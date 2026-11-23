@@ -60,6 +60,19 @@ def _head_copy_args(device, handle):
     return _tasks(device, workers), shard_tiles, total_tiles, device.compute_with_storage_grid_size().x
 
 
+@lru_cache(maxsize=16)
+def _head_rows_program(tasks, rows, scatter, specs):
+    grid, rt = _grid(tasks)
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=str(_KERNELS / "head_rows.cpp"),
+        core_ranges=grid,
+        compile_time_args=[rows, int(scatter), *sum(specs[0], ())],
+        runtime_args=rt,
+        config=ttnn.ReaderConfigDescriptor(),
+    )
+    return _program([kernel], [_tile_cb(grid, 0, BF, 1 if scatter else HQ // HKV)])
+
+
 def _norm_rows(x, weight, out, rows):
     chunk, stripes = rowvm._stripes(D)
     grid = x.device().compute_with_storage_grid_size()
@@ -117,10 +130,14 @@ class _Rope:
 class DraftBlock:
     """Device transformer on one DSpark block with fixed-size prefix storage."""
 
-    def __init__(self, device, weights, rows, prefix_capacity, *, sharded_mlp=True, short_prefix=False):
+    def __init__(
+        self, device, weights, rows, prefix_capacity, *, sharded_mlp=True, short_prefix=False, pack_queries=True
+    ):
         if not 2 <= rows <= 8 or prefix_capacity < 32 or prefix_capacity % 32:
             raise ValueError("DSpark needs 2-8 rows and a positive, tile-aligned prefix capacity")
         self.rows = rows
+        self.pack_queries = pack_queries
+        self.head_rows_tasks = _tasks(device, HKV * HD // 32)
         self.ck = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
         )
@@ -158,9 +175,13 @@ class DraftBlock:
         self.v_head = _tile_view(self.v, (1, HKV, 32, HD))
         self.q_rot = _alloc(device, (1, HQ, 32, HD))
         self.k_rot = _alloc(device, (1, HKV, 32, HD))
-        self.q_group = _tile_view(self.q_rot, (1, HKV, HQ // HKV * 32, HD))
-        self.attn = _alloc(device, self.q_group.shape)
-        self.attn_flat = _tile_view(self.attn, (1, 1, 32, HQ * HD))
+        if pack_queries:
+            self.q_group, self.attn = (_alloc(device, (1, HKV, 32, HD)) for _ in range(2))
+            self.attn_heads = _alloc(device, (1, HQ, 32, HD))
+        else:
+            self.q_group = _tile_view(self.q_rot, (1, HKV, HQ // HKV * 32, HD))
+            self.attn = self.attn_heads = _alloc(device, self.q_group.shape)
+        self.attn_flat = _tile_view(self.attn_heads, (1, 1, 32, HQ * HD))
         self.rope_q = _Rope(device, HQ)
         self.rope_k = _Rope(device, HKV)
         self.gate, self.up, self.silu = (row(MLP_WIDTH) for _ in range(3))
@@ -179,7 +200,7 @@ class DraftBlock:
         self.short_attention = attention_buffers(local_capacity) if short_prefix and prefix_capacity > 2048 else None
         self.scores, self.probs = {}, {}
         for cap in set(caps):
-            shape = (1, HKV, HQ // HKV * 32, cap + 32)
+            shape = (1, HKV, self.q_group.shape[-2], cap + 32)
             self.scores[cap] = tuple(_alloc(device, shape, FP) for _ in range(2))
             self.probs[cap] = _alloc(device, shape)
 
@@ -221,6 +242,8 @@ class DraftBlock:
         stride = (cap + 32) * HD // 1024
         for block, cache in ((self.k_rot, keys), (self.v_head, values)):
             _remap(block, cache, HKV, HD // 32, stride, stride - HD // 32)
+        if self.pack_queries:
+            _launch(_head_rows_program, (self.head_rows_tasks, self.rows, False), (self.q_rot, self.q_group))
         scores, masked = self.scores[cap]
         ttnn.matmul(
             self.q_group, keys, transpose_b=True, dtype=FP, compute_kernel_config=self.ck, optional_output_tensor=scores
@@ -241,6 +264,8 @@ class DraftBlock:
             normalized = masked
         _cast(normalized, self.probs[cap])
         ttnn.matmul(self.probs[cap], values, compute_kernel_config=self.ck, optional_output_tensor=self.attn)
+        if self.pack_queries:
+            _launch(_head_rows_program, (self.head_rows_tasks, self.rows, True), (self.attn, self.attn_heads))
         self._linear(self.attn_flat, name + "o_proj", self.branch)
 
     def forward(self, *, short=False):

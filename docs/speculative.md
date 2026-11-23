@@ -27,7 +27,9 @@ committed input.
 The draft block starts at the first uncommitted position. It embeds the pending target ID in row 0
 and fills subsequent rows with the checkpoint mask embedding. Each query attends to its layer's
 committed context and the entire transient block. RoPE uses the block's absolute positions. The
-transient self-projected K/V occupy separate slots from the feature-projected prefix.
+transient self-projected K/V occupy separate slots from the feature-projected prefix. The
+three query heads in each KV group pack their live rows into one tile. This cuts score and
+probability storage to one-third for the draft's attention products.
 
 Rows 1 through K predict the K proposals at their own positions. The block reads the target
 unembedding once for their BF16 base scores. A copy from the width-sharded head output collects
@@ -78,7 +80,7 @@ and position for the following replay. The host reads the emitted IDs from one 6
 The component tests run through the pinned dev image.
 
 ```sh
-scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_block.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-queries"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64 --proposals 4"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 INK_PREFILL_EXPERT_DOUT_L1=480 python -u tests/bench_mtp_acceptance.py --steps 64 --long-context"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
@@ -93,7 +95,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 8.86 ms median, 8.94 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 8.05 ms median, 8.12 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
 | Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |

@@ -1,3 +1,4 @@
+import argparse
 import statistics
 import time
 
@@ -59,7 +60,7 @@ def check_context(ctx, block, last):
     assert error < 0.01, f"Markov tap mixture relative L2={error:.5f}"
 
 
-def main():
+def main(compare_queries=False):
     count = 3
     weights = load_drafter(paths.snapshot())
     target = Weights(paths.hf_sd())
@@ -74,7 +75,18 @@ def main():
     device = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
     try:
         device.enable_program_cache()
-        blocks = [DraftBlock(device, weights, count + 1, 1088, sharded_mlp=mode) for mode in (False, True)]
+        labels = ("ordinary queries", "packed queries") if compare_queries else ("ordinary MLP", "sharded MLP")
+        blocks = [
+            DraftBlock(
+                device,
+                weights,
+                count + 1,
+                1088,
+                sharded_mlp=True if compare_queries else mode,
+                pack_queries=mode if compare_queries else True,
+            )
+            for mode in (False, True)
+        ]
         head = dense.prepare_weight(device, torch.nn.functional.pad(head.T, (0, PADDED_VOCAB - VOCAB)))
         projection = DraftHeadProjection(device, head, weights, count)
         markov = MarkovDraftHead(device, weights, fold, bias, count)
@@ -126,7 +138,7 @@ def main():
             forward(blocks[1])
             actual = read(blocks[1])
             delta = (actual[2].float() - logits.float()).norm() / logits.float().norm()
-            print(f"sharded: {actual[0]} vs {ids}, relative L2 {delta:.5f}", flush=True)
+            print(f"{labels[1]}: {actual[0]} vs {ids}, relative L2 {delta:.5f}", flush=True)
             assert actual[0] == ids and delta < 0.01
             hidden_error = (hidden.float() - case[3]).norm() / case[3].float().norm()
             expected_ids, expected_logits = case[4]
@@ -174,7 +186,7 @@ def main():
                     assert ids == eager[j][k][0]
                     assert torch.equal(hidden, eager[j][k][1])
                     assert torch.equal(logits, eager[j][k][2])
-            for label, timings in zip(("ordinary MLP", "sharded MLP"), ms):
+            for label, timings in zip(labels, ms):
                 p95 = statistics.quantiles(timings[4:], n=20, method="inclusive")[-1]
                 print(
                     f"DSpark {count} drafts ({label}): median {statistics.median(timings[4:]):.2f} ms, "
@@ -191,4 +203,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compare-queries", action="store_true")
+    main(parser.parse_args().compare_queries)
