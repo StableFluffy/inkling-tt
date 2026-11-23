@@ -1,5 +1,7 @@
 from functools import lru_cache, partial
 from pathlib import Path
+from statistics import median
+from time import perf_counter
 
 import torch
 import ttnn
@@ -51,12 +53,13 @@ class RoundDecision:
 
     def accept(self, position, target, drafts, meta):
         """Write the accepted range and its IDs, including the B1 continuation."""
-        if len(target) != self.rows or len(drafts) != self.rows - 1:
-            raise ValueError("Target and draft decisions must match the configured round width")
-        _launch(_accept_program, (self.rows,), (position, *target, *drafts, meta, self.result))
+        rows = len(target)
+        if not 2 <= rows <= self.rows or len(drafts) != rows - 1:
+            raise ValueError("Target and draft decisions must match the active round width")
+        _launch(_accept_program, (rows,), (position, *target, *drafts, meta, self.result))
 
-    def read(self):
-        data = ttnn.to_torch(self.result).flatten().tolist()
+    def read(self, result=None):
+        data = ttnn.to_torch(self.result if result is None else result).flatten().tolist()
         return data[2 : 2 + data[0]], data[1]
 
     def publish(self, anchor, position):
@@ -64,11 +67,15 @@ class RoundDecision:
 
 
 class SpeculativeRound:
-    def __init__(self, model, buckets, snapshot, proposals=3):
+    def __init__(self, model, buckets, snapshot, proposals=3, *, adaptive=False):
         if model.trace_id is not None or not buckets or model.taps is None or not hasattr(model, "embed_table"):
             raise ValueError("Set up speculative decoding with target taps, prefill buckets and device feedback")
         self.model, self.device = model, model.c.dev
         self.rows = proposals + 1
+        self.adaptive = adaptive
+        self.widths = tuple(range(2, min(self.rows, 4) + 1)) if adaptive else (self.rows,)
+        self.costs = {}
+        self.start_request()
         weights = load_drafter(snapshot)
         fold, bias = fold_head(model.wts.get("lm_head.weight"), weights)
         self.target = TargetVerify(model, proposals, streaming=True)
@@ -93,12 +100,36 @@ class SpeculativeRound:
         self.verify_context = DraftContextProjection(self.block, weights, 32, self.last)
         self.prefill_traces = {}
         self.draft_traces = {}
-        self.trace = None
+        self.verify_traces = {}
+        self.context_trace = None
         self.pending = None
         self.warmed = False
 
-    def can_run(self, position):
-        return 0 <= position <= self.model.lmax - self.rows
+    def start_request(self):
+        self.accepted, self.rejected = 1.7, 0.3
+        self.plain = False
+        self.pending = None
+
+    def can_run(self, position, rows=None):
+        rows = self.rows if rows is None else rows
+        return 0 <= position <= self.model.lmax - rows
+
+    def _short(self, position):
+        return self.block.short_attention is not None and position <= 1024
+
+    def pick(self, position, limit):
+        if self.plain:
+            return 1
+        short = self._short(position)
+        acceptance = self.accepted / (self.accepted + self.rejected)
+        widths = (r for r in self.widths if r <= limit and self.can_run(position, r))
+        if self.adaptive:
+            widths = (1, *widths)
+            width = max(widths, key=lambda r: sum(acceptance**i for i in range(r)) / self.costs[short, r])
+        else:
+            width = next(widths, 1)
+        self.plain = width == 1
+        return width
 
     def _write(self, token, position):
         for host, dest in (([[token]], self.anchor), ([position], self.position)):
@@ -109,26 +140,30 @@ class SpeculativeRound:
         self.positions.rotate(context.meta, context.cos, context.sin)
         context.extend(taps)
 
-    def _draft(self, short):
+    def _draft(self, short, rows):
         self.positions.prepare(self.block, self.anchor, self.position, self.model.embed_table, short=short)
         base, recurrent = self.projection.project(self.block.forward(short=short), self.last)
-        self.markov.score(base, recurrent, self.anchor)
+        self.markov.score(base[: rows - 1], recurrent[: rows - 1], self.anchor)
 
-    def _verify(self):
-        drafts = self.markov.ids
+    def _verify(self, rows):
+        drafts = self.markov.ids[: rows - 1]
         self.target.stage_device(self.anchor, drafts, self.position)
-        _, target_ids = self.target.verify()
+        _, target_ids = self.target.verify(rows=rows)
         self.decision.accept(self.position, target_ids, drafts, self.verify_context.meta)
-        self._extend(self.verify_context, self.target.taps)
         self.decision.publish(self.anchor, self.position)
+
+    def _context(self):
+        self._extend(self.verify_context, self.target.taps)
 
     def warm(self):
         for bucket, context in self.prefill_context.items():
             self._extend(context, bucket.taps)
-        self._write(0, 0)
-        for short in self._draft_widths():
-            self._draft(short)
-        self._verify()
+        for rows in self.widths:
+            self._write(0, 0)
+            for short in self._draft_widths():
+                self._draft(short, rows)
+            self._verify(rows)
+            self._context()
         ttnn.synchronize_device(self.device)
         self.model.reset()
         self.warmed = True
@@ -148,15 +183,19 @@ class SpeculativeRound:
         return trace
 
     def capture(self):
-        if not self.warmed or self.trace is not None:
+        if not self.warmed or self.verify_traces:
             raise RuntimeError("Speculation needs a warmed graph with no existing round trace")
         try:
             for bucket, context in self.prefill_context.items():
                 self.prefill_traces[bucket] = self._capture(partial(self._extend, context, bucket.taps))
-            self._write(0, 0)
-            for short in self._draft_widths():
-                self.draft_traces[short] = self._capture(partial(self._draft, short))
-            self.trace = self._capture(self._verify)
+            for rows in self.widths:
+                self._write(0, 0)
+                for short in self._draft_widths():
+                    self.draft_traces[short, rows] = self._capture(partial(self._draft, short, rows))
+                self.verify_traces[rows] = self._capture(partial(self._verify, rows))
+            self.context_trace = self._capture(self._context)
+            if self.adaptive:
+                self._measure_costs()
         except Exception:
             self.close()
             raise
@@ -164,28 +203,65 @@ class SpeculativeRound:
         self.model.reset()
         self.pending = None
 
+    def _measure_costs(self):
+        for short in self._draft_widths():
+            position = min(
+                29 if short or self.block.short_attention is None else self.model.lmax - 32,
+                self.model.lmax - max(self.widths),
+            )
+            variants = (1, *self.widths)
+            samples = {rows: [] for rows in variants}
+            for trial in range(4):
+                for i in range(len(variants)):
+                    rows = variants[(i + trial) % len(variants)]
+                    if rows == 1:
+                        self.model.st.write(self.model.embed_row(0), position)
+                        traces = (self.model.trace_id,)
+                    else:
+                        self._write(0, position)
+                        traces = (self.draft_traces[short, rows], self.verify_traces[rows], self.context_trace)
+                    ttnn.synchronize_device(self.device)
+                    start = perf_counter()
+                    for trace in traces:
+                        ttnn.execute_trace(self.device, trace, cq_id=0, blocking=False)
+                    ttnn.synchronize_device(self.device)
+                    samples[rows].append(perf_counter() - start)
+            for rows in variants:
+                self.costs[short, rows] = median(samples[rows][1:])
+
     def append_prompt(self, bucket):
         self.pending = None
         ttnn.execute_trace(self.device, self.prefill_traces[bucket], cq_id=0, blocking=False)
 
-    def run(self, token, position):
-        if self.trace is None or not self.can_run(position):
+    def run(self, token, position, rows=None):
+        rows = self.rows if rows is None else rows
+        if rows not in self.verify_traces or not self.can_run(position, rows):
             raise ValueError("Speculative round requires a captured graph and room for the full block")
         if self.pending != (token, position):
             self._write(token, position)
         self.pending = None
-        short = self.block.short_attention is not None and position <= 1024
-        ttnn.execute_trace(self.device, self.draft_traces[short], cq_id=0, blocking=False)
-        ttnn.execute_trace(self.device, self.trace, cq_id=0, blocking=False)
-        emitted, end = self.decision.read()
+        short = self._short(position)
+        ttnn.execute_trace(self.device, self.draft_traces[short, rows], cq_id=0, blocking=False)
+        ttnn.execute_trace(self.device, self.verify_traces[rows], cq_id=0, blocking=False)
+        result = ttnn.from_device(self.decision.result, blocking=False)
+        ready = ttnn.record_event(self.device, 0)
+        ttnn.execute_trace(self.device, self.context_trace, cq_id=0, blocking=False)
+        ttnn.event_synchronize(ready)
+        emitted, end = self.decision.read(result)
+        accepted = len(emitted) - 1
+        self.accepted = 0.9 * self.accepted + accepted
+        self.rejected = 0.9 * self.rejected + int(accepted < rows - 1)
         self.pending = (emitted[-1], end)
         self.model.st.device_state = None
         return emitted, end
 
     def close(self):
-        if self.trace is not None:
-            ttnn.release_trace(self.device, self.trace)
-            self.trace = None
+        if self.context_trace is not None:
+            ttnn.release_trace(self.device, self.context_trace)
+            self.context_trace = None
+        for trace in self.verify_traces.values():
+            ttnn.release_trace(self.device, trace)
+        self.verify_traces.clear()
         for trace in self.draft_traces.values():
             ttnn.release_trace(self.device, trace)
         self.draft_traces.clear()

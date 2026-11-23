@@ -81,13 +81,18 @@ for the next round.
 
 ## Round replay
 
-The round allocates scratch and warms the device programs before capture. The draft and target
-traces replay on the same command queue. The target stages the pending token and draft IDs,
-verifies them, and advances past the longest matching prefix.
-The drafter and target reuse the same width-sharded head input and output buffers.
+The round allocates scratch and warms each width before capture. Draft, target verification
+and the accepted-context projection use separate traces on one command queue. The drafter and
+target share width-sharded head buffers across widths. Smaller rounds score a prefix of the
+draft block and verify only those rows.
 
-The round extends the draft cache from accepted target taps, then publishes the next pending ID
-and position for the following replay. The host reads the emitted IDs from one 64-byte result.
+The server selects one to four target rows using the startup replay times and a decaying
+estimate of proposal acceptance. With estimated conditional acceptance `a`, a width `R` produces
+an expected `1 + a + ... + a^(R-1)` IDs. Width one uses B1 for the rest of the request.
+
+The target publishes the next pending ID and position. The host starts an asynchronous
+read of the 64-byte accepted result and queues the draft context update behind it. The
+context trace projects the accepted taps while the host consumes the result.
 
 ## Device checks
 
@@ -103,7 +108,7 @@ scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_decision.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_verify.py"
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_round.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_round.py --adaptive"
 INK_LMAX=2048 scripts/bench_decode.sh
 ```
 
@@ -141,15 +146,15 @@ The serial verifier check compares logits and taps at the local window boundary,
 ring wrap and the global cache limit. It also runs B1 with alternate continuations after each
 possible rejection and compares with a serial run of the same accepted prefix.
 
-The three-proposal round reproduces the B1 IDs on 32-token continuations, including a prompt
-that reaches the 1,024-slot ring wrap. Times exclude prefill and draft context priming.
+Adaptive rounds reproduce the B1 IDs on 32-token continuations, including a prompt
+that reaches the 1,024-key window boundary. Times exclude prefill and draft context priming.
 
 | Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
 |---|---:|---:|
-| Chat | 20.14 / 20.20 | 16.25 / 16.29 |
-| Python | 20.17 / 20.20 | 17.48 / 17.49 |
-| Korean | 20.17 / 20.19 | 24.44 / 24.46 |
-| Ring wrap | 20.67 / 20.77 | 22.04 / 22.04 |
+| Chat | 19.58 / 19.70 | 12.77 / 12.77 |
+| Python | 19.63 / 19.69 | 13.78 / 13.78 |
+| Korean | 19.53 / 19.56 | 19.95 / 19.96 |
+| Ring wrap | 20.06 / 20.09 | 16.43 / 16.44 |
 
 ## HTTP serving
 

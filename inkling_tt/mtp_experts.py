@@ -91,17 +91,16 @@ class VerifyExperts:
 
     def run(self, x, routing, handle, *, direct_maps=True):
         """Stream the union of B1 routes while preserving each token's combine order."""
-        if len(routing) != self.rows:
-            raise ValueError("Expected one set of B1 IDs and weights per verify row")
+        rows = len(routing)
+        if not 2 <= rows <= self.rows:
+            raise ValueError("Expected B1 IDs and weights for each active verify row")
         work = self.workspace
         if direct_maps:
             ids = tuple(index for index, _ in routing)
-            _launch(
-                _route_program, (self.rows, work.gather.shape[-1] * 4), (*ids, work.ends, work.gather, work.inverse)
-            )
+            _launch(_route_program, (rows, work.gather.shape[-1] * 4), (*ids, work.ends, work.gather, work.inverse))
         else:
             route_tensors = tuple(t for pair in routing for t in pair)
-            _launch(_pack_program, (self.rows,), (*route_tensors, work.ids, work.gamma))
+            _launch(_pack_program, (rows,), (*route_tensors, work.ids, work.gamma))
             maps = (work.ids, work.ends, work.gather, work.inverse)
             with experts._LOCK:
                 desc, kernel = experts._prefill_route_program(
@@ -120,7 +119,7 @@ class VerifyExperts:
         experts._prefill_project(False, work, handle, verify=self.verify_mode)
         _launch(
             _combine_program,
-            (_tasks(x.device(), self.rows * (D // 32)),),
+            (_tasks(x.device(), rows * (D // 32)),),
             (work.inverse, work.wide),
             (),
             (work.output, *(gamma for _, gamma in routing)),

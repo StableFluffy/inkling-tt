@@ -177,8 +177,10 @@ class Engine:
         t1 = time.perf_counter()
         t.reset_s = t1 - t0
         spec = self.rt.speculative if greedy and s.mtp else None
-        if spec is not None and (s.max_tokens <= spec.rows or not spec.can_run(len(ids))):
-            spec = None
+        if spec is not None:
+            spec.start_request()
+            if spec.pick(len(ids), s.max_tokens - 1) == 1:
+                spec = None
         logits = self.rt.feed(ids, 0, job.cancelled, draft_context=spec is not None)
         t0 = time.perf_counter()
         t.prefill_s = t0 - t1
@@ -203,8 +205,9 @@ class Engine:
                 break
             if greedy:
                 if not pending:
-                    if spec is not None and s.max_tokens - k - 1 >= spec.rows and spec.can_run(pos):
-                        pending.extend(self.rt.speculate(tok, pos))
+                    rows = spec.pick(pos, s.max_tokens - k - 1) if spec is not None else 1
+                    if rows > 1:
+                        pending.extend(self.rt.speculate(tok, pos, rows))
                     else:
                         pending.append(self.rt.step_greedy(tok, pos))
             elif device_sampling:

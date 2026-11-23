@@ -142,8 +142,9 @@ class MarkovDraftHead:
 
     def score(self, base_rows, context_rows, anchor):
         """Enqueue the recurrent scoring steps. The anchor is a device UINT32 [1,1] tensor."""
-        if len(base_rows) != self.proposals or len(context_rows) != self.proposals:
-            raise ValueError("Markov inputs must match the configured proposal count")
+        count = len(base_rows)
+        if not 1 <= count <= self.proposals or len(context_rows) != count:
+            raise ValueError("Markov inputs must match the active proposal count")
         ttnn.copy(self.zero, self.state)
         prev = anchor
         for i, (base, context) in enumerate(zip(base_rows, context_rows)):
@@ -172,4 +173,4 @@ class MarkovDraftHead:
             )
             ttnn.argmax(self.logits[i], dim=-1, keepdim=True, output_tensor=self.ids[i])
             prev = self.ids[i]
-        return self.ids, self.logits
+        return self.ids[:count], self.logits[:count]

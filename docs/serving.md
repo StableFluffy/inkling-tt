@@ -75,8 +75,9 @@ A request may use at most `lmax` tokens in total and must leave room for one out
 ## Speculative decoding
 
 A source checkout can load the official `mtp.safetensors` from `INKLING_SNAPSHOT` and enable
-DSpark for greedy requests without penalties. With `--mtp` alone, the server drafts three
-proposals per round. Set `"mtp": false` in a chat or completion request to select B1 for that
+DSpark for greedy requests without penalties. With `--mtp` alone, the server chooses up to
+three proposals per round. It compares expected IDs per millisecond against B1 and can hand
+the rest of the request to B1. Set `"mtp": false` in a chat or completion request to select B1 for that
 request. The server uses B1 by default because the speedup depends on the prompt.
 
 ```bash

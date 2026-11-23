@@ -136,15 +136,19 @@ class TargetVerify:
 
     def stage_device(self, anchor, drafts, start):
         m = self.model
-        if len(drafts) != self.rows - 1 or not m.c.row_major_state or not hasattr(m, "embed_table"):
-            raise ValueError("Device verification requires normalized feedback embeddings and a full draft block")
+        rows = len(drafts) + 1
+        if not 2 <= rows <= self.rows or not m.c.row_major_state or not hasattr(m, "embed_table"):
+            raise ValueError("Device verification requires feedback embeddings and a draft block within capacity")
         inputs = (start, m.embed_table, m.tau_table, anchor, *drafts)
-        outputs = tuple(tensor for step in self.steps for tensor in (step.x, step.pos_g, step.tau))
-        _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, self.rows)), (*inputs, *outputs))
+        outputs = tuple(tensor for step in self.steps[:rows] for tensor in (step.x, step.pos_g, step.tau))
+        _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, rows)), (*inputs, *outputs))
 
-    def verify(self, *, grouped_glue=True, grouped_attention=True, grouped_front=True):
+    def verify(self, *, rows=None, grouped_glue=True, grouped_attention=True, grouped_front=True):
         m = self.model
-        states = [(step.x, _DecodeBank(bank, 0, 1), None) for step, bank in zip(self.steps, self.banks)]
+        rows = self.rows if rows is None else rows
+        if not 2 <= rows <= self.rows:
+            raise ValueError("Verify width must fit the allocated row capacity")
+        states = [(step.x, _DecodeBank(bank, 0, 1), None) for step, bank in zip(self.steps[:rows], self.banks)]
         batch = self.shared and grouped_glue
         block_attention = self.shared and grouped_attention
         front = batch and block_attention and grouped_front
@@ -172,9 +176,9 @@ class TargetVerify:
             memory_config=head.output_shards,
             optional_output_tensor=self.head_output,
         )
-        for i, (logits, index) in enumerate(zip(self.logits, self.ids)):
+        for i, (logits, index) in enumerate(zip(self.logits[:rows], self.ids[:rows])):
             rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
-        return self.logits, self.ids
+        return self.logits[:rows], self.ids[:rows]
 
     def _range(self, first, stop, pass_id, states, previous=None, *, batch, block_attention, front):
         m = self.model
@@ -188,7 +192,7 @@ class TargetVerify:
                     for i, (x, _, _) in enumerate(states):
                         _tile_row(x, self.taps[tap], target=i)
             messages_by_row = []
-            for i in range(self.rows):
+            for i in range(len(states)):
                 messages = None
                 if previous is not None:
                     prev_x, prev_bank, _ = previous[i]
@@ -245,7 +249,7 @@ class TargetVerify:
                 )
             if self.shared:
                 projected = self.o.project(layer.wo)
-                attention = [projected] * self.rows
+                attention = [projected] * len(states)
             after_attention = rowvm._Group() if batch else None
             pending = []
             for i, ((x, bank, _), a, messages, scratch) in enumerate(
@@ -278,8 +282,10 @@ class TargetVerify:
                     _tile_row(mixed, self.mlp, target=i)
             if self.shared:
                 _pack_rows(self.mlp, mixed_rows, self.mlp_tasks)
-                rowvm.fused_router_block(self.mlp, layer.router_w.tensor, layer.dec.router_b, self.routes)
-            grouped = self.experts.run(self.mlp, self.routes, layer.expert_stream)
+                rowvm.fused_router_block(
+                    self.mlp, layer.router_w.tensor, layer.dec.router_b, self.routes[: len(states)]
+                )
+            grouped = self.experts.run(self.mlp, self.routes[: len(states)], layer.expert_stream)
             after_mlp = rowvm._Group() if batch else None
             states = []
             for i, (_, bank, residual) in enumerate(pending):
@@ -311,7 +317,7 @@ class TargetVerify:
         _, forget, update = layer.gates["mlp"]
         down = rowvm.message_down(
             [(u, m, weight) for u, m in zip(mixed, mlp_messages)],
-            out=tuple(s.mlp_down[0] for s in self.scratch),
+            out=tuple(s.mlp_down[0] for s in self.scratch[: len(mixed)]),
         )
         blends = rowvm._Group()
         result = [
