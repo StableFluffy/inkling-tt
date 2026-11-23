@@ -59,7 +59,9 @@ decode paths share the per-visit rings.
 The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dynamic taps and
 O each use one sweep of their B1 weights. Head preparation and attention read
 the query's row directly from the packed projections. The output gate writes into that same row
-of the O projection's input shards.
+of the O projection's input shards. One attention launch per head group runs every verify row
+with its B1 split and FP32 reduction order. The workers synchronize within each KV head before
+reusing the circular buffers for the next query.
 
 The post-attention and post-MLP convolution and mix epilogues run on disjoint core groups.
 Each row reads earlier inputs within the block directly from the packed projection or expert
@@ -111,8 +113,9 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
+| Batched attention against serial B1 | 88/88 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 42.34 ms median, 42.41 ms p95 |
+| Four-row target verify at `lmax=1120` | 42.23 ms median, 42.25 ms p95 |
 | B1 greedy in the same job | 19.36 ms median, 19.42 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure

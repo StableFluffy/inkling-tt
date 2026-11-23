@@ -11,6 +11,13 @@ constexpr uint32_t fp_tile = 4096;
 constexpr uint32_t bf_row = 32;
 constexpr uint32_t fp_row = 64;
 constexpr uint32_t window = 1024;
+#ifdef ATTN_ROWS
+constexpr uint32_t rows = ATTN_ROWS;
+constexpr bool batched_rows = true;
+#else
+constexpr uint32_t rows = 1;
+constexpr bool batched_rows = false;
+#endif
 
 inline bool relative_tile_is_zero(uint32_t pos, uint32_t tile) {
     return pos >= window + tile * 32 + 31;

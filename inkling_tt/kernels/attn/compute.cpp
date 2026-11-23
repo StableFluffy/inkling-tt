@@ -207,8 +207,9 @@ void finish(uint32_t cb, uint32_t first, uint32_t count) {
 void score(uint32_t pos, const Work& work, bool running = false, bool last = true) {
     DeviceZoneScopedN("INK_ATTN_SCORE");
     const uint32_t count = work.tile_count;
+    const uint32_t pages = batched_rows ? max_chunk_tiles : count;
     cb_wait_front(q_cb, dim_tiles);
-    cb_wait_front(k_cb, count * dim_tiles);
+    cb_wait_front(k_cb, pages * dim_tiles);
     cb_reserve_back(exps_cb, count);
     const uint32_t stats_out = last ? local_stats_cb : running_stats_cb;
     tile_regs_acquire();
@@ -220,10 +221,10 @@ void score(uint32_t pos, const Work& work, bool running = false, bool last = tru
         }
     }
     cb_pop_front(q_cb, dim_tiles);
-    cb_pop_front(k_cb, count * dim_tiles);
+    cb_pop_front(k_cb, pages * dim_tiles);
 
     const bool relative = !global_cache || !relative_tile_is_zero(pos, work.first_tile + count - 1);
-    cb_wait_front(table_cb, count);
+    cb_wait_front(table_cb, pages);
     if (relative) {
         cb_wait_front(r_cb, 1);
         for (uint32_t t = 0; t < count; ++t) {
@@ -238,7 +239,7 @@ void score(uint32_t pos, const Work& work, bool running = false, bool last = tru
         }
         cb_pop_front(r_cb, 1);
     }
-    cb_pop_front(table_cb, count);
+    cb_pop_front(table_cb, pages);
     if (running) {
         cb_wait_front(running_stats_cb, 1);
         load_tiles(running_stats_cb, 1, max_chunk_tiles);
@@ -274,19 +275,26 @@ void value_product(uint32_t split, uint32_t count, bool running = false, bool la
     DeviceZoneScopedN("INK_ATTN_VALUE");
     cb_wait_front(exps_cb, count);
     cb_wait_front(factor_in_cb, 1);
-    cb_reserve_back(probs_cb, count);
+    const uint32_t pages = batched_rows ? max_chunk_tiles : count;
+    cb_reserve_back(probs_cb, pages);
     tile_regs_acquire();
     load_tiles(exps_cb, count, 0);
     load_tiles(factor_in_cb, 1, max_chunk_tiles);
     MATH((ATTN_MATH(normalize, split, count, 0)));
     finish(probs_cb, 0, count);
     cb_pop_front(exps_cb, count);
+    if constexpr (batched_rows) {
+        for (uint32_t i = count; i < pages; ++i) {
+            // The value product consumes only live probabilities.
+            cb_push_back(probs_cb, 1);
+        }
+    }
     if (last) {
         cb_pop_front(factor_in_cb, 1);
     }
 
-    cb_wait_front(probs_cb, count);
-    cb_wait_front(v_cb, count * dim_tiles);
+    cb_wait_front(probs_cb, pages);
+    cb_wait_front(v_cb, pages * dim_tiles);
     const uint32_t output = last ? partials_out_cb : running_values_cb;
     tile_regs_acquire();
     reconfig_data_format(v_cb, probs_cb);
@@ -306,13 +314,14 @@ void value_product(uint32_t split, uint32_t count, bool running = false, bool la
     }
     cb_reserve_back(output, dim_tiles);
     finish(output, 0, dim_tiles);
-    cb_pop_front(v_cb, count * dim_tiles);
-    cb_pop_front(probs_cb, count);
+    cb_pop_front(v_cb, pages * dim_tiles);
+    cb_pop_front(probs_cb, pages);
 }
 
 void combine_values(uint32_t active) {
     DeviceZoneScopedN("INK_ATTN_OUTPUT");
-    cb_wait_front(partials_in_cb, active);
+    const uint32_t pages = batched_rows ? splits : active;
+    cb_wait_front(partials_in_cb, pages);
     cb_wait_front(gate_cb, 1);
     cb_reserve_back(gated_cb, 1);
     tile_regs_acquire();
@@ -327,19 +336,18 @@ void combine_values(uint32_t active) {
     MATH((sfpu::sigmoid_init<false>()));
     MATH((ATTN_MATH(gate_output, 0, 0, 0)));
     finish(gated_cb, 0, 1);
-    cb_pop_front(partials_in_cb, active);
+    cb_pop_front(partials_in_cb, pages);
     cb_pop_front(gate_cb, 1);
 }
-}  // namespace
-
-void kernel_main() {
-    const uint32_t split = (get_absolute_logical_y() * grid_width + get_absolute_logical_x()) % splits;
+void run_row(uint32_t split) {
     cb_wait_front(compute_position_cb, 1);
     const uint32_t pos = read_tile_value(compute_position_cb, 0, 0);
     cb_pop_front(compute_position_cb, 1);
     const Work work(pos, cache_tiles, split);
-    if (work.tile_count || split < dim_tiles) {
-        compute_kernel_hw_startup<SrcOrder::Reverse>(q_cb, k_cb, exps_cb);
+    if constexpr (!batched_rows) {
+        if (work.tile_count || split < dim_tiles) {
+            compute_kernel_hw_startup<SrcOrder::Reverse>(q_cb, k_cb, exps_cb);
+        }
     }
     if (work.tile_count) {
         if constexpr (streaming) {
@@ -361,8 +369,27 @@ void kernel_main() {
         } else {
             value_product(split, work.tile_count);
         }
+        if constexpr (batched_rows) {
+            const uint32_t pad = split_tiles - work.tile_count;
+            if (pad) {
+                cb_reserve_back(exps_cb, pad);
+                cb_push_back(exps_cb, pad);
+                cb_pop_front(exps_cb, pad);
+            }
+        }
     }
     if (split < dim_tiles) {
         combine_values(work.active_splits);
+    }
+}
+}  // namespace
+
+void kernel_main() {
+    const uint32_t split = (get_absolute_logical_y() * grid_width + get_absolute_logical_x()) % splits;
+    if constexpr (batched_rows) {
+        compute_kernel_hw_startup<SrcOrder::Reverse>(q_cb, k_cb, exps_cb);
+    }
+    for (uint32_t row = 0; row < rows; ++row) {
+        run_row(split);
     }
 }

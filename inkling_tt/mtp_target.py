@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import torch
 import ttnn
 
-from inkling_tt import rowvm
-from inkling_tt.model import HD, HKV, LOOP0, LOOP1, NB, NPASS, VOCAB, D, visit_slot
+from inkling_tt import attn_decode, rowvm
+from inkling_tt.model import DR, HD, HKV, HQ, LOOP0, LOOP1, NB, NPASS, VOCAB, D, visit_slot
 from inkling_tt.model2 import BF, DRAM, FP, L1, MTP_TAP_VISITS, RM, TILE, Step, _DecodeBank
 from inkling_tt.mtp_experts import VerifyExperts
 from inkling_tt.mtp_projection import SharedProjection, _pack_rows, _tile_row
@@ -92,6 +92,9 @@ class TargetVerify:
                 scratch.k, scratch.v = (row(HKV * HD) for _ in range(2))
                 scratch.k_dyn, scratch.v_dyn = (row(32) for _ in range(2))
                 scratch.attended = row(o_weight.n, mem=o_weight.output_shards)
+        self.prepared_heads = tuple(
+            tuple(_alloc(device, t.shape) for t in c.attention_glue[:3]) for _ in range(self.rows)
+        )
         self.mlp = _alloc(device, (1, 1, 32, D))
         self.mlp_tasks = _tasks(device, D // 32)
         self.branch = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, D)), BF, TILE, device, L1)
@@ -139,17 +142,18 @@ class TargetVerify:
         outputs = tuple(tensor for step in self.steps for tensor in (step.x, step.pos_g, step.tau))
         _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, self.rows)), (*inputs, *outputs))
 
-    def verify(self, *, grouped_glue=True):
+    def verify(self, *, grouped_glue=True, grouped_attention=True):
         m = self.model
         states = [(step.x, _DecodeBank(bank, 0, 1), None) for step, bank in zip(self.steps, self.banks)]
         batch = self.shared and grouped_glue
-        states = self._range(0, LOOP0, 0, states, batch=batch)
+        block_attention = self.shared and grouped_attention
+        states = self._range(0, LOOP0, 0, states, batch=batch, block_attention=block_attention)
         prefix = states
-        states = self._range(LOOP0, LOOP1, 0, states, batch=batch)
+        states = self._range(LOOP0, LOOP1, 0, states, batch=batch, block_attention=block_attention)
         for p in range(1, NPASS):
             reenter = [(x, bank._replace(tail_start=1 + p * ((LOOP1 - LOOP0) // NB)), None) for x, bank, _ in prefix]
-            states = self._range(LOOP0, LOOP1, p, reenter, states, batch=batch)
-        states = self._range(LOOP1, len(m.layers), 0, states, batch=batch)
+            states = self._range(LOOP0, LOOP1, p, reenter, states, batch=batch, block_attention=block_attention)
+        states = self._range(LOOP1, len(m.layers), 0, states, batch=batch, block_attention=block_attention)
         for i, (_, _, hidden) in enumerate(states):
             _tile_row(hidden, self.taps[3], target=i)
         head = m.head
@@ -166,7 +170,7 @@ class TargetVerify:
             rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
         return self.logits, self.ids
 
-    def _range(self, first, stop, pass_id, states, previous=None, *, batch):
+    def _range(self, first, stop, pass_id, states, previous=None, *, batch, block_attention):
         m = self.model
         for layer in m.layers[first:stop]:
             slot = visit_slot(layer.i, pass_id if layer.is_loop else 0)
@@ -211,7 +215,19 @@ class TargetVerify:
                         projections=projections,
                         output=self.o.input if self.shared else None,
                         row=i if self.shared else 0,
+                        prepare_heads=self.prepared_heads[i] if block_attention else None,
                     )
+                )
+            if block_attention:
+                attn_decode.decode_rows(
+                    attention,
+                    visit.k,
+                    visit.v,
+                    layer._decode_rel_table,
+                    projections[0],
+                    global_cache=layer.is_global,
+                    gate_col=HQ * (HD + DR) + 32,
+                    out=self.o.input,
                 )
             if self.shared:
                 projected = self.o.project(layer.wo)

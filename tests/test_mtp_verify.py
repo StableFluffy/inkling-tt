@@ -71,25 +71,29 @@ def main(trace_only):
             raise AssertionError("verify accepted a block that crosses lmax")
 
         model.capture()
-        seed(len(prompt))
-        verifier.stage(block, len(prompt))
-        trace = ttnn.begin_trace_capture(dev, cq_id=0)
-        verifier.verify()
-        ttnn.end_trace_capture(dev, trace, cq_id=0)
-        seed(len(prompt))
-        verifier.stage(block, len(prompt))
-        verifier.verify(grouped_glue=False)
-        ttnn.synchronize_device(dev)
-        seed(len(prompt))
-        verifier.stage(block, len(prompt))
-        baseline_trace = ttnn.begin_trace_capture(dev, cq_id=0)
-        verifier.verify(grouped_glue=False)
-        ttnn.end_trace_capture(dev, baseline_trace, cq_id=0)
+        verify_traces = []
+        for glue, attention in ((False, False), (True, False), (True, True)):
+            seed(len(prompt))
+            verifier.stage(block, len(prompt))
+            verifier.verify(grouped_glue=glue, grouped_attention=attention)
+            check_outputs(references[len(prompt)])
+            ttnn.synchronize_device(dev)
+            seed(len(prompt))
+            verifier.stage(block, len(prompt))
+            trace = ttnn.begin_trace_capture(dev, cq_id=0)
+            verifier.verify(grouped_glue=glue, grouped_attention=attention)
+            ttnn.end_trace_capture(dev, trace, cq_id=0)
+            verify_traces.append(trace)
+        trace = verify_traces[-1]
         try:
             for pos, expected in references.items():
                 seed(pos)
                 verifier.stage(block, pos)
                 ttnn.execute_trace(dev, trace, cq_id=0, blocking=True)
+                check_outputs(expected)
+                seed(pos)
+                verifier.stage(block, pos)
+                ttnn.execute_trace(dev, verify_traces[1], cq_id=0, blocking=True)
                 check_outputs(expected)
                 if trace_only:
                     continue
@@ -109,8 +113,8 @@ def main(trace_only):
                 print(f"position {pos}: every rejected suffix can be overwritten by B1", flush=True)
             print(f"{len(references)} verify replays match the serial B1 logits and taps", flush=True)
             pos = len(prompt)
-            times = [[], [], []]
-            traces = (model.trace_id, baseline_trace, trace)
+            traces = (model.trace_id, *verify_traces)
+            times = [[] for _ in traces]
             for trial in range(12):
                 for kind in ((trial + i) % len(traces) for i in range(len(traces))):
                     seed(pos)
@@ -122,7 +126,9 @@ def main(trace_only):
                     start = time.perf_counter()
                     ttnn.execute_trace(dev, traces[kind], cq_id=0, blocking=True)
                     times[kind].append(1000 * (time.perf_counter() - start))
-            for name, samples in zip(("B1", "verify serial epilogues", "verify grouped epilogues"), times):
+            for name, samples in zip(
+                ("B1", "verify serial epilogues", "verify grouped epilogues", "verify grouped attention"), times
+            ):
                 warm = samples[2:]
                 print(
                     f"{name}: {statistics.median(warm):.2f} ms median, "
@@ -130,8 +136,8 @@ def main(trace_only):
                     flush=True,
                 )
         finally:
-            ttnn.release_trace(dev, baseline_trace)
-            ttnn.release_trace(dev, trace)
+            for trace in verify_traces:
+                ttnn.release_trace(dev, trace)
             pf.close()
     finally:
         ttnn.close_device(dev)

@@ -17,6 +17,7 @@ def main():
         device.enable_program_cache()
         for global_cache in (False, True):
             check(device, global_cache)
+            check_rows(device, global_cache)
     finally:
         ttnn.close_device(device)
 
@@ -98,6 +99,64 @@ def check(device, global_cache):
                 print(f"{label}: {statistics.median(timings):.2f}/{p95:.2f} us median/p95", flush=True)
     finally:
         ttnn.release_trace(device, serial_trace)
+        ttnn.release_trace(device, trace)
+
+
+def check_rows(device, global_cache):
+    rng = torch.Generator().manual_seed(1051)
+    placement = dense._l1_shards(device, 3072, 4)
+    capacity = 2208 if global_cache else attn_decode.RING_SLOTS
+
+    def upload(shape, mem=DRAM):
+        host = torch.randn(shape, generator=rng, dtype=torch.bfloat16)
+        return ttnn.from_torch(host, dtype=BF, layout=TILE, device=device, memory_config=mem)
+
+    queries = tuple(
+        (
+            upload((1, 1, 24, 128)),
+            upload((1, 1, 24, 32)),
+            upload((32, 32)),
+            _alloc(device, (1,), ttnn.int32, RM),
+        )
+        for _ in range(4)
+    )
+    k, v = (upload((1, 8, capacity, 128)) for _ in range(2))
+    gate = upload((1, 1, 32, 3072), placement)
+    out = ttnn.allocate_tensor_on_device(gate.shape, BF, TILE, device, placement)
+    rel = torch.randn((W + 1, 32), generator=rng, dtype=torch.bfloat16)
+    rel[-1].zero_()
+    table = attn_decode.prepare_table(rel, global_cache=global_cache, device=device)
+
+    def position(start):
+        for i, (_, _, _, pos) in enumerate(queries):
+            host = ttnn.from_torch(torch.tensor([start + i], dtype=torch.int32), dtype=pos.dtype, layout=pos.layout)
+            ttnn.copy_host_to_device_tensor(host, pos)
+
+    def serial():
+        for row, (q, r, sink, pos) in enumerate(queries):
+            attn_decode.decode(
+                q, k, v, r, sink, table, pos, gate, global_cache=global_cache, gate_col=0, out=out, row=row
+            )
+
+    def grouped():
+        attn_decode.decode_rows(queries, k, v, table, gate, global_cache=global_cache, gate_col=0, out=out)
+
+    position(29)
+    grouped()
+    serial()
+    ttnn.synchronize_device(device)
+    trace = ttnn.begin_trace_capture(device, cq_id=0)
+    grouped()
+    ttnn.end_trace_capture(device, trace, cq_id=0)
+    try:
+        for start in (1, 29, 31, 61, 127, 257, 1023, 1087, 2015, 2047, 2204):
+            position(start)
+            serial()
+            oracle = ttnn.to_torch(out)[..., :4, :]
+            ttnn.execute_trace(device, trace, cq_id=0, blocking=True)
+            assert torch.equal(ttnn.to_torch(out)[..., :4, :], oracle), (global_cache, start)
+        print(f"{capacity} slots: one attention launch matches 44 serial B1 rows", flush=True)
+    finally:
         ttnn.release_trace(device, trace)
 
 

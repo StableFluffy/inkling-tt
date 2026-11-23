@@ -626,7 +626,9 @@ class Layer:
         hn = self.ops.rms(rows[0]) if shared else None
         return tuple(self.gate_msg(s, u, m, hn, weight=norm) for s, u, m, norm in zip("qkv", rows, messages, norms))
 
-    def attention(self, xq, xk, xv, vs: Visit, st: Step, *, scratch=None, projections=None, output=None, row=0):
+    def attention(
+        self, xq, xk, xv, vs: Visit, st: Step, *, scratch=None, projections=None, output=None, row=0, prepare_heads=None
+    ):
         c = self.c
         if projections is not None:
             qrsg, kr, vr, k_dyn, v_dyn = projections
@@ -640,7 +642,9 @@ class Layer:
         tau = st.tau if self.is_global else None
         q, rp, sinkt, k_shard, v_shard, gated = c.attention_glue
         fused_decode = c.fused_attn_decode and (not self.is_global or (vs.klen % 32 == 0 and vs.klen <= 32768))
-        if fused_decode:
+        if prepare_heads is not None:
+            q, rp, sinkt = prepare_heads
+        elif fused_decode:
             # The eager graph in capture() allocates this scratch before tracing.
             if not hasattr(c, "_fused_attention_heads"):
                 c._fused_attention_heads = tuple(
@@ -749,6 +753,8 @@ class Layer:
             # capture() runs this branch eagerly before opening the trace.
             if not hasattr(self, "_decode_rel_table"):
                 self._decode_rel_table = attn_decode.prepare_table(self.rel_table, global_cache=self.is_global)
+            if prepare_heads is not None:
+                return q, rp, sinkt, st.pos_g
             attn_decode.decode(
                 q,
                 vs.k,

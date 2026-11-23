@@ -19,7 +19,7 @@ _LAUNCH_LOCK = Lock()
 
 
 @lru_cache(maxsize=24)
-def _program(accessors, length, physical_length, global_cache, gate_tile, cols, rows, first_head, heads, row):
+def _program(accessors, length, physical_length, global_cache, gate_tile, cols, rows, first_head, heads, row, batch):
     grid = ttnn.num_cores_to_corerangeset(heads * _SPLITS, ttnn.CoreCoord(cols, rows), row_wise=True)
     split_tiles = (length // 32 + _SPLITS - 1) // _SPLITS
     tiles = min(split_tiles, 4)
@@ -48,6 +48,8 @@ def _program(accessors, length, physical_length, global_cache, gate_tile, cols, 
         defines.append(("ATTN_RING_TILES", str(physical_length // 32)))
     if row:
         defines.append(("ATTN_QUERY_ROW", str(row)))
+    batch_defines = [("ATTN_ROWS", str(batch)), ("ATTN_WORKERS", str(heads * _SPLITS))] if batch > 1 else []
+    defines.extend(batch_defines)
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "io.cpp"),
@@ -67,6 +69,7 @@ def _program(accessors, length, physical_length, global_cache, gate_tile, cols, 
             kernel_source=str(_KERNELS / "compute.cpp"),
             core_ranges=grid,
             compile_time_args=[length // 32, int(global_cache), cols],
+            defines=batch_defines,
             config=config,
         ),
     ]
@@ -105,7 +108,7 @@ def _program(accessors, length, physical_length, global_cache, gate_tile, cols, 
         )
         for index, fmt, pages, size in buffers
     ]
-    semaphores = [ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, grid, 0) for i in range(3)]
+    semaphores = [ttnn.SemaphoreDescriptor(i, ttnn.CoreType.WORKER, grid, 0) for i in range(5 if batch > 1 else 3)]
     desc = ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=semaphores)
     desc.custom_program_hash = ttnn.compute_program_descriptor_hash(desc)
     return desc, kernels
@@ -162,6 +165,19 @@ def prepare_table(table, *, global_cache, device=None):
 
 def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out, row=0):
     """Apply position-derived attention and write the gated row into preallocated O shards."""
+    return _decode(((q, relative, sink, position),), k, v, table, gate, global_cache, gate_col, out, row)
+
+
+def decode_rows(queries, k, v, table, gate, *, global_cache, gate_col, out):
+    """Apply the B1 attention partition to each consecutive query in one program."""
+    return _decode(queries, k, v, table, gate, global_cache, gate_col, out, 0)
+
+
+def _decode(queries, k, v, table, gate, global_cache, gate_col, out, row):
+    batch = len(queries)
+    if not 1 <= batch <= 8:
+        raise ValueError("attention requires one to eight query rows")
+    q, relative, sink, position = queries[0]
     length = k.shape[-2]
     if length < 32 or length > _MAX_LENGTH or length % 32 or (not global_cache and length not in (_WINDOW, RING_SLOTS)):
         raise ValueError("fused attention requires a supported sliding ring or a tile-aligned global cache")
@@ -174,7 +190,7 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
         raise ValueError("fused attention decode requires a tile-aligned output gate")
     device = q.device()
     rows = gate.shape[-2]
-    if not 0 <= row < rows or rows not in (1, 32):
+    if not 0 <= row < row + batch <= rows or rows not in (1, 32):
         raise ValueError("fused attention gate row must fit within one tile")
     inputs = (q, k, v, relative, sink, table, position, gate)
     operands = (*inputs, out)
@@ -211,8 +227,21 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
         raise ValueError("fused attention decode requires independent output storage")
 
     accessors = tuple(tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args()) for t in operands)
+    more_queries = tuple(t for query in queries[1:] for t in query)
+    for i, t in zip((0, 3, 4, 6) * (batch - 1), more_queries):
+        original = operands[i]
+        if (
+            not t.is_allocated()
+            or t.device() != device
+            or t.shape != original.shape
+            or t.dtype != original.dtype
+            or t.layout != original.layout
+            or t.memory_config() != original.memory_config()
+        ):
+            raise ValueError("attention rows require the same shapes and placements")
     cols, rows, heads, peers = _placement(device, kv_heads)
     addresses = [t.buffer_address() for t in operands]
+    extra = [t.buffer_address() for t in more_queries]
     with _LAUNCH_LOCK:
         for first_head in range(0, kv_heads, heads):
             desc, kernels = _program(
@@ -226,9 +255,10 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
                 first_head,
                 heads,
                 row,
+                batch,
             )
-            kernels[0].common_runtime_args = [*addresses, *peers]
-            kernels[1].common_runtime_args = [*addresses, *peers]
+            kernels[0].common_runtime_args = [*addresses, *peers, *extra]
+            kernels[1].common_runtime_args = [*addresses, *peers, *extra]
             desc.kernels = kernels
-            ttnn.generic_op(list(operands), desc)
+            ttnn.generic_op([*inputs, *more_queries, out], desc)
     return out
