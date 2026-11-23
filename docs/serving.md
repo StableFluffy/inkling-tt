@@ -16,7 +16,7 @@ docker run -d --name inkling --privileged \
   -v "$INKLING_HF_SD":/models/hf_sd:ro \
   -v "$INKLING_SNAPSHOT":/models/Inkling-2-Mini:ro \
   -v "$INKLING_WORK/image-cache":/cache \
-  inkling-2-mini-tt:0.1.1
+  ghcr.io/stablefluffy/inkling-tt:0.1.1
 
 until curl -sf localhost:8000/health; do sleep 10; done
 ```
@@ -86,7 +86,7 @@ docker run -d --name inkling-mtp --privileged \
   -v "$INKLING_HF_SD":/models/hf_sd:ro \
   -v "$INKLING_SNAPSHOT":/models/Inkling-2-Mini:ro \
   -v "$INKLING_WORK/image-cache":/cache \
-  inkling-2-mini-tt:0.1.1 --mtp --lmax 8192
+  ghcr.io/stablefluffy/inkling-tt:0.1.1 --mtp --lmax 8192
 ```
 
 From a source checkout, use `PORT=8000 scripts/serve.sh --mtp --lmax 8192`. The server enables

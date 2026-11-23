@@ -25,7 +25,7 @@ hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa615fc413cc9af3379
 
 The converted weights are the official checkpoint dequantized to BF16 and split per layer. To make them yourself, see [docs/install.md](docs/install.md#3-download-and-convert-the-checkpoint).
 
-Build the release image with the pinned tt-metal tree. See [docs/development.md](docs/development.md#release-image).
+Then start the server from the container image:
 
 ```bash
 docker run -d --name inkling --privileged \
@@ -33,7 +33,7 @@ docker run -d --name inkling --privileged \
   -e TT_VISIBLE_DEVICES=0 -e TT_METAL_VISIBLE_DEVICES=0 -p 127.0.0.1:8000:8000 \
   -v "$PWD/hf_sd":/models/hf_sd:ro -v "$PWD/Inkling-2-Mini":/models/Inkling-2-Mini:ro \
   -v "$PWD/cache":/cache \
-  inkling-2-mini-tt:0.1.1
+  ghcr.io/stablefluffy/inkling-tt:0.1.1
 
 until curl -sf localhost:8000/health; do sleep 10; done
 
@@ -41,8 +41,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages": [{"role": "user", "content": "What is 2+3?"}], "temperature": 0, "max_tokens": 256}'
 ```
 
-For greedy DSpark speculation, download the 0.64 GB drafter into the same snapshot directory and append
-`--mtp --lmax 8192` after the image name in the command above.
+For greedy DSpark speculation, download the 0.64 GB drafter into the same snapshot directory and append `--mtp --lmax 8192` after the image name in the command above. It speeds up code and math the most; see [docs/speculative.md](docs/speculative.md).
 
 ```bash
 hf download thinkingmachines/Inkling-2-Mini mtp.safetensors \
