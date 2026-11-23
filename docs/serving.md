@@ -56,7 +56,7 @@ INKLING_URL=http://localhost:8000 python3 tools/bench_server.py
 | Option | Default | Meaning |
 |---|---|---|
 | `--lmax` | 32768 | Context length (prompt plus output), multiple of 32 |
-| `--prefill-chunk` | 2048, 128 with `--mtp` | Prefill bucket rows; `0` feeds prompts token by token |
+| `--prefill-chunk` | 2048 | Prefill bucket rows; `0` feeds prompts token by token |
 | `--host`, `--port` | 127.0.0.1, 8400 | Listen address (the image uses 0.0.0.0:8000 inside the container) |
 | `--device-id` | 0 | Card index within the visible devices |
 | `--no-trace` | off | Run decode eagerly, for debugging |
@@ -87,10 +87,10 @@ PORT=8000 scripts/serve.sh --mtp 3 --lmax 8192
 INKLING_URL=http://localhost:8000 python3 tools/bench_server.py --compare-mtp
 ```
 
-The speculative configuration defaults to the 128-row prefill bucket and retains fewer global
-attention scores in L1. With the speculative workspaces resident, the 2,048-row expert lane
-program exceeded L1 on the tested card. The smaller bucket increases time to first token on
-long prompts. See [speculative.md](speculative.md) for the round and measurements.
+Both 128- and 2,048-row prefill buckets run with MTP at an 8,192-token context on the tested
+card. The runtime shares the head workspace, reserves one expert weight buffer per prefill
+gate/up reader and retains up to 56 global score tiles. The second pass recomputes scores
+past that range. See [speculative.md](speculative.md) and [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).
 
 ## vLLM
 

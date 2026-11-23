@@ -656,7 +656,7 @@ class Prefill:
     readout in creation order. Close buckets in reverse creation order.
     """
 
-    def __init__(self, m, chunk=512, fixed=True, warmup=True, *, trace=True, global_score_tiles=None):
+    def __init__(self, m, chunk=512, fixed=True, warmup=True, *, trace=True, global_score_tiles=None, weight_buffers=2):
         if not 128 <= chunk <= 2048 or chunk % 32:
             raise ValueError("chunk must be a multiple of 32 between 128 and 2048")
         if m.lmax % 32:
@@ -756,6 +756,7 @@ class Prefill:
                 broadcast_down=broadcast_down,
                 full_tiles=full_tiles,
                 lanes=lanes,
+                weight_buffers=weight_buffers,
                 wide_l1_blocks=None if wide is None else int(wide),
             )
             if any(stream)
@@ -1115,6 +1116,7 @@ class Prefill:
         return _stencil(y, layer.pm_taps, visit.conv[3], self.meta, residual=z), bank
 
     def _body(self):
+        self.ops.prefill_lin = self.lin
         self._bank_items = {}
         self._un16 = None
         try:

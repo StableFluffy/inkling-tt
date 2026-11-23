@@ -657,11 +657,6 @@ class Layer:
         if prepare_heads is not None:
             q, rp, sinkt = prepare_heads
         elif fused_decode:
-            # The eager graph in capture() allocates this scratch before tracing.
-            if not hasattr(c, "_fused_attention_heads"):
-                c._fused_attention_heads = tuple(
-                    ttnn.allocate_tensor_on_device(t.shape, BF, TILE, c.dev, L1) for t in (q, rp, sinkt)
-                )
             q, rp, sinkt = c._fused_attention_heads
         if c.layout_fusion and not c.join_attention_prep:
             rowvm.attention_heads(qrsg, q, rp, sinkt, q_threshold=QK_CLIP, r_threshold=REL_CLIP, tau=tau)
@@ -1003,6 +998,8 @@ def init_attention_glue(c, lmax):
         alloc((1, 1, HKV, HD), c.kv_shard),
         alloc((1, 1, 1, HQ * HD)),
     )
+    if c.fused_attn_decode:
+        c._fused_attention_heads = tuple(alloc(t.shape, L1) for t in c.attention_glue[:3])
     c.attention_bias = {width: alloc((1, 1, HQ, width)) for width in {W, lmax}}
 
 

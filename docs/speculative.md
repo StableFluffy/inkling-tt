@@ -163,17 +163,6 @@ that reaches the 1,024-key window boundary. Times exclude prefill and draft cont
 with `"mtp": false`. See [serving.md](serving.md#speculative-decoding) for the checkpoint file and
 launch command.
 
-`tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` compared streamed responses in
-one server process with an 8,192-slot context and the 128-row prefill bucket. All five prompts
-produced identical stream events and usage across modes. Times measure decode per generated ID.
-
-| Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
-|---|---:|---:|
-| Chat | 20.60 / 20.69 | 25.40 / 25.40 |
-| Python | 20.60 / 20.69 | 21.90 / 21.90 |
-| Korean | 20.60 / 20.69 | 24.80 / 24.80 |
-| 1,580 tokens | 21.20 / 21.29 | 24.10 / 24.10 |
-| 7,820 tokens | 21.70 / 21.88 | 27.20 / 27.29 |
-
-MTP remains opt-in. The 7,820-token prompt reaches its first token in about 12.7 s with
-the 128-row prefill bucket.
+`tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` compares streamed responses
+with both prefill buckets resident and an 8,192-token context. It checks the stream choices
+and usage for each run. The HTTP results and the default are in [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).

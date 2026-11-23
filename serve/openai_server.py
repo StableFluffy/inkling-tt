@@ -562,7 +562,7 @@ def main():
     ap.add_argument("--prefill-chunk", type=int)
     args = ap.parse_args()
     if args.prefill_chunk is None:
-        args.prefill_chunk = 128 if args.mtp else 2048
+        args.prefill_chunk = 2048
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     engine = Engine(args)

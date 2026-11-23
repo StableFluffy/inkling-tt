@@ -61,6 +61,8 @@ class InklingRuntime:
             self.speculative = SpeculativeRound(
                 self.m, self.buckets, paths.snapshot(), proposals=self.mtp, adaptive=self.mtp <= 3
             )
+            for bucket in self.buckets:
+                bucket._warm()
             self.speculative.warm()
         if self.sampler is not None:
             self.sampler.warm()
@@ -78,10 +80,16 @@ class InklingRuntime:
         from inkling_tt.prefill import Prefill
 
         t0 = time.time()
-        # A short-prompt bucket and a long one; each warms its programs in the constructor, and all of them must
-        # exist before the decode trace is captured.
+        # With MTP, warm the buckets after allocating the draft and verifier workspaces.
         self.buckets = [
-            Prefill(self.m, c, global_score_tiles=72 if self.mtp else None) for c in sorted({128, self.chunk})
+            Prefill(
+                self.m,
+                c,
+                warmup=not self.mtp,
+                global_score_tiles=56 if self.mtp else None,
+                weight_buffers=1 if self.mtp else 2,
+            )
+            for c in sorted({128, self.chunk})
         ]
         self.pf = self.buckets[0]
         self.reset()

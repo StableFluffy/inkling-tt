@@ -84,6 +84,14 @@ The 2048-row bucket uses `norm_compute.cpp` to normalize 32 rows at a time and w
 
 Prefill and decode share the visit state of `InklingTT2`: the 48 K/V caches, the 192 convolution histories and the position. After the last chunk the cache holds the whole prompt, the readout gives the first output token, and decode continues at `position = len(prompt)`. Cache slots past the position are masked, so a new request only zeroes the convolution histories (`InklingRuntime.reset`).
 
+## MTP memory budget
+
+The MTP runtime allocates both buckets, the verifier and the drafter before it warms any
+prefill or speculative trace. The buckets share the LM head projection with decode and the
+drafter. Compact gate/up and wide expert lanes use one resident expert weight buffer each.
+More of the wide down-projection output goes to DRAM, and global attention retains up to
+56 score tiles per worker. The remaining tiles are recomputed in the second FP32 pass.
+
 ## Capture order
 
 A trace replays recorded commands at fixed device addresses. A buffer allocated while a trace exists can land on memory that the trace uses for its intermediates, so every buffer must exist before `m.capture()`. Every program must also have run once, so that its binary is compiled and cached before capture:

@@ -392,9 +392,12 @@ class _PrefillWorkspace:
     broadcast_down: bool
     lanes: int = 0
     down_l1_blocks: int = 0
+    weight_buffers: int = 2
 
 
-def prepare_prefill(device, tokens, *, broadcast_down=False, full_tiles=False, lanes=0, wide_l1_blocks=None):
+def prepare_prefill(
+    device, tokens, *, broadcast_down=False, full_tiles=False, lanes=0, wide_l1_blocks=None, weight_buffers=2
+):
     """Allocate reusable scratch for one prefill chunk on a single device.
 
     Use a separate workspace for each simultaneously live output. To trace the
@@ -405,6 +408,8 @@ def prepare_prefill(device, tokens, *, broadcast_down=False, full_tiles=False, l
         raise ValueError("prefill supports 32 to 2048 tokens in multiples of 32")
     if lanes and not full_tiles:
         raise ValueError("lane projections require full activation tiles")
+    if weight_buffers not in (1, 2):
+        raise ValueError("prefill projections reserve one or two expert weight buffers")
     max_lanes = prefill_lane_capacity(device)
     if not 0 <= lanes <= max_lanes:
         raise ValueError(f"prefill expert lanes must be between 0 and {max_lanes} for this worker grid, got {lanes}")
@@ -427,7 +432,7 @@ def prepare_prefill(device, tokens, *, broadcast_down=False, full_tiles=False, l
         # more bytes per worker; the existing DRAM tail holds the remainder.
         grid = device.compute_with_storage_grid_size()
         workers = grid.x * grid.y
-        default_blocks = 600 if workers >= 130 else 540 if workers >= 120 else 480
+        default_blocks = 256 if weight_buffers == 1 else 600 if workers >= 130 else 540 if workers >= 120 else 480
         if not has_default_l1_budget(device):
             default_blocks -= 56
         down_l1_blocks = min(capacity, int(os.environ.get("INK_PREFILL_EXPERT_DOUT_L1", default_blocks)))
@@ -457,6 +462,7 @@ def prepare_prefill(device, tokens, *, broadcast_down=False, full_tiles=False, l
         broadcast_down,
         lanes,
         down_l1_blocks,
+        weight_buffers,
     )
 
 
@@ -710,7 +716,7 @@ def _prefill_project(gate, workspace, handle, *, verify=False):
             tuple(_accessor(t) for t in (ends, x, output, *tail)),
             broadcast_down,
             workspace.rows,
-            workspace.tokens > 1024,
+            workspace.tokens > 1024 or workspace.weight_buffers == 1,
             wide_blocks,
             verify,
         )
@@ -785,7 +791,7 @@ def _lane_tasks(device, lanes, gate, pairs):
 
 
 @lru_cache(maxsize=16)
-def _lane_program(gate, tasks, fidelity, specs, wide_blocks):
+def _lane_program(gate, tasks, fidelity, specs, wide_blocks, weight_buffers):
     k = _GU_K if gate else _DOWN_K
     block_k = _GU_K_BLOCK if gate else _DOWN_K_BLOCK
     cols = 4
@@ -794,7 +800,7 @@ def _lane_program(gate, tasks, fidelity, specs, wide_blocks):
     grid = ttnn.CoreRangeSet([ttnn.CoreRange(core, core) for core, _ in rt])
     cbs = [
         _cb(grid, 0, _BF, 2048, 2 * k),
-        _cb(grid, 1, _BFP8, 1088, 2 * k * cols),
+        _cb(grid, 1, _BFP8, 1088, weight_buffers * k * cols),
         _cb(grid, 2, ttnn.uint32, _EXPERTS * 4),
         _cb(grid, 3, ttnn.uint32, _EXPERTS * 4),
         _cb(grid, 16, _BF, 2048, 2 * out_cols),
@@ -843,7 +849,14 @@ def _prefill_project_lanes(gate, workspace, handle, compact=None):
     ends = workspace.ends
     tensors = (ends, x, output, *tail)
     with _LOCK:
-        desc, kernels = _lane_program(gate, tasks, handle.fidelity, tuple(_accessor(t) for t in tensors), wide_blocks)
+        desc, kernels = _lane_program(
+            gate,
+            tasks,
+            handle.fidelity,
+            tuple(_accessor(t) for t in tensors),
+            wide_blocks,
+            workspace.weight_buffers,
+        )
         kernels[0].common_runtime_args = [ends.buffer_address(), weights.buffer_address()]
         kernels[1].common_runtime_args = [t.buffer_address() for t in tensors]
         desc.kernels = kernels

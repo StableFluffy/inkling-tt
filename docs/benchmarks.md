@@ -43,6 +43,26 @@ Each chunk goes to whichever bucket costs less for the tokens that remain. A 300
 | Long, greedy | 7,820 | 3.709 / 3.714 s | 19.8 / 20.0 ms/token |
 | Short, sampled (T=0.8) | 23 | 0.126 / 0.146 s | 19.5 / 19.9 ms/token |
 
+## Adaptive greedy MTP
+
+`tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` alternates B1 and adaptive
+DSpark requests against the same source server. The server runs with `--mtp 3 --lmax 8192`
+and both prefill buckets resident. The streamed choices and usage are identical across all
+30 requests. Values are median/p95.
+
+| Prompt | B1 decode, ms/ID | MTP decode, ms/ID | B1 TTFT, ms | MTP TTFT, ms |
+|---|---:|---:|---:|---:|
+| Chat | 18.60/18.69 | 19.00/19.18 | 141.90/142.62 | 142.50/143.04 |
+| Python | 18.70/19.24 | 15.60/15.60 | 153.60/153.69 | 153.90/154.26 |
+| Korean | 19.20/19.29 | 19.30/19.30 | 166.00/172.12 | 167.80/172.12 |
+| 1,580 tokens | 19.90/19.99 | 20.40/20.40 | 1125.50/1166.54 | 1120.30/1144.60 |
+| 7,820 tokens | 20.60/20.60 | 20.60/21.05 | 4955.70/4981.71 | 4999.80/5007.90 |
+
+The mean of the five decode medians is 19.40 ms/ID for B1 and 18.98 ms/ID for MTP.
+Chat and the 1,580-token prompt have higher median latency with MTP, so B1 is the server
+default. With MTP enabled, the 7,820-token prompt reaches its first token in about five
+seconds.
+
 ## Accuracy
 
 The reference is Hugging Face's eager implementation in BF16 on the CPU. These checks measure how closely the port tracks it on local fixtures; they are not a task evaluation.
