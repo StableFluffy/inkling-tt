@@ -33,6 +33,8 @@ Decode slows slightly with context length because global-attention visits read m
 
 Sharing the prefix across four adjacent query tiles cuts the full-cache median from 22.546 s to 20.779 s. Grouping the three heads of a KV group cuts a further 0.078 s in its interleaved comparison. The logits were bitwise identical across both schedules at 2,048, 8,192, 30,000 and 32,768 tokens.
 
+Fusing the residual add into the stencil saves 23 ms at 2,048 tokens and 90 ms at 8,192 tokens in an interleaved comparison with the four-query schedule. Both paths produce the same logits.
+
 Each chunk goes to whichever bucket costs less for the tokens that remain, so a 300-token prompt runs as three 128-row chunks and an 8,192-token prompt as four 2048-row chunks. Throughput falls at 32k because attention over the global layers grows with the prompt. The 32,768-token row fills the whole cache and leaves no room for output.
 
 ## Server

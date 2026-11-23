@@ -63,6 +63,16 @@ void kernel_main() {
                 }
             }
             MATH((_llk_math_eltwise_binary_sfpu_params_(round_bf16, 0, 0, 0, VectorMode::None)));
+#ifdef PREFILL_RESIDUAL
+            cb_wait_front(5, 1);
+            load(5, 0, 1);
+            add_binary_tile_init();
+            add_binary_tile(0, 1, 0);
+            cb_pop_front(5, 1);
+            if constexpr (get_compile_time_arg_val(4)) {
+                MATH((_llk_math_eltwise_binary_sfpu_params_(round_bf16, 0, 0, 0, VectorMode::None)));
+            }
+#endif
             tile_regs_commit();
             cb_reserve_back(16, 1);
             tile_regs_wait();

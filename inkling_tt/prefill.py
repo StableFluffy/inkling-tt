@@ -240,9 +240,11 @@ def _state_program(tasks, tiles, capacity, cols, last, specs):
 
 
 @lru_cache(maxsize=16)
-def _conv_program(tasks, cols, dynamic, tiles, x_dtype, specs):
+def _conv_program(tasks, cols, dynamic, tiles, x_dtype, out_dtype, residual_dtype, specs):
     grid, rt = _grid(tasks)
-    args = [cols, int(dynamic), tiles, int(x_dtype == BF)]
+    residual_bytes = 0 if residual_dtype is None else (2048 if residual_dtype == BF else 4096)
+    args = [cols, int(dynamic), tiles, int(x_dtype == BF), int(out_dtype == BF), residual_bytes]
+    defines = [("PREFILL_RESIDUAL", "1")] if residual_dtype is not None else []
     reader, writer = tuple(sum(group, ()) for group in specs)
     cbs = [
         _tile_cb(grid, i, dt, pages, size)
@@ -251,9 +253,11 @@ def _conv_program(tasks, cols, dynamic, tiles, x_dtype, specs):
             (1, FP, 4, None),
             (3, FP, 5, None),
             (4, ttnn.uint32, 2, 32),
-            (16, BF, 2, None),
+            (16, out_dtype, 2, None),
         )
     ]
+    if residual_dtype is not None:
+        cbs.append(_tile_cb(grid, 5, residual_dtype, 2))
     if dynamic:
         cbs.append(_tile_cb(grid, 2, FP, 8))
     kernels = [
@@ -262,7 +266,7 @@ def _conv_program(tasks, cols, dynamic, tiles, x_dtype, specs):
             core_ranges=grid,
             compile_time_args=[*args, *reader],
             runtime_args=rt,
-            defines=[("PREFILL_DYN", "1")] if dynamic else [],
+            defines=defines + ([("PREFILL_DYN", "1")] if dynamic else []),
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
@@ -278,7 +282,8 @@ def _conv_program(tasks, cols, dynamic, tiles, x_dtype, specs):
             core_ranges=grid,
             compile_time_args=args,
             runtime_args=rt,
-            config=_compute((1, 2) if x_dtype == BF else (0, 1, 2)),
+            defines=defines,
+            config=_compute(((1, 2) if x_dtype == BF else (0, 1, 2)) + ((5,) if residual_dtype == FP else ())),
         ),
     ]
     return _program(kernels, cbs)
@@ -457,13 +462,21 @@ def _alloc(device, shape, dtype=BF, layout=TILE):
     return ttnn.allocate_tensor_on_device(ttnn.Shape(shape), dtype, layout, device, DRAM)
 
 
-def _stencil(x, taps, history, meta, dyn=None):
-    out = _alloc(x.device(), x.shape)
+def _stencil(x, taps, history, meta, dyn=None, *, residual=None, dtype=BF):
+    out = _alloc(x.device(), x.shape, dtype)
     cols = x.shape[-1] // 32
-    inputs = (meta, x, taps, history) + ((dyn,) if dyn is not None else ())
+    inputs = (meta, x, taps, history, *(t for t in (dyn, residual) if t is not None))
     _launch(
         _conv_program,
-        (_tasks(x.device(), cols), cols, dyn is not None, x.shape[-2] // 32, x.dtype),
+        (
+            _tasks(x.device(), cols),
+            cols,
+            dyn is not None,
+            x.shape[-2] // 32,
+            x.dtype,
+            dtype,
+            None if residual is None else residual.dtype,
+        ),
         inputs,
         (meta, out),
     )
@@ -847,18 +860,14 @@ class Prefill:
                 qkv = [ops.rms(self.gate_msg(layer, s, h, v, hn), layer.norm_in, BF) for s, v in zip("qkv", messages)]
 
         a = self.attention(layer, *qkv, visit)
-        a = f32(_stencil(a, layer.pa_taps, visit.conv[2], self.meta))
+        z = _stencil(a, layer.pa_taps, visit.conv[2], self.meta, residual=None if layer.block_boundary else x, dtype=FP)
         if layer.block_boundary:
             bank = [*bank, ops.rms(x)]
-            z = a
-        else:
-            z = ttnn.add(f32(x), a)
         hm = self.mix(bank, z, layer.q_mlp, 1)[0]
         if messages is not None:
             hm = self.gate_msg(layer, "mlp", hm, messages[3])
         y = self.moe(layer, ops.rms(hm, layer.norm_post, BF))
-        y = _stencil(y, layer.pm_taps, visit.conv[3], self.meta)
-        return bf16(ttnn.add(z, f32(y))), bank
+        return _stencil(y, layer.pm_taps, visit.conv[3], self.meta, residual=z), bank
 
     def _body(self):
         self._bank_items = {}

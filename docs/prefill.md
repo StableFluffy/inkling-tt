@@ -72,7 +72,7 @@ another 0.28 s on a 32k-token prompt.
 
 ## Convolution, depth mixing, message gates
 
-- The stencil kernel (`conv_io.cpp`, `conv_compute.cpp`) applies the four-tap causal convolution, static or dynamic, to a whole chunk. It reads the visit's three-row FP32 history, accumulates in FP32, and updates the history in place in the layout decode reads. At position 0 it treats the history as zero.
+- The stencil kernel (`conv_io.cpp`, `conv_compute.cpp`) applies the four-tap causal convolution, static or dynamic, to a whole chunk. It reads the visit's three-row FP32 history, accumulates in FP32, and updates the history in place in the layout decode reads. At position 0 it treats the history as zero. The post-attention and post-MoE stencils also apply the residual add. They round the convolution to BF16 before the FP32 add, and round the final layer output to BF16 nearest-even.
 - The heads kernel (`heads_io.cpp`, `heads_compute.cpp`) clips or RMS-scales each 128-channel head in FP32 and writes head-major tiles; global queries are rounded to BF16 and multiplied by their row's `tau`.
 - Depth mixing computes RMS and the depth logits with TTNN ops and the weighted sum over bank entries with `mix_compute.cpp`, for one, three or four query rows.
 - The message-gate kernel (`gate_compute.cpp`) evaluates `u * (1 - tanh(h W_f)) + m * tanh(h W_g)` in FP32 for one output tile.

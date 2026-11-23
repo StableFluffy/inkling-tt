@@ -7,6 +7,8 @@ constexpr uint32_t tiles = get_compile_time_arg_val(2);
 constexpr bool bf_input = get_compile_time_arg_val(3);
 constexpr uint32_t x_bytes = bf_input ? bf_bytes : fp_bytes;
 constexpr uint32_t x_row = bf_input ? 32 : 64;
+constexpr uint32_t out_bytes = get_compile_time_arg_val(4) ? bf_bytes : fp_bytes;
+constexpr uint32_t residual_bytes = get_compile_time_arg_val(5);
 
 uint32_t row_offset(uint32_t row, uint32_t half) {
     return ((row / 16 * 2 + half) * 256 + row % 16 * 16) * 4;
@@ -20,7 +22,7 @@ void local_copy(uint32_t src, uint32_t dst, uint32_t bytes) {
 
 void kernel_main() {
     const auto addr = [](uint32_t i) { return get_common_arg_val<uint32_t>(i); };
-    constexpr auto a0 = TensorAccessorArgs<4>();
+    constexpr auto a0 = TensorAccessorArgs<6>();
     constexpr auto a1 = TensorAccessorArgs<a0.next_compile_time_args_offset()>();
     const auto meta = TensorAccessor(a0, addr(0), 32);
     const uint32_t metadata = get_write_ptr(4)
@@ -39,11 +41,11 @@ void kernel_main() {
     const uint32_t end = get_arg_val<uint32_t>(1);
 
 #ifdef PREFILL_WRITE
-    const auto out = TensorAccessor(a1, addr(1), bf_bytes);
+    const auto out = TensorAccessor(a1, addr(1), out_bytes);
     for (uint32_t col = first; col < end; ++col) {
         for (uint32_t t = 0; t < tiles; ++t) {
             cb_wait_front(16, 1);
-            noc_async_write<bf_bytes>(get_read_ptr(16), out.get_noc_addr(t * cols + col), bf_bytes);
+            noc_async_write<out_bytes>(get_read_ptr(16), out.get_noc_addr(t * cols + col), out_bytes);
             noc_async_write_barrier();
             cb_pop_front(16, 1);
         }
@@ -51,9 +53,19 @@ void kernel_main() {
 #else
     constexpr auto a2 = TensorAccessorArgs<a1.next_compile_time_args_offset()>();
     constexpr auto a3 = TensorAccessorArgs<a2.next_compile_time_args_offset()>();
-#ifdef PREFILL_DYN
+#if defined(PREFILL_DYN) || defined(PREFILL_RESIDUAL)
     constexpr auto a4 = TensorAccessorArgs<a3.next_compile_time_args_offset()>();
+#endif
+#ifdef PREFILL_DYN
     const auto dyn = TensorAccessor(a4, addr(4), bf_bytes);
+#endif
+#ifdef PREFILL_RESIDUAL
+#ifdef PREFILL_DYN
+    constexpr auto residual_args = TensorAccessorArgs<a4.next_compile_time_args_offset()>();
+    const auto residual = TensorAccessor(residual_args, addr(5), residual_bytes);
+#else
+    const auto residual = TensorAccessor(a4, addr(4), residual_bytes);
+#endif
 #endif
     const auto x = TensorAccessor(a1, addr(1), x_bytes);
     const auto taps = TensorAccessor(a2, addr(2), fp_bytes);
@@ -101,10 +113,17 @@ void kernel_main() {
 
         for (uint32_t t = 0; t < tiles; ++t) {
             noc_async_read<x_bytes>(x.get_noc_addr(t * cols + col), curr, x_bytes);
+#ifdef PREFILL_RESIDUAL
+            cb_reserve_back(5, 1);
+            noc_async_read<residual_bytes>(residual.get_noc_addr(t * cols + col), get_write_ptr(5), residual_bytes);
+#endif
 #ifdef PREFILL_DYN
             noc_async_read<bf_bytes>(dyn.get_noc_addr(t), dyn_data, bf_bytes);
 #endif
             noc_async_read_barrier();
+#ifdef PREFILL_RESIDUAL
+            cb_push_back(5, 1);
+#endif
 #ifdef PREFILL_DYN
             invalidate_l1_cache();
             const auto raw_dyn = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(dyn_data);
