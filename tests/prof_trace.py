@@ -78,7 +78,7 @@ def profile_mtp(lmax, position, reps):
 
     if position < 1 or position + 8 > lmax:
         raise ValueError("The position must leave room for two four-row target blocks")
-    dev = open_device(large_dispatch_ring=False)
+    dev = open_device(large_dispatch_ring=lmax <= 8192)
     try:
         rt = InklingRuntime(dev, paths.hf_sd(), lmax=lmax, chunk=2048, mtp=3)
         labels = capture_labels(rt.capture)

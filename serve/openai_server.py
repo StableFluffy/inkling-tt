@@ -127,7 +127,8 @@ class Engine:
             raise ValueError("--mtp requires trace capture and prefill")
         self.ttnn = ttnn
         self.lmax = args.lmax
-        self.dev = open_device(args.device_id, large_dispatch_ring=not mtp)
+        large_dispatch_ring = not mtp or (mtp <= 3 and args.lmax <= 8192)
+        self.dev = open_device(args.device_id, large_dispatch_ring=large_dispatch_ring)
         self.device_sampling = not args.no_trace and os.getenv("INK_DEVICE_SAMPLING") != "0"
         self.rt = InklingRuntime(
             self.dev,

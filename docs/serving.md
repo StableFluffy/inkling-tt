@@ -88,8 +88,9 @@ INKLING_URL=http://localhost:8000 python3 tools/bench_server.py --compare-mtp
 ```
 
 Both 128- and 2,048-row prefill buckets run with MTP at an 8,192-token context on the tested
-card. The runtime uses the standard dispatch ring and shares the head workspace. Wide expert
-lanes reserve one weight buffer each. Global attention retains up to 56 score tiles and
+card. The runtime shares the head workspace and uses the same larger dispatch ring as
+standalone B1 for up to three proposals and 8,192 context slots. Larger contexts and fixed
+widths above three proposals use the standard ring. Wide expert lanes reserve one weight buffer each. Global attention retains up to 56 score tiles and
 recomputes scores past that range. See [speculative.md](speculative.md) and [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).
 
 ## vLLM

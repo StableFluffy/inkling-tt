@@ -53,8 +53,8 @@ read shards directly: `rowvm.prepare_attention` reads Q, R, the sink and the gat
 packed output, the attention kernel writes the O projection's input shards, and `rowvm.head_tail`
 reads the head's output shards.
 
-B1 and MTP use the same four-worker BF16 head schedule. MTP uses the standard dispatch
-ring and shares the projection workspace across prefill, decode and draft.
+B1 and MTP use the same four-worker BF16 head schedule. MTP shares the projection
+workspace across prefill, decode and draft.
 
 ## The fused attention projection
 
