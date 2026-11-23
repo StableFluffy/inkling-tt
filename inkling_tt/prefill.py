@@ -542,15 +542,20 @@ def _heads(x, col_offset, heads, *, rms=False, threshold=0.0, tau=None, width=HD
 
 
 @lru_cache(maxsize=8)
-def _gate_program(tasks, row_tiles, cols, specs):
+def _gate_program(tasks, row_tiles, cols, hidden_dtype, specs):
     grid, rt = _grid(tasks)
     reader, writer = tuple(sum(group, ()) for group in specs)
-    cbs = [_tile_cb(grid, 0, FP, 4), _tile_cb(grid, 1, FP, 4), _tile_cb(grid, 2, FP, 4), _tile_cb(grid, 16, FP, 2)]
+    cbs = [
+        _tile_cb(grid, 0, hidden_dtype, 4),
+        _tile_cb(grid, 1, FP, 4),
+        _tile_cb(grid, 2, FP, 4),
+        _tile_cb(grid, 16, FP, 2),
+    ]
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "gate_io.cpp"),
             core_ranges=grid,
-            compile_time_args=[row_tiles, cols, *reader],
+            compile_time_args=[row_tiles, cols, int(hidden_dtype == BF), *reader],
             runtime_args=rt,
             config=ttnn.ReaderConfigDescriptor(),
         ),
@@ -577,7 +582,7 @@ def _message_gate(h, forget, message, u, m):
     """u * (1 - tanh(h @ forget)) + m * tanh(h @ message) with FP32 controller weights."""
     rows, cols = u.shape[-2] // 32, u.shape[-1] // 32
     out = _alloc(u.device(), u.shape, FP)
-    _launch(_gate_program, (_tasks(u.device(), rows * cols), rows, cols), (h, forget, message, u, m), (out,))
+    _launch(_gate_program, (_tasks(u.device(), rows * cols), rows, cols, h.dtype), (h, forget, message, u, m), (out,))
     return out
 
 
@@ -696,6 +701,7 @@ class Prefill:
         self._fused_relative = self._fused_heads and os.environ.get("INK_PREFILL_RELATIVE_HEADS", "1") == "1"
         self.relative = _alloc(self.dev, (1, HQ, chunk, 32)) if self._fused_relative else None
         self._fused_gate = os.environ.get("INK_PREFILL_GATE", "1") == "1"
+        self._gate_bf_hidden = os.environ.get("INK_PREFILL_GATE_BF_HIDDEN", "1") == "1"
         self._fused_norm = chunk == 2048 and os.environ.get("INK_PREFILL_NORM", "1") == "1"
         if self._fused_norm:
             self._norm_rows = tuple(_alloc(self.dev, self.rows.shape) for _ in range(3))
@@ -1056,9 +1062,10 @@ class Prefill:
                 un16 = bf16(un)
                 self._un16 = (un, un16)
             hin = ttnn.concat([un16, bf16(self.ops.rms(m))], dim=-1)
-        h = f32(self.lin(hin, dn))
+        h = self.lin(hin, dn)
         if self._fused_gate:
-            return _message_gate(h, wf, wg, u, m)
+            return _message_gate(h if self._gate_bf_hidden else f32(h), wf, wg, u, m)
+        h = f32(h)
         forget = dense.message_prefill_up(h, wf)
         message = dense.message_prefill_up(h, wg)
         kept = ttnn.multiply(u, forget, input_tensor_b_activations=[act("TANH"), act("RSUB", 1.0)])
