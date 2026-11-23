@@ -56,10 +56,11 @@ class DraftPositions:
             (position, self.table, cos, sin),
         )
 
-    def prepare(self, block, anchor, position, embedding):
+    def prepare(self, block, anchor, position, embedding, *, short=False):
         _launch(_embedding_program, (D, 0), (anchor, embedding, block.embedded))
         self.rotate(position, block.cos, block.sin)
-        for mask in block.mask:
+        for layer in range(len(block.mask)):
+            _, mask = block.attention_buffers(layer, short)
             tiles = mask.shape[-1] // 32
             _launch(
                 _position_program,
@@ -122,8 +123,12 @@ class DraftContextProjection:
             for source, dest in ((self.k_norm, self.k_heads), (self.v, self.v_heads)):
                 _launch(_remap_program, (tasks, cols, cols, row_tiles, HKV), (source, dest), heads=True)
             self.rope.apply(self.k_heads, self.cos, self.sin, self.k_rot)
-            for source, cache in ((self.k_rot, cache_k), (self.v_heads, cache_v)):
-                _launch(_commit_program, (tasks, row_tiles, cache.shape[-2] - 32), (self.meta, source, cache))
+            destinations = [(cache_k, cache_v)]
+            if i == 1 and self.block.short_attention is not None:
+                destinations.append(self.block.short_attention[0])
+            for pair in destinations:
+                for source, cache in zip((self.k_rot, self.v_heads), pair):
+                    _launch(_commit_program, (tasks, row_tiles, cache.shape[-2] - 32), (self.meta, source, cache))
         self._mix(features, 3)
         _launch(
             _state_program,

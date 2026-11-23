@@ -17,7 +17,9 @@ identifies the rows to append to the drafter's context.
 Each draft layer forms its own FP32 mixture of the taps with checkpoint fusion weights, then applies
 the layer's weighted RMSNorm. The layer projects BF16 K and V from the mixture and applies a
 learned K norm and NeoX RoPE to K. The first and third layers keep 1,024-slot rings. The middle
-layer keeps the full prefix. A fourth tap mixture supplies the Markov context from the last
+layer keeps the full prefix. When the maximum context exceeds 2,048, the round also keeps a
+1,024-slot copy of the global draft cache for short prefixes. The long draft uses a tiled FP32
+softmax whose L1 scratch fits alongside the target and prefill workspaces. A fourth tap mixture supplies the Markov context from the last
 committed input.
 
 ## Draft scores
@@ -63,8 +65,9 @@ the previous history. The continuation ID remains pending for the next round.
 
 ## Round replay
 
-The round allocates scratch and warms the device programs before capture. It scores the draft,
-stages the pending token and proposals, verifies them, and commits the longest matching prefix.
+The round allocates scratch and warms the device programs before capture. The draft and target
+traces replay on the same command queue. The target stages the pending token and draft IDs,
+verifies them, and commits the longest matching prefix.
 The drafter and target reuse the same width-sharded head input and output buffers.
 
 The round extends the draft cache from accepted target taps, then publishes the next pending ID
@@ -104,18 +107,18 @@ INK_LMAX=2048 scripts/bench_decode.sh
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
 
-The serial B1 oracle checks 64 generated IDs on each acceptance fixture. Four proposals raise
-the number of emitted IDs per round on each of the short prompts.
+The serial B1 oracle checks 64 generated IDs on each acceptance fixture. These runs use 8,192
+prefix slots for K=3 and 2,048 for K=4.
 
 | Prompt | Input tokens | K=3 emitted per round | K=4 emitted per round |
 |---|---:|---:|---:|
-| Chat | 33 | 3.048 | 3.368 |
+| Chat | 33 | 3.200 | 3.368 |
 | Python | 35 | 3.368 | 3.765 |
 | Korean | 43 | 2.370 | 2.783 |
 | Summarization | 7,825 | 2.667 | — |
 
-The 7,825-token fixture uses an 8,192-slot draft global prefix and takes 11.07 ms median and
-11.14 ms p95 for three proposals.
+The 7,825-token fixture uses an 8,192-slot draft global prefix and takes 9.20 ms median and
+9.29 ms p95 for three proposals.
 
 The traced verifier matches serial B1 logits and taps bitwise at four starting positions. Committing any prefix length reproduces serial B1 KV and convolution histories,
 including a block that spans the local ring wrap and one that ends at the global cache limit.

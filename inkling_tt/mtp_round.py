@@ -72,7 +72,7 @@ class SpeculativeRound:
         weights = load_drafter(snapshot)
         fold, bias = fold_head(model.wts.get("lm_head.weight"), weights)
         self.target = TargetVerify(model, proposals, streaming=True)
-        self.block = DraftBlock(self.device, weights, self.rows, model.lmax)
+        self.block = DraftBlock(self.device, weights, self.rows, model.lmax, short_prefix=True)
         self.projection = DraftHeadProjection(
             self.device,
             model.head,
@@ -92,6 +92,7 @@ class SpeculativeRound:
         }
         self.verify_context = DraftContextProjection(self.block, weights, 32, self.last, meta=self.target.commit.meta)
         self.prefill_traces = {}
+        self.draft_traces = {}
         self.trace = None
         self.pending = None
         self.warmed = False
@@ -108,10 +109,13 @@ class SpeculativeRound:
         self.positions.rotate(context.meta, context.cos, context.sin)
         context.extend(taps)
 
-    def _forward(self):
-        self.positions.prepare(self.block, self.anchor, self.position, self.model.embed_table)
-        base, recurrent = self.projection.project(self.block.forward(), self.last)
-        drafts, _ = self.markov.score(base, recurrent, self.anchor)
+    def _draft(self, short):
+        self.positions.prepare(self.block, self.anchor, self.position, self.model.embed_table, short=short)
+        base, recurrent = self.projection.project(self.block.forward(short=short), self.last)
+        self.markov.score(base, recurrent, self.anchor)
+
+    def _verify(self):
+        drafts = self.markov.ids
         self.target.stage_device(self.anchor, drafts, self.position)
         _, target_ids = self.target.verify()
         commit = self.target.commit
@@ -124,10 +128,15 @@ class SpeculativeRound:
         for bucket, context in self.prefill_context.items():
             self._extend(context, bucket.taps)
         self._write(0, 0)
-        self._forward()
+        for short in self._draft_widths():
+            self._draft(short)
+        self._verify()
         ttnn.synchronize_device(self.device)
         self.model.reset()
         self.warmed = True
+
+    def _draft_widths(self):
+        return (False, True) if self.block.short_attention is not None else (False,)
 
     def _capture(self, body):
         trace = ttnn.begin_trace_capture(self.device, cq_id=0)
@@ -147,7 +156,9 @@ class SpeculativeRound:
             for bucket, context in self.prefill_context.items():
                 self.prefill_traces[bucket] = self._capture(partial(self._extend, context, bucket.taps))
             self._write(0, 0)
-            self.trace = self._capture(self._forward)
+            for short in self._draft_widths():
+                self.draft_traces[short] = self._capture(partial(self._draft, short))
+            self.trace = self._capture(self._verify)
         except Exception:
             self.close()
             raise
@@ -165,6 +176,8 @@ class SpeculativeRound:
         if self.pending != (token, position):
             self._write(token, position)
         self.pending = None
+        short = self.block.short_attention is not None and position <= 1024
+        ttnn.execute_trace(self.device, self.draft_traces[short], cq_id=0, blocking=False)
         ttnn.execute_trace(self.device, self.trace, cq_id=0, blocking=False)
         emitted, end = self.decision.read()
         self.pending = (emitted[-1], end)
@@ -175,6 +188,9 @@ class SpeculativeRound:
         if self.trace is not None:
             ttnn.release_trace(self.device, self.trace)
             self.trace = None
+        for trace in self.draft_traces.values():
+            ttnn.release_trace(self.device, trace)
+        self.draft_traces.clear()
         for trace in self.prefill_traces.values():
             ttnn.release_trace(self.device, trace)
         self.prefill_traces.clear()

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 import ttnn
+from ttnn.operations.moreh import SoftmaxOpParallelizationStrategy
 
 from inkling_tt import dense, rowvm
 from inkling_tt.model import HD, HKV, HQ, D
@@ -116,7 +117,7 @@ class _Rope:
 class DraftBlock:
     """Device transformer on one DSpark block with fixed-size prefix storage."""
 
-    def __init__(self, device, weights, rows, prefix_capacity, *, sharded_mlp=True):
+    def __init__(self, device, weights, rows, prefix_capacity, *, sharded_mlp=True, short_prefix=False):
         if not 2 <= rows <= 8 or prefix_capacity < 32 or prefix_capacity % 32:
             raise ValueError("DSpark needs 2-8 rows and a positive, tile-aligned prefix capacity")
         self.rows = rows
@@ -165,14 +166,27 @@ class DraftBlock:
         self.gate, self.up, self.silu = (row(MLP_WIDTH) for _ in range(3))
         self.gate_fp, self.sigmoid, self.silu_fp = (row(MLP_WIDTH, FP) for _ in range(3))
 
-        self.cache, self.mask, self.scores, self.probs = [], [], {}, {}
-        for cap in (min(prefix_capacity, 1024), prefix_capacity, min(prefix_capacity, 1024)):
-            width = cap + 32
-            self.cache.append(tuple(upload(torch.zeros(1, HKV, width, HD)) for _ in range(2)))
-            self.mask.append(_alloc(device, (1, 1, 1, width), FP))
-            if cap not in self.scores:
-                self.scores[cap] = tuple(_alloc(device, (1, HKV, HQ // HKV * 32, width), FP) for _ in range(2))
-                self.probs[cap] = _alloc(device, (1, HKV, HQ // HKV * 32, width))
+        local_capacity = min(prefix_capacity, 1024)
+
+        def attention_buffers(capacity):
+            width = capacity + 32
+            kv = tuple(upload(torch.zeros(1, HKV, width, HD)) for _ in range(2))
+            mask = _alloc(device, (1, 1, 1, width), FP)
+            return kv, mask
+
+        caps = (local_capacity, prefix_capacity, local_capacity)
+        self.cache, self.mask = zip(*(attention_buffers(cap) for cap in caps))
+        self.short_attention = attention_buffers(local_capacity) if short_prefix and prefix_capacity > 2048 else None
+        self.scores, self.probs = {}, {}
+        for cap in set(caps):
+            shape = (1, HKV, HQ // HKV * 32, cap + 32)
+            self.scores[cap] = tuple(_alloc(device, shape, FP) for _ in range(2))
+            self.probs[cap] = _alloc(device, shape)
+
+    def attention_buffers(self, layer, short):
+        if layer == 1 and short:
+            return self.short_attention
+        return self.cache[layer], self.mask[layer]
 
     def _linear(self, x, name, dest):
         weight = self.weights[name + ".weight"]
@@ -195,14 +209,14 @@ class DraftBlock:
         ttnn.add(self.residual, self.branch, dtype=FP, output_tensor=self.merged)
         _cast(self.merged, self.residual)
 
-    def _attention(self, layer, name):
+    def _attention(self, layer, name, *, short):
         for name_part, out in (("q_proj", self.q), ("k_proj", self.k), ("v_proj", self.v)):
             self._linear(self.norm, name + name_part, out)
         _norm_heads(self.q, self.weights[name + "q_norm.weight"], self.q_norm, self.rows, HQ)
         _norm_heads(self.k, self.weights[name + "k_norm.weight"], self.k_norm, self.rows, HKV)
         self.rope_q.apply(self.q_head, self.cos, self.sin, self.q_rot)
         self.rope_k.apply(self.k_head, self.cos, self.sin, self.k_rot)
-        keys, values = self.cache[layer]
+        (keys, values), mask = self.attention_buffers(layer, short)
         cap = keys.shape[-2] - 32
         stride = (cap + 32) * HD // 1024
         for block, cache in ((self.k_rot, keys), (self.v_head, values)):
@@ -212,19 +226,30 @@ class DraftBlock:
             self.q_group, keys, transpose_b=True, dtype=FP, compute_kernel_config=self.ck, optional_output_tensor=scores
         )
         ttnn.mul(scores, 1 / math.sqrt(HD), output_tensor=masked)
-        ttnn.add_(masked, self.mask[layer])
-        ttnn.softmax_in_place(masked, compute_kernel_config=self.ck)
-        _cast(masked, self.probs[cap])
+        ttnn.add_(masked, mask)
+        if cap > 2048:
+            ttnn.moreh_softmax(
+                masked,
+                len(masked.shape) - 1,
+                strategy=SoftmaxOpParallelizationStrategy.LARGE_W,
+                compute_kernel_config=self.ck,
+                output_tensor=scores,
+            )
+            normalized = scores
+        else:
+            ttnn.softmax_in_place(masked, compute_kernel_config=self.ck)
+            normalized = masked
+        _cast(normalized, self.probs[cap])
         ttnn.matmul(self.probs[cap], values, compute_kernel_config=self.ck, optional_output_tensor=self.attn)
         self._linear(self.attn_flat, name + "o_proj", self.branch)
 
-    def forward(self):
+    def forward(self, *, short=False):
         ttnn.copy(self.embedded, self.residual)
         for layer in range(3):
             prefix = f"layers.{layer}."
             source = self.residual if layer == 0 else self.merged
             _norm_rows(source, self.weights[prefix + "input_layernorm.weight"], self.norm, self.rows)
-            self._attention(layer, prefix + "self_attn.")
+            self._attention(layer, prefix + "self_attn.", short=short)
             self._residual()
             _norm_rows(self.merged, self.weights[prefix + "post_attention_layernorm.weight"], self.norm, self.rows)
             self._linear(self.norm, prefix + "mlp.gate_proj", self.gate)
