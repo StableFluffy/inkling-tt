@@ -377,6 +377,7 @@ def _run(
     position=None,
     group=None,
     wait_for_kv=False,
+    packed_kv=False,
 ):
     inputs = [r.tensor for r in readers]
     if position is not None:
@@ -431,7 +432,7 @@ def _run(
         common_args.append(position.buffer_address())
     packed_history = (
         group is not None
-        and compute_args[0] in (_CONV_MIX, _CONV_ADD)
+        and (packed_kv or compute_args[0] in (_CONV_MIX, _CONV_ADD))
         and any(
             spec[13] and spec[1] == 4 and readers[i - 1].row > 0 and readers[i - 1].tensor.dtype == BF
             for i, spec in enumerate(in_specs)
@@ -766,6 +767,7 @@ def update_kv(
     _group=None,
     row=0,
     _wait_for_kv=False,
+    packed=False,
 ):
     """Convolve and normalize each head, then update the corresponding cache row."""
     if (
@@ -804,6 +806,7 @@ def update_kv(
             position=position,
             group=group,
             wait_for_kv=_wait_for_kv,
+            packed_kv=packed,
         )
     if _group is None:
         group.launch()
@@ -829,6 +832,7 @@ def prepare_attention(
     wrap,
     row=0,
     kv_projection=None,
+    _group=None,
 ):
     """Dispatch head preparation and K/V cache writes together."""
     cores = None
@@ -837,7 +841,7 @@ def prepare_attention(
         grid = device.compute_with_storage_grid_size()
         occupied = {(x, y) for x, y, _ in _kv_placement(device)}
         cores = tuple((x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in occupied)
-    group = _Group(cores)
+    group = _Group(cores) if _group is None else _group
     attention_heads(qrsg, q, r, sink, q_threshold=q_threshold, r_threshold=r_threshold, tau=tau, _group=group, row=row)
     update_kv(
         k,
@@ -853,8 +857,10 @@ def prepare_attention(
         _group=group,
         row=row,
         _wait_for_kv=kv_projection is not None,
+        packed=_group is not None,
     )
-    group.launch((*kv_projection, k, v) if kv_projection is not None else None)
+    if _group is None:
+        group.launch((*kv_projection, k, v) if kv_projection is not None else None)
 
 
 def gate_from_heads(x, logits, *, col_offset=0, dtype=BF, out=None, memory_config=None):

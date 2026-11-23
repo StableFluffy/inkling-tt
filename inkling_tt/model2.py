@@ -627,7 +627,19 @@ class Layer:
         return tuple(self.gate_msg(s, u, m, hn, weight=norm) for s, u, m, norm in zip("qkv", rows, messages, norms))
 
     def attention(
-        self, xq, xk, xv, vs: Visit, st: Step, *, scratch=None, projections=None, output=None, row=0, prepare_heads=None
+        self,
+        xq,
+        xk,
+        xv,
+        vs: Visit,
+        st: Step,
+        *,
+        scratch=None,
+        projections=None,
+        output=None,
+        row=0,
+        prepare_heads=None,
+        prep_group=None,
     ):
         c = self.c
         if projections is not None:
@@ -719,6 +731,7 @@ class Layer:
                     wrap=wrap,
                     kv_projection=kv_projection,
                     row=row,
+                    _group=prep_group,
                 )
             else:
                 rowvm.update_kv(

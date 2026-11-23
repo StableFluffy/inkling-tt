@@ -65,7 +65,9 @@ reusing the circular buffers for the next query.
 
 The post-attention and post-MLP convolution and mix epilogues run on disjoint core groups.
 Each row reads earlier inputs within the block directly from the packed projection or expert
-output. Earlier positions come from the FP32 history ring.
+output. Earlier positions come from the FP32 history ring. Attention preparation batches the
+head work and face-row cache writes. Repeat visits batch the MLP message down projections
+and blend epilogues within the worker grid.
 
 The router projects all verify rows in one program. Each row has its own top-8 leader and keeps
 B1's K-stripe sum and tie-breaking order. The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
@@ -115,8 +117,8 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
 | Batched attention against serial B1 | 88/88 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 42.23 ms median, 42.25 ms p95 |
-| B1 greedy in the same job | 19.36 ms median, 19.42 ms p95 |
+| Four-row target verify at `lmax=1120` | 39.13 ms median, 39.20 ms p95 |
+| B1 greedy in the same job | 19.33 ms median, 19.43 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.

@@ -72,17 +72,22 @@ def main(trace_only):
 
         model.capture()
         verify_traces = []
-        for glue, attention in ((False, False), (True, False), (True, True)):
+        for glue, attention, front in (
+            (False, False, False),
+            (True, False, False),
+            (True, True, False),
+            (True, True, True),
+        ):
             seed(len(prompt))
             verifier.stage(block, len(prompt))
-            verifier.verify(grouped_glue=glue, grouped_attention=attention)
+            verifier.verify(grouped_glue=glue, grouped_attention=attention, grouped_front=front)
             check_outputs(references[len(prompt)])
             ttnn.synchronize_device(dev)
             seed(len(prompt))
             verifier.stage(block, len(prompt))
             rowvm._group_program.cache_clear()
             trace = ttnn.begin_trace_capture(dev, cq_id=0)
-            verifier.verify(grouped_glue=glue, grouped_attention=attention)
+            verifier.verify(grouped_glue=glue, grouped_attention=attention, grouped_front=front)
             ttnn.end_trace_capture(dev, trace, cq_id=0)
             verify_traces.append(trace)
         trace = verify_traces[-1]
@@ -128,7 +133,14 @@ def main(trace_only):
                     ttnn.execute_trace(dev, traces[kind], cq_id=0, blocking=True)
                     times[kind].append(1000 * (time.perf_counter() - start))
             for name, samples in zip(
-                ("B1", "verify serial epilogues", "verify grouped epilogues", "verify grouped attention"), times
+                (
+                    "B1",
+                    "verify serial epilogues",
+                    "verify grouped epilogues",
+                    "verify grouped attention",
+                    "verify grouped preparation",
+                ),
+                times,
             ):
                 warm = samples[2:]
                 print(
