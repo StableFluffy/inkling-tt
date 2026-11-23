@@ -1,0 +1,11 @@
+__pycache__/
+*.egg-info/
+*.pyc
+/.work/
+/.image-ctx/
+/.venv*/
+/.src/
+/generated/
+/hf_sd/
+/golden/
+/Inkling-2-Mini/

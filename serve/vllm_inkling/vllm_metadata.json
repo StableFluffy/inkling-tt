@@ -1,0 +1,4 @@
+{
+  "arch": "Inkling2LoopForConditionalGeneration",
+  "main_class": "inkling_vllm_adapter:InklingForCausalLM"
+}

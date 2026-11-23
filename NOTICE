@@ -1,0 +1,68 @@
+inkling-tt
+Copyright 2026 Jeonghwan Park and contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------------
+Model
+
+This software runs the Inkling-2-Mini model published by Thinking Machines Lab, Inc.
+at https://huggingface.co/thinkingmachines/Inkling-2-Mini (revision
+b85c3cfa615fc413cc9af3379f491b963f3b586a) under the Apache License, Version 2.0.
+The model weights are not included in this repository or in the container image;
+they are downloaded from the original repository and converted locally. Use of the
+model is also subject to the Thinking Machines Model Acceptable Use Policy:
+https://thinkingmachines.ai/model-acceptable-use-policy/
+
+--------------------------------------------------------------------------------
+Tenstorrent tt-metal
+
+This software is built on, links against at runtime, and its device kernels are
+compiled with, Tenstorrent TT-Metalium / TTNN (https://github.com/tenstorrent/tt-metal,
+commit 79951bd44b7484a136b3619e0d81f26baa8a1936), Copyright Tenstorrent USA, Inc.,
+licensed under the Apache License, Version 2.0. The kernels under inkling_tt/kernels/
+include tt-metal device headers and call its kernel APIs; no tt-metal source file is
+copied into this repository. The container image built by serve/build_image.sh
+contains a built tt-metal tree at /opt/tt-metal together with its own LICENSE and
+NOTICE files, on the tt-metal dev image
+ghcr.io/tenstorrent/tt-metal/tt-metalium/ubuntu-22.04-dev-amd64@sha256:47772e38d127584ac8d64b4632ebdd82e5cef574f787cdb319e8f687501535dc,
+whose contents keep their own licenses.
+
+--------------------------------------------------------------------------------
+Hugging Face Transformers (adapted file)
+
+serve/vllm_inkling/inkling_vllm_config.py is adapted from
+src/transformers/models/inkling2_loop/configuration_inkling2_loop.py in
+Hugging Face Transformers (https://github.com/huggingface/transformers, commit
+be48e7a0b63d2ff22ce1ebccbccbd0374c1592ef), Copyright 2026 the HuggingFace Team,
+licensed under the Apache License, Version 2.0. Changes: made a standalone module for
+transformers 5.12 (no relative imports, @strict and docstring decorators removed,
+loop_config handled in __post_init__) and added AutoConfig registration. The file
+keeps the original copyright and license header and states the modification.
+
+tools/reference/ref_inkling.py and tools/golden/*.py are independent code. ref_inkling.py
+re-implements the equations of the same Transformers eager model in plain torch;
+the golden scripts call the Transformers API to record reference outputs.
+
+--------------------------------------------------------------------------------
+vLLM and vllm-tt-plugin
+
+serve/vllm_inkling/ is a plugin bundle for vLLM (https://github.com/vllm-project/vllm,
+Apache License 2.0) and the Tenstorrent vLLM plugin
+(https://github.com/tenstorrent/vllm-tt-plugin, commit
+0e96e9eec1387bbc8e9a75457f2a31d67acdcf0a, Copyright Tenstorrent AI ULC, Apache
+License 2.0). Neither is vendored. inkling_vllm_adapter.py implements the plugin's
+model interface; it shares only interface names and capability keys with the plugin.
+serve/install_vllm_venv.sh downloads both at install time.
+
+--------------------------------------------------------------------------------
+Prior art (design references, no code copied)
+
+The bank-local expert-streaming readers (inkling_tt/experts_stream.py,
+inkling_tt/kernels/experts/) were designed after the approach of the public
+Qwen3-Coder-30B-A3B P150 bundle (https://huggingface.co/raahemnabeel/qwen3-coder-30b-a3b,
+revision 77c2b34da6ca2591d75bd17cedbefd6c1cbf6a09) and tt-metal's GPT-OSS fused
+decode (models/demos/gpt_oss at the tt-metal commit above). The kernels were written
+for this model. A line comparison against the 24 moe_decode files of that bundle
+revision (2,047 distinct long lines) found only standard tt-metal include lines and
+kernel-API boilerplate in common.
