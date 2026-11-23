@@ -84,7 +84,7 @@ void exchange(uint32_t task, bool rms_pass) {
 }
 #endif
 
-template <uint32_t I>
+template <uint32_t I, bool Batch = false, bool Commit = false>
 void transfer(uint32_t task) {
 #if defined(ROWVM_CONV_MIX) && !defined(ROWVM_WRITE)
     if constexpr (I == 0) {
@@ -124,6 +124,15 @@ void transfer(uint32_t task) {
     }
 #endif
     const auto tensor = TensorAccessor(args, address, row_major ? tile_cols * 32 * bytes : tile_bytes);
+#ifndef ROWVM_WRITE
+    constexpr bool defer = Batch && (bytes == 4 || row_major || whole_tiles || !decltype(tensor)::is_dram);
+    if constexpr (Commit) {
+        if constexpr (defer) {
+            cb_push_back(cb, rows * (whole_tiles ? cols / 32 : dense_tiles));
+        }
+        return;
+    }
+#endif
     constexpr uint32_t task_cols = get_compile_time_arg_val(1 + region_words * count + count);
     uint32_t row_task = task;
     uint32_t col_task = task;
@@ -145,8 +154,10 @@ void transfer(uint32_t task) {
                 noc_async_read<tile_bytes>(tensor.get_noc_addr(tile), dst + (r * tile_count + t) * tile_bytes, tile_bytes);
             }
         }
-        noc_async_read_barrier();
-        cb_push_back(cb, rows * tile_count);
+        if constexpr (!defer) {
+            noc_async_read_barrier();
+            cb_push_back(cb, rows * tile_count);
+        }
         return;
     }
 #endif
@@ -219,8 +230,10 @@ void transfer(uint32_t task) {
         noc_async_write_barrier();
         cb_pop_front(cb, rows * dense_tiles);
 #else
-        noc_async_read_barrier();
-        cb_push_back(cb, rows * dense_tiles);
+        if constexpr (!defer) {
+            noc_async_read_barrier();
+            cb_push_back(cb, rows * dense_tiles);
+        }
 #endif
         return;
     }
@@ -275,8 +288,10 @@ void transfer(uint32_t task) {
     noc_async_write_barrier();
     cb_pop_front(cb, rows * dense_tiles);
 #else
-    noc_async_read_barrier();
-    cb_push_back(cb, rows * dense_tiles);
+    if constexpr (!defer) {
+        noc_async_read_barrier();
+        cb_push_back(cb, rows * dense_tiles);
+    }
 #endif
 }
 
@@ -360,6 +375,15 @@ void transfer_all(uint32_t task, std::integer_sequence<uint32_t, I...>) {
     (transfer<I>(task), ...);
 }
 
+#if defined(ROWVM_CONV_MIX) && !defined(ROWVM_WRITE)
+template <uint32_t Offset, uint32_t... I>
+void read_batch(uint32_t task, std::integer_sequence<uint32_t, I...>) {
+    (transfer<I + Offset, true, false>(task), ...);
+    noc_async_read_barrier();
+    (transfer<I + Offset, true, true>(task), ...);
+}
+#endif
+
 // A convolution mix finishes its history and residual rows before the collectives;
 // the writer drains them while the stripes exchange mix statistics.
 #if defined(ROWVM_CONV_MIX) && defined(ROWVM_WRITE)
@@ -380,7 +404,12 @@ void kernel_main() {
 #ifndef ROWVM_WRITE
     {
     RV_ZONE("RV_READ");
+#ifdef ROWVM_CONV_MIX
+    read_batch<4>(task, std::make_integer_sequence<uint32_t, count - 4>{});
+    read_batch<0>(task, std::make_integer_sequence<uint32_t, 4>{});
+#else
     transfer_all(task, std::make_integer_sequence<uint32_t, count>{});
+#endif
     }
 #endif
 #if defined(ROWVM_CONV_MIX) && defined(ROWVM_WRITE)
