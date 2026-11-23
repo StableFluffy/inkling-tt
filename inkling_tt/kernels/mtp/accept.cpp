@@ -42,6 +42,7 @@ void kernel_main() {
     for (uint32_t i = rows + 2; i < 16; ++i) {
         out[i] = 0;
     }
+    out[14] = rows;
     noc_async_write<64>(output, result.get_noc_addr(0), 64);
     noc_async_write_barrier();
 }

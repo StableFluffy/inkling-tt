@@ -82,19 +82,23 @@ for the next round.
 
 ## Round replay
 
-The round allocates scratch and warms each width before capture. Draft, target verification
-and the accepted-context projection use separate traces on one command queue. Prefill, B1,
-the verifier and the drafter share one width-sharded head workspace when MTP is enabled. A
-narrow call copies its live row into that workspace. Smaller rounds score a prefix of the draft
-block and verify only those rows.
+The round allocates scratch and warms each width before capture. The draft transformer and base
+head use a trace shared by all widths. Markov scoring, verification and the accepted-context
+projection have separate traces on the same command queue. Prefill, B1, the verifier and the
+drafter share one width-sharded BF16 head workspace.
 
-The server selects one to four target rows using the startup replay times and a decaying
-estimate of proposal acceptance. With estimated conditional acceptance `a`, a width `R` produces
-an expected `1 + a + ... + a^(R-1)` IDs. Width one uses B1 for the rest of the request.
+The target publishes the next anchor, absolute position and adaptive width. It selects the width
+using replay costs measured at startup and a decaying estimate of proposal acceptance. With
+estimated conditional acceptance `a`, a width `R` yields an expected `1 + a + ... + a^(R-1)` IDs.
+Width one switches the request to B1.
 
-The target publishes the next pending ID and position. The host starts an asynchronous
-read of the 64-byte accepted result and queues the draft context update behind it. The
-context trace projects the accepted taps while the host consumes the result.
+The host queues an asynchronous read of the 64-byte result, followed by the context update and
+the next shared draft trace when another speculative round fits and pays off at the lowest possible acceptance. The draft starts from the
+device-published anchor and position. The host uses the returned width to submit the matching
+scoring and verification traces while the draft runs. Near the short-prefix boundary or the
+output limit, the next launch waits for the accepted position.
+On the 32-ID ring-boundary fixture, the two schedules have similar medians and prequeueing
+reduces p95 from 20.89 to 20.55 ms per ID.
 
 ## Device checks
 

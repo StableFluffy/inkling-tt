@@ -13,10 +13,10 @@ from inkling_tt.prefill import Prefill
 from serve.runtime import default_precision
 
 
-def main(proposals, adaptive):
+def main(proposals, adaptive, compare_pipeline):
     dev = open_device(large_dispatch_ring=False)
     try:
-        lmax = 1056
+        lmax = 8192 if compare_pipeline else 1056
         model = InklingTT2(dev, paths.hf_sd(), default_precision(), lmax=lmax, capture_taps=True)
         pf = Prefill(model, 128, warmup=False, global_score_tiles=56)
         spec = SpeculativeRound(model, [pf], paths.snapshot(), proposals=proposals, adaptive=adaptive)
@@ -32,10 +32,13 @@ def main(proposals, adaptive):
             for name, prompt in prompts:
                 count = 32
                 expected = None
-                samples = [[], []]
+                modes = (0, 1, 2) if compare_pipeline else (0, 1)
+                samples = [[] for _ in modes]
                 widths = {}
-                for i in range(4):
-                    for mode in (0, 1) if i % 2 == 0 else (1, 0):
+                advances = 0
+                for i in range(6 if compare_pipeline else 4):
+                    for offset in modes:
+                        mode = (i + offset) % len(modes)
                         model.reset()
                         spec.start_request()
                         for offset in range(0, len(prompt), pf.chunk):
@@ -52,11 +55,21 @@ def main(proposals, adaptive):
                             if mode:
                                 widths[width] = widths.get(width, 0) + 1
                             if width > 1:
-                                ids, pos = spec.run(current, pos, width)
+                                remaining = count - len(emitted)
+                                ids, pos = spec.run(
+                                    current,
+                                    pos,
+                                    width,
+                                    remaining=remaining,
+                                    advance_draft=mode == 2 or not compare_pipeline,
+                                )
+                                advances += int(spec.draft_ready)
                             else:
                                 ids, pos = [model.step_greedy(current, pos)], pos + 1
                             emitted.extend(ids)
                             current = ids[-1]
+                        if compare_pipeline:
+                            ttnn.synchronize_device(dev)
                         samples[mode].append(1000 * (time.perf_counter() - start) / count)
                         if expected is None:
                             expected = emitted
@@ -68,7 +81,9 @@ def main(proposals, adaptive):
                             )
                 if adaptive:
                     print(f"{name}: chosen verify widths {widths}", flush=True)
-                for label, timings in zip(("B1", "MTP"), samples):
+                if compare_pipeline:
+                    print(f"{name}: {advances} next drafts launched before readback", flush=True)
+                for label, timings in zip(("B1", "MTP", "MTP pipelined"), samples):
                     p95 = statistics.quantiles(timings, n=20, method="inclusive")[-1]
                     print(
                         f"{name}: {label} {count} identical IDs, "
@@ -86,5 +101,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--proposals", type=int, choices=range(1, 8), default=3)
     parser.add_argument("--adaptive", action="store_true")
+    parser.add_argument("--compare-pipeline", action="store_true")
     args = parser.parse_args()
-    main(args.proposals, args.adaptive)
+    main(args.proposals, args.adaptive, args.compare_pipeline)

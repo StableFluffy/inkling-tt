@@ -165,11 +165,9 @@ class InklingRuntime:
             self._advance(ids[p - start], p)
         return self.m.step(ids[-1], end - 1)
 
-    def speculate(self, tok, pos, rows):
-        if self.pos != pos:
-            raise RuntimeError(f"sequence state is at position {self.pos}, asked to decode position {pos}")
-        self.pos = None
-        emitted, self.pos = self.speculative.run(tok, pos, rows)
+    def speculate(self, tok, pos, rows, *, remaining=0):
+        self._begin_step(pos)
+        emitted, self.pos = self.speculative.run(tok, pos, rows, remaining=remaining)
         return emitted
 
     def _begin_step(self, pos):

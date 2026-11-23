@@ -207,7 +207,7 @@ class Engine:
                 if not pending:
                     rows = spec.pick(pos, s.max_tokens - k - 1) if spec is not None else 1
                     if rows > 1:
-                        pending.extend(self.rt.speculate(tok, pos, rows))
+                        pending.extend(self.rt.speculate(tok, pos, rows, remaining=s.max_tokens - k - 1))
                     else:
                         pending.append(self.rt.step_greedy(tok, pos))
             elif device_sampling:

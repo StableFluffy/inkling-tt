@@ -87,7 +87,8 @@ def profile_mtp(lmax, position, reps):
         traces = {1: {"b1": int(rt.m.trace_id)}}
         for width in spec.widths:
             traces[width] = {
-                "draft": int(spec.draft_traces[short, width]),
+                "draft_core": int(spec.draft_core_traces[short]),
+                "draft_scores": int(spec.draft_traces[width]),
                 "verify": int(spec.verify_traces[width]),
                 "context": int(spec.context_trace),
             }
