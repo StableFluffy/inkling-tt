@@ -650,7 +650,7 @@ class Prefill:
     readout in creation order. Close buckets in reverse creation order.
     """
 
-    def __init__(self, m, chunk=512, fixed=True, warmup=True, *, trace=True):
+    def __init__(self, m, chunk=512, fixed=True, warmup=True, *, trace=True, global_score_tiles=None):
         if not 128 <= chunk <= 2048 or chunk % 32:
             raise ValueError("chunk must be a multiple of 32 between 128 and 2048")
         if m.lmax % 32:
@@ -673,9 +673,9 @@ class Prefill:
         default_l1 = chunk <= 1024 or has_default_l1_budget(self.dev)
         if not default_l1:
             wide_score_tiles -= 12
-        score_tiles = int(
-            os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", str(wide_score_tiles if chunk > 1024 else 97))
-        )
+        if global_score_tiles is None:
+            global_score_tiles = wide_score_tiles if chunk > 1024 else 97
+        score_tiles = int(os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", global_score_tiles))
         self._global_score_tiles = min(m.lmax // 32, max(0, score_tiles))
         grouping = os.environ.get("INK_PREFILL_QUERY_GROUP", "3")
         self._query_group = 1
@@ -1208,7 +1208,7 @@ class Prefill:
 _CHUNK_OVERHEAD_ROWS = 352
 
 
-def prefill_buckets(buckets, tokens):
+def prefill_buckets(buckets, tokens, *, on_chunk=None):
     """Run a prompt from position zero, choosing for each chunk the bucket with
     the lowest estimated cost for the remaining tokens. Returns (logits, position)."""
     buckets = sorted(buckets, key=lambda p: p.chunk)
@@ -1218,5 +1218,7 @@ def prefill_buckets(buckets, tokens):
         pf = min(buckets, key=lambda p: (-(-rest // p.chunk) * (p.chunk + _CHUNK_OVERHEAD_ROWS), -p.chunk))
         n = min(pf.chunk, rest)
         lg = pf.run_chunk(tokens[pos : pos + n], pos, return_logits=pos + n >= total)
+        if on_chunk is not None:
+            on_chunk(pf)
         pos += n
     return lg, pos

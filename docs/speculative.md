@@ -103,8 +103,8 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Staged local and global attention | 128/128 bitwise-equal rows |
 | Traced target state commits | 56/56 equal to sequential updates |
-| Four-row target verify at `lmax=1056` | 50.08 ms median, 50.12 ms p95 |
-| B1 greedy in the same job | 20.06 ms median, 20.12 ms p95 |
+| Four-row target verify at `lmax=1056` | 48.62 ms median, 48.66 ms p95 |
+| B1 greedy in the same job | 20.02 ms median, 20.06 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
@@ -122,11 +122,12 @@ prefix slots for K=3 and 2,048 for K=4.
 The 7,825-token fixture uses an 8,192-slot draft global prefix and takes 9.20 ms median and
 9.29 ms p95 for three proposals.
 
-The traced verifier matches serial B1 logits and taps bitwise at four starting positions. Committing any prefix length reproduces serial B1 KV and convolution histories,
-including a block that spans the local ring wrap and one that ends at the global cache limit.
+The traced verifier matches serial B1 logits and taps bitwise at four starting positions.
+Committing any prefix length reproduces serial B1 KV and convolution histories, including at
+the local ring wrap and global cache limit.
 
-The shared projections cut four-row verification from 68.11 to 50.08 ms in the same job. The
-attention and row epilogues still run once per verify row. The OpenAI server uses the B1 decode path.
+The shared projections and router cut four-row verification from 68.06 to 48.62 ms in the
+same job. Attention and row epilogues still run once per verify row.
 
 The three-proposal round reproduces the B1 IDs on 32-token continuations, including a prompt
 that reaches the 1,024-slot ring wrap. Times exclude prefill and draft context priming.
@@ -137,3 +138,24 @@ that reaches the 1,024-slot ring wrap. Times exclude prefill and draft context p
 | Python | 20.17 / 20.20 | 17.48 / 17.49 |
 | Korean | 20.17 / 20.19 | 24.44 / 24.46 |
 | Ring wrap | 20.67 / 20.77 | 22.04 / 22.04 |
+
+## HTTP serving
+
+`--mtp` enables round replay for greedy requests without penalties. Each request can select B1
+with `"mtp": false`. See [serving.md](serving.md#speculative-decoding) for the checkpoint file and
+launch command.
+
+`tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` compared streamed responses in
+one server process with an 8,192-slot context and the 128-row prefill bucket. All five prompts
+produced identical stream events and usage across modes. Times measure decode per generated ID.
+
+| Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
+|---|---:|---:|
+| Chat | 20.60 / 20.69 | 25.40 / 25.40 |
+| Python | 20.60 / 20.69 | 21.90 / 21.90 |
+| Korean | 20.60 / 20.69 | 24.80 / 24.80 |
+| 1,580 tokens | 21.20 / 21.29 | 24.10 / 24.10 |
+| 7,820 tokens | 21.70 / 21.88 | 27.20 / 27.29 |
+
+MTP remains opt-in. The 7,820-token prompt reaches its first token in about 12.7 s with
+the 128-row prefill bucket.

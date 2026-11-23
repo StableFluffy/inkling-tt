@@ -23,7 +23,7 @@ def default_precision():
 
 
 class InklingRuntime:
-    def __init__(self, device, weights, lmax=32768, chunk=2048, log=print, *, device_sampling=False):
+    def __init__(self, device, weights, lmax=32768, chunk=2048, log=print, *, device_sampling=False, mtp=0):
         if lmax % 32 or chunk % 32:
             raise ValueError(f"lmax and chunk must be multiples of 32, got {lmax}, {chunk}")
         self.dev = device
@@ -32,9 +32,11 @@ class InklingRuntime:
         self.fast_prefill = True
         self.chunk = chunk
         self.pf = None
+        self.mtp = mtp
+        self.speculative = None
         self.buckets = []
         t0 = time.time()
-        self.m = InklingTT2(device, weights, default_precision(), lmax=lmax, log=lambda s: None)
+        self.m = InklingTT2(device, weights, default_precision(), lmax=lmax, log=lambda s: None, capture_taps=bool(mtp))
         self.sampler = None
         if device_sampling and hasattr(self.m, "head_logits"):
             from inkling_tt.sampling import DecodeSampler
@@ -53,9 +55,16 @@ class InklingRuntime:
             return
         self._prepare_prefill(log)
         t0 = time.time()
+        if self.mtp:
+            from inkling_tt.mtp_round import SpeculativeRound
+
+            self.speculative = SpeculativeRound(self.m, self.buckets, paths.snapshot(), proposals=self.mtp)
+            self.speculative.warm()
         if self.sampler is not None:
             self.sampler.warm()
         self.m.capture()
+        if self.speculative is not None:
+            self.speculative.capture()
         if self.sampler is not None:
             self.sampler.capture()
         self.pos = None
@@ -69,12 +78,17 @@ class InklingRuntime:
         t0 = time.time()
         # A short-prompt bucket and a long one; each warms its programs in the constructor, and all of them must
         # exist before the decode trace is captured.
-        self.buckets = [Prefill(self.m, c) for c in sorted({128, self.chunk})]
+        self.buckets = [
+            Prefill(self.m, c, global_score_tiles=72 if self.mtp else None) for c in sorted({128, self.chunk})
+        ]
         self.pf = self.buckets[0]
         self.reset()
         log(f"inkling: chunked prefill tables and programs prepared in {time.time() - t0:.1f} s")
 
     def release(self):
+        if self.speculative is not None:
+            self.speculative.close()
+            self.speculative = None
         if self.sampler is not None:
             self.sampler.release()
         if self.traced:
@@ -99,7 +113,7 @@ class InklingRuntime:
         m.st.write(m.embed_row(tok), pos)
         ttnn.execute_trace(m.c.dev, m.trace_id, cq_id=0, blocking=False)
 
-    def feed(self, ids, start, cancelled=None):
+    def feed(self, ids, start, cancelled=None, *, draft_context=False):
         end = start + len(ids)
         if end > self.lmax:
             raise ValueError(f"sequence length {end} exceeds lmax {self.lmax}")
@@ -109,18 +123,19 @@ class InklingRuntime:
             raise RuntimeError(f"sequence state is at position {self.pos}, asked to continue from {start}")
         self.pos = None
         if self.pf is not None and self.chunk and start % 32 == 0:
-            logits = self._chunked(ids, start, cancelled)
+            logits = self._chunked(ids, start, cancelled, draft_context)
         else:
             logits = self._tokenwise(ids, start, cancelled)
         if logits is not None:
             self.pos = end
         return logits
 
-    def _chunked(self, ids, start, cancelled):
+    def _chunked(self, ids, start, cancelled, draft_context):
+        on_chunk = self.speculative.append_prompt if draft_context else None
         if start == 0 and len(self.buckets) > 1:
             from inkling_tt.prefill import prefill_buckets
 
-            return prefill_buckets(self.buckets, ids)[0]
+            return prefill_buckets(self.buckets, ids, on_chunk=on_chunk)[0]
         logits = None
         for i in range(0, len(ids), self.chunk):
             if cancelled is not None and cancelled.is_set():
@@ -128,6 +143,8 @@ class InklingRuntime:
             tokens = ids[i : i + self.chunk]
             bucket = next(p for p in self.buckets if p.chunk >= len(tokens))
             logits = bucket.run_chunk(tokens, start + i)
+            if on_chunk is not None:
+                on_chunk(bucket)
         return logits
 
     def _tokenwise(self, ids, start, cancelled):
@@ -137,6 +154,13 @@ class InklingRuntime:
                 return None
             self._advance(ids[p - start], p)
         return self.m.step(ids[-1], end - 1)
+
+    def speculate(self, tok, pos):
+        if self.pos != pos:
+            raise RuntimeError(f"sequence state is at position {self.pos}, asked to decode position {pos}")
+        self.pos = None
+        emitted, self.pos = self.speculative.run(tok, pos)
+        return emitted
 
     def _begin_step(self, pos):
         if self.pos != pos:

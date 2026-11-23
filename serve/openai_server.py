@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -50,6 +51,7 @@ class SamplingFields(BaseModel):
     stream: bool = False
     n: int = 1
     ignore_eos: bool = False
+    mtp: bool = True
 
 
 class ChatRequest(SamplingFields):
@@ -74,6 +76,7 @@ class Sampling:
     stop: list[str]
     stop_ids: set[int]
     seed: int | None
+    mtp: bool = True
 
 
 @dataclass
@@ -119,9 +122,12 @@ class Engine:
         from inkling_tt.device import open_device
         from serve.runtime import InklingRuntime
 
+        mtp = getattr(args, "mtp", 0)
+        if mtp and (args.no_trace or not args.prefill_chunk):
+            raise ValueError("--mtp requires trace capture and prefill")
         self.ttnn = ttnn
         self.lmax = args.lmax
-        self.dev = open_device(args.device_id)
+        self.dev = open_device(args.device_id, large_dispatch_ring=not mtp)
         self.device_sampling = not args.no_trace and os.getenv("INK_DEVICE_SAMPLING") != "0"
         self.rt = InklingRuntime(
             self.dev,
@@ -130,6 +136,7 @@ class Engine:
             chunk=args.prefill_chunk,
             log=log.info,
             device_sampling=self.device_sampling,
+            mtp=mtp,
         )
         self.rt.fast_prefill = not args.no_fast_prefill
         if not args.no_trace:
@@ -169,16 +176,19 @@ class Engine:
             self.rt.sampler.reset()
         t1 = time.perf_counter()
         t.reset_s = t1 - t0
-        logits = self.rt.feed(ids, 0, job.cancelled)
+        spec = self.rt.speculative if greedy and s.mtp else None
+        if spec is not None and (s.max_tokens <= spec.rows or not spec.can_run(len(ids))):
+            spec = None
+        logits = self.rt.feed(ids, 0, job.cancelled, draft_context=spec is not None)
         t0 = time.perf_counter()
         t.prefill_s = t0 - t1
         if logits is None:
             t.finish_reason = "cancelled"
             return
         pos = len(ids)
-        next_tok = None
+        pending = deque()
         for k in range(s.max_tokens):
-            tok = next_tok if next_tok is not None else sample(logits, s, counts, gen)
+            tok = pending.popleft() if pending else sample(logits, s, counts, gen)
             counts[tok] = counts.get(tok, 0) + 1
             t.completion_tokens += 1
             if tok in s.stop_ids:
@@ -192,11 +202,17 @@ class Engine:
                 t.finish_reason = "length"
                 break
             if greedy:
-                next_tok = self.rt.step_greedy(tok, pos)
+                if not pending:
+                    if spec is not None and s.max_tokens - k - 1 >= spec.rows and spec.can_run(pos):
+                        pending.extend(self.rt.speculate(tok, pos))
+                    else:
+                        pending.append(self.rt.step_greedy(tok, pos))
             elif device_sampling:
                 draw = torch.rand(1, generator=gen).item() if s.temperature > 0.0 else 0.0
-                next_tok = self.rt.step_sampled(
-                    tok, pos, s.temperature, s.top_k, s.top_p, s.presence_penalty, s.frequency_penalty, draw
+                pending.append(
+                    self.rt.step_sampled(
+                        tok, pos, s.temperature, s.top_k, s.top_p, s.presence_penalty, s.frequency_penalty, draw
+                    )
                 )
             else:
                 logits = self.rt.step(tok, pos)
@@ -311,6 +327,7 @@ def make_sampling(req: SamplingFields, n_prompt, lmax):
         stop=stop,
         stop_ids=stop_ids,
         seed=req.seed,
+        mtp=req.mtp,
     )
 
 
@@ -529,9 +546,20 @@ def main():
     ap.add_argument("--device-id", type=int, default=0)
     ap.add_argument("--lmax", type=int, default=32768)
     ap.add_argument("--no-trace", action="store_true")
+    ap.add_argument(
+        "--mtp",
+        nargs="?",
+        const=3,
+        default=0,
+        type=int,
+        choices=range(1, 8),
+        help="enable DSpark for greedy requests with this many proposals (default 3)",
+    )
     ap.add_argument("--no-fast-prefill", action="store_true")
-    ap.add_argument("--prefill-chunk", type=int, default=2048)
+    ap.add_argument("--prefill-chunk", type=int)
     args = ap.parse_args()
+    if args.prefill_chunk is None:
+        args.prefill_chunk = 128 if args.mtp else 2048
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
     engine = Engine(args)

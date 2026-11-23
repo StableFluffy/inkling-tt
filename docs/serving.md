@@ -56,10 +56,11 @@ INKLING_URL=http://localhost:8000 python3 tools/bench_server.py
 | Option | Default | Meaning |
 |---|---|---|
 | `--lmax` | 32768 | Context length (prompt plus output), multiple of 32 |
-| `--prefill-chunk` | 2048 | Rows of the large prefill bucket; `0` feeds prompts token by token |
+| `--prefill-chunk` | 2048, 128 with `--mtp` | Prefill bucket rows; `0` feeds prompts token by token |
 | `--host`, `--port` | 127.0.0.1, 8400 | Listen address (the image uses 0.0.0.0:8000 inside the container) |
 | `--device-id` | 0 | Card index within the visible devices |
 | `--no-trace` | off | Run decode eagerly, for debugging |
+| `--mtp [K]` | off | Verify DSpark proposals on greedy requests |
 
 Environment switches for comparisons: `INK_ATTN_DECODE=0` uses TTNN's SDPA decode for attention. `INKLING_EXPERTS=stock` uses TTNN's `sparse_matmul` for experts; because visit fusion depends on the expert streamer, it also turns off the fused attention, router, head tail and token feedback, and decode is much slower.
 
@@ -70,6 +71,25 @@ The runtime (`serve/runtime.py`) resets the convolution histories, which takes a
 The sampler uses the request's Torch generator for a single uniform draw per token. It walks its cumulative mass in ascending token-ID order and breaks score ties by token ID. Repeating a seeded request reproduces its sequence on the same sampling path. Filtered sequences can differ between the host and device paths because their cumulative order differs. `INK_DEVICE_SAMPLING=0` selects the host path for comparison.
 
 A request may use at most `lmax` tokens in total and must leave room for one output token.
+
+## Speculative decoding
+
+A source checkout can load the official `mtp.safetensors` from `INKLING_SNAPSHOT` and enable
+DSpark for greedy requests without penalties. With `--mtp` alone, the server drafts three
+proposals per round. Set `"mtp": false` in a chat or completion request to select B1 for that
+request. The server uses B1 by default because the speedup depends on the prompt.
+
+```bash
+hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa615fc413cc9af3379f491b963f3b586a \
+  --include mtp.safetensors --local-dir "$INKLING_SNAPSHOT"
+PORT=8000 scripts/serve.sh --mtp 3 --lmax 8192
+INKLING_URL=http://localhost:8000 python3 tools/bench_server.py --compare-mtp
+```
+
+The speculative configuration defaults to the 128-row prefill bucket and retains fewer global
+attention scores in L1. With the speculative workspaces resident, the 2,048-row expert lane
+program exceeded L1 on the tested card. The smaller bucket increases time to first token on
+long prompts. See [speculative.md](speculative.md) for the round and measurements.
 
 ## vLLM
 
