@@ -18,7 +18,7 @@ import torch
 import ttnn
 
 import inkling_tt.prefill as pp
-from inkling_tt import dense
+from inkling_tt import dense, paths
 from inkling_tt.device import open_device
 from inkling_tt.model import Precision
 from inkling_tt.model2 import InklingTT2
@@ -76,7 +76,9 @@ def main():
     )
     spec.experts = os.getenv("INK_EXPERTS", "stream")
     layers = int(os.environ["PREFILL_LAYERS"]) if os.getenv("PREFILL_LAYERS") else None
-    m = InklingTT2(dev, "hf_sd", spec, layers=layers, lmax=int(os.getenv("PREFILL_LMAX", "2048")), log=lambda _: None)
+    m = InklingTT2(
+        dev, paths.hf_sd(), spec, layers=layers, lmax=int(os.getenv("PREFILL_LMAX", "2048")), log=lambda _: None
+    )
     print("LOAD", time.perf_counter() - t, flush=True)
     try:
         for arg in sys.argv[1:]:
@@ -121,7 +123,7 @@ def bench(dev, m, chunk, names=()):
             mem.largest_contiguous_bytes_free_per_bank,
             flush=True,
         )
-    g = torch.load("golden/long300.pt", weights_only=False)
+    g = torch.load(paths.golden("long300.pt"), weights_only=False)
     source = g["ids"].tolist()
     logical = bool(os.getenv("PREFILL_LOGICAL_RESET"))
     if os.getenv("PREFILL_GOLDEN"):
@@ -149,7 +151,7 @@ def bench(dev, m, chunk, names=()):
         )
     if os.getenv("PREFILL_TEACHER"):
         hits = n = 0
-        for sample in torch.load("golden/eval3x128.pt", weights_only=False):
+        for sample in torch.load(paths.golden("eval3x128.pt"), weights_only=False):
             lg, pos = pf.prefill(sample["ids"].tolist())
             prompt_hits = 0
             for i, tok in enumerate(sample["gen"]):
