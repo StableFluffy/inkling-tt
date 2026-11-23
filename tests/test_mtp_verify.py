@@ -55,6 +55,11 @@ def main(trace_only):
             verifier.verify()
             check_outputs(expected)
             print(f"position {pos}: four rows match serial B1 logits and taps", flush=True)
+            if pos == len(prompt):
+                verifier.shared = False
+                verifier.verify()
+                check_outputs(expected)
+                verifier.shared = True
             if trace_only:
                 continue
             for rows in range(1, len(block) + 1):
@@ -86,6 +91,11 @@ def main(trace_only):
         trace = ttnn.begin_trace_capture(dev, cq_id=0)
         verifier.verify()
         ttnn.end_trace_capture(dev, trace, cq_id=0)
+        verifier.shared = False
+        baseline_trace = ttnn.begin_trace_capture(dev, cq_id=0)
+        verifier.verify()
+        ttnn.end_trace_capture(dev, baseline_trace, cq_id=0)
+        verifier.shared = True
         try:
             for pos, expected in references.items():
                 seed(pos)
@@ -94,9 +104,10 @@ def main(trace_only):
                 check_outputs(expected)
             print("four verify replays match the serial B1 logits and taps", flush=True)
             pos = len(prompt)
-            times = [[], []]
+            times = [[], [], []]
+            traces = (model.trace_id, baseline_trace, trace)
             for trial in range(12):
-                for kind in (0, 1) if trial % 2 == 0 else (1, 0):
+                for kind in ((trial + i) % len(traces) for i in range(len(traces))):
                     seed(pos)
                     if kind:
                         verifier.stage(block, pos)
@@ -104,9 +115,9 @@ def main(trace_only):
                         model.st.write(model.embed_row(block[0]), pos)
                     ttnn.synchronize_device(dev)
                     start = time.perf_counter()
-                    ttnn.execute_trace(dev, trace if kind else model.trace_id, cq_id=0, blocking=True)
+                    ttnn.execute_trace(dev, traces[kind], cq_id=0, blocking=True)
                     times[kind].append(1000 * (time.perf_counter() - start))
-            for name, samples in zip(("B1", "verify four rows"), times):
+            for name, samples in zip(("B1", "verify serial projections", "verify shared projections"), times):
                 warm = samples[2:]
                 print(
                     f"{name}: {statistics.median(warm):.2f} ms median, "
@@ -114,6 +125,7 @@ def main(trace_only):
                     flush=True,
                 )
         finally:
+            ttnn.release_trace(dev, baseline_trace)
             ttnn.release_trace(dev, trace)
             pf.close()
     finally:

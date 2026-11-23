@@ -18,7 +18,7 @@ _LAUNCH_LOCK = Lock()
 
 
 @lru_cache(maxsize=24)
-def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head, heads):
+def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head, heads, row):
     grid = ttnn.num_cores_to_corerangeset(heads * _SPLITS, ttnn.CoreCoord(cols, rows), row_wise=True)
     split_tiles = (length // 32 + _SPLITS - 1) // _SPLITS
     tiles = min(split_tiles, 4)
@@ -44,6 +44,8 @@ def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head,
     config.unpack_to_dest_mode = unpack
     staged = len(accessors) > 9
     defines = [("ATTN_STAGED", "1")] if staged else []
+    if row:
+        defines.append(("ATTN_QUERY_ROW", str(row)))
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "io.cpp"),
@@ -158,7 +160,7 @@ def prepare_table(table, *, global_cache, device=None):
     )
 
 
-def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out, staged=None):
+def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out, staged=None, row=0):
     """Apply position-derived attention and write the gated row into preallocated O shards."""
     length = k.shape[-2]
     if length < 32 or length > _MAX_LENGTH or length % 32 or (not global_cache and length != _WINDOW):
@@ -171,6 +173,9 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
     if gate_col < 0 or gate_col % 32 or gate.shape[-1] < gate_col + width:
         raise ValueError("fused attention decode requires a tile-aligned output gate")
     device = q.device()
+    rows = gate.shape[-2]
+    if not 0 <= row < rows or rows not in (1, 32):
+        raise ValueError("fused attention gate row must fit within one tile")
     inputs = (q, k, v, relative, sink, table, position, gate)
     operands = (*inputs, out)
     shapes = (
@@ -181,8 +186,8 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
         (32, 32),
         (1, 1, _table_height(global_cache), 32),
         (1,),
-        (1, 1, 1, gate.shape[-1]),
-        (1, 1, 1, width),
+        (1, 1, rows, gate.shape[-1]),
+        (1, 1, rows, width),
     )
     for i, (operand, shape) in enumerate(zip(operands, shapes)):
         dtype = ttnn.int32 if i == 6 else ttnn.bfloat16
@@ -229,7 +234,9 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
     addresses = [t.buffer_address() for t in operands]
     with _LAUNCH_LOCK:
         for first_head in range(0, kv_heads, heads):
-            desc, kernels = _program(accessors, length, global_cache, gate_col // 32, cols, rows, first_head, heads)
+            desc, kernels = _program(
+                accessors, length, global_cache, gate_col // 32, cols, rows, first_head, heads, row
+            )
             kernels[0].common_runtime_args = [*addresses, *peers]
             kernels[1].common_runtime_args = [*addresses, *peers]
             desc.kernels = kernels

@@ -4,7 +4,7 @@ The Inkling-2-Mini checkpoint ships a three-layer DSpark drafter in `mtp.safeten
 drafter uses target features to propose several tokens for one pending token. A lossless round
 requires the target to reproduce B1 logits and state for each proposed input before committing the
 matching prefix. The verifier processes each visit in layer order across the block. It
-shares the LM head and the routed-expert weights across the verify rows.
+shares the attention projections, LM head and routed-expert weights across the verify rows.
 
 ## Draft context
 
@@ -47,6 +47,11 @@ BF16 rows through the current query's position. Future staged rows remain invisi
 the point where the local ring wraps. The attention partitions and FP32 reductions are the same
 as for a normal B1 step.
 
+The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dynamic taps and
+O each use one sweep of their B1 weights. Head preparation and the causal attention overlay read
+the query's row directly from the packed projections. The output gate writes into that same row
+of the O projection's input shards.
+
 The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
 B1's eight routes and FP32 weights per row, streams the existing BFP8_B weight pack at HiFi4 and
 combines the results in the original routing-slot order.
@@ -79,8 +84,8 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Staged local and global attention | 128/128 bitwise-equal rows |
 | Traced target state commits | 56/56 equal to sequential updates |
-| Four-row target verify at `lmax=1056` | 68.18 ms median, 68.25 ms p95 |
-| B1 greedy in the same job | 20.01 ms median, 20.06 ms p95 |
+| Four-row target verify at `lmax=1056` | 50.08 ms median, 50.12 ms p95 |
+| B1 greedy in the same job | 20.06 ms median, 20.12 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
@@ -93,5 +98,5 @@ The verifier replays four serial B1 rows bitwise for logits and taps at four sta
 positions after warming the graph and allocating its scratch. Committing any prefix length reproduces serial B1 KV and convolution histories,
 including a block that spans the local ring wrap and one that ends at the global cache limit.
 
-The OpenAI server uses the B1 decode path. The verifier shares the target LM head and experts
-across rows. It runs the other target projections and epilogues once per row.
+The shared projections cut four-row verification from 68.11 to 50.08 ms in the same job. The
+attention and row epilogues still run once per verify row. The OpenAI server uses the B1 decode path.

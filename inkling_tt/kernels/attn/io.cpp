@@ -4,6 +4,10 @@
 
 using namespace attn;
 
+#ifndef ATTN_QUERY_ROW
+#define ATTN_QUERY_ROW 0
+#endif
+
 namespace {
 constexpr uint32_t cache_tiles = get_compile_time_arg_val(0);
 constexpr bool global_cache = get_compile_time_arg_val(1);
@@ -186,8 +190,8 @@ void read_inputs(uint32_t head, uint32_t split, uint32_t pos, uint32_t start, co
         if (output_worker) {
             const uint32_t g_tile = gate_tile + q_head * dim_tiles + split;
             const uint32_t dst = get_write_ptr(gate_cb) + dest_row;
-            noc_async_read<bf_row>(gate.get_noc_addr(g_tile, 0), dst, bf_row);
-            noc_async_read<bf_row>(gate.get_noc_addr(g_tile, 512), dst + 512, bf_row);
+            noc_async_read<bf_row>(gate.get_noc_addr(g_tile, ATTN_QUERY_ROW * bf_row), dst, bf_row);
+            noc_async_read<bf_row>(gate.get_noc_addr(g_tile, 512 + ATTN_QUERY_ROW * bf_row), dst + 512, bf_row);
         }
     }
     if (active) {
@@ -304,7 +308,7 @@ void write_output(uint32_t head, uint32_t d) {
     for (uint32_t h = 0; h < queries; ++h) {
         const uint32_t tile = (head * queries + h) * dim_tiles + d;
         for (uint32_t face = 0; face < 2; ++face) {
-            noc_async_write(src + face * 512 + (row + h) * bf_row, out.get_noc_addr(tile, face * 512), bf_row);
+            noc_async_write(src + face * 512 + (row + h) * bf_row, out.get_noc_addr(tile, face * 512 + ATTN_QUERY_ROW * bf_row), bf_row);
         }
     }
     noc_async_write_barrier();

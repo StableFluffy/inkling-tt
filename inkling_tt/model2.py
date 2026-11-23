@@ -621,9 +621,13 @@ class Layer:
         hn = self.ops.rms(rows[0]) if shared else None
         return tuple(self.gate_msg(s, u, m, hn, weight=norm) for s, u, m, norm in zip("qkv", rows, messages, norms))
 
-    def attention(self, xq, xk, xv, vs: Visit, st: Step, *, staging=None, scratch=None):
+    def attention(
+        self, xq, xk, xv, vs: Visit, st: Step, *, staging=None, scratch=None, projections=None, output=None, row=0
+    ):
         c = self.c
-        if scratch is not None:
+        if projections is not None:
+            qrsg, kr, vr, k_dyn, v_dyn = projections
+        elif scratch is not None:
             qrsg = _linear_to_shards(xq, self.dq.weight, activation=scratch.sharded_q, out=scratch.qrsg)
         else:
             qrsg = _linear_to_shards(xq, self.dq.weight) if c.shard_fusion else dense.linear(xq, self.dq.weight)
@@ -667,24 +671,26 @@ class Layer:
             )
 
         kv_projection = None
-        if scratch is None and c.paired_kv and xk.memory_config() == xv.memory_config():
-            kr, vr = c.kv_rows
-            if c.fused_kv_prep:
-                kv_projection = (xk, xv, self.decode_kv)
+        if projections is None:
+            if scratch is None and c.paired_kv and xk.memory_config() == xv.memory_config():
+                kr, vr = c.kv_rows
+                if c.fused_kv_prep:
+                    kv_projection = (xk, xv, self.decode_kv)
+                else:
+                    rowvm.project_kv(xk, xv, self.decode_kv, kr, vr)
+            elif scratch is None:
+                kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
             else:
-                rowvm.project_kv(xk, xv, self.decode_kv, kr, vr)
-        elif scratch is None:
-            kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
-        else:
-            kr, vr = project(xk, self.wk, scratch.k), project(xv, self.wv, scratch.v)
+                kr, vr = project(xk, self.wk, scratch.k), project(xv, self.wv, scratch.v)
         if c.layout_fusion:
             if staging is None:
                 caches, cache_pos, wrap = (vs.k, vs.v), st.pos_g, not self.is_global
             else:
                 staged_k, staged_v, _, cache_pos = staging
                 caches, wrap = (staged_k, staged_v), False
-            k_dyn = v_dyn = None
-            if self.is_global:
+            if projections is None:
+                k_dyn = v_dyn = None
+            if self.is_global and projections is None:
                 if scratch is None:
                     k_dyn, v_dyn = dense.linear(xk, self.k_wproj), dense.linear(xv, self.v_wproj)
                 else:
@@ -709,6 +715,7 @@ class Layer:
                     v_dyn=v_dyn,
                     wrap=wrap,
                     kv_projection=kv_projection,
+                    row=row,
                 )
             else:
                 rowvm.update_kv(
@@ -724,6 +731,7 @@ class Layer:
                     k_dyn=k_dyn,
                     v_dyn=v_dyn,
                     wrap=wrap,
+                    row=row,
                 )
         else:
             if self.is_global:
@@ -753,9 +761,12 @@ class Layer:
                 qrsg,
                 global_cache=self.is_global,
                 gate_col=gate_col,
-                out=c.gated_shards,
+                out=c.gated_shards if output is None else output,
                 staged=None if staging is None else staging[:3],
+                row=row,
             )
+            if output is not None:
+                return output
             return _linear_to_shards(c.gated_shards, self.wo, out=None if scratch is None else scratch.attended)
         if c.position_fusion:
             bias = rowvm.relative_bias_from_position(
@@ -816,22 +827,8 @@ class Layer:
     def forward(self, x, bank, vs, st, messages=None):
         return self._forward(x, bank, vs, st, messages)[0]
 
-    def _forward(
-        self,
-        x,
-        bank,
-        vs,
-        st,
-        messages=None,
-        *,
-        attention_input=None,
-        next_mix=None,
-        staging=None,
-        defer_experts=False,
-        scratch=None,
-    ):
+    def _attention_inputs(self, x, bank, messages, attention_input, *, scratch=None):
         ops, d = self.ops, self.dec
-        block_residual = x
         fp_inputs = None if scratch is None else scratch.inputs_fp
         bf_inputs = None if scratch is None else scratch.inputs_bf
 
@@ -866,47 +863,17 @@ class Layer:
             else:
                 h = attention_input if attention_input is not None else mix_attention()[0]
                 xq, xk, xv = self._gate_attention((h,) * 3, messages, (d.norm_in,) * 3, shared=True, scratch=scratch)
-        a = self.attention(xq, xk, xv, vs, st, staging=staging, scratch=scratch)
+        return xq, xk, xv
+
+    def _forward(self, x, bank, vs, st, messages=None, *, attention_input=None, next_mix=None):
+        ops = self.ops
+        block_residual = x
+        xq, xk, xv = self._attention_inputs(x, bank, messages, attention_input)
+        a = self.attention(xq, xk, xv, vs, st)
         if self.block_boundary and not isinstance(bank, _DecodeBank):
             bank = ops.bank_append(bank, block_residual)
         if self.c.visit_fusion:
-            z_bf, z_fp, xm = self.c.visit_scratch if scratch is None else scratch.visit
-            z = z_bf if self.block_boundary else z_fp
-            residual = None if self.block_boundary else block_residual
-            append = None
-            if isinstance(bank, _DecodeBank):
-                S, J, start = bank
-                if self.block_boundary:
-                    bank, row = bank.append()
-                    append = (block_residual, row)
-            else:
-                S, J = bank
-                start = 0
-            mixed = rowvm.attnres_mix(
-                S,
-                a,
-                d.q_mlp[2],
-                J,
-                weight=d.norm_post if messages is None else None,
-                dtype=BF if messages is None else FP,
-                out=(xm,) if messages is None else None if scratch is None else (scratch.mixed_fp,),
-                memory_config=L1 if messages is None else DRAM,
-                convolution=(vs.conv[2], d.pa_taps, residual, z),
-                bank_start=start,
-                shared_prefix=bool(start),
-                append=append,
-            )[0]
-            if messages is not None:
-                mixed = self.gate_msg(
-                    "mlp",
-                    mixed,
-                    messages[3],
-                    weight=d.norm_post,
-                    out=xm,
-                    controller_out=None if scratch is None else scratch.mlp_down,
-                )
-            if defer_experts:
-                return mixed, bank, z
+            mixed, bank, z = self._finish_attention(x, bank, vs.conv[2], a, messages)
             branch = self._visit_moe(mixed, vs)
             return self._finish_visit(branch, bank, z, vs.conv[3], next_mix)
 
@@ -918,6 +885,46 @@ class Layer:
             xm = self.gate_msg("mlp", ops.mix(bank, z, self.q_mlp, 1)[0], messages[3], weight=self.norm_post)
         y = self.sconv(self._visit_moe(xm, vs), self.pm_taps, vs.conv[3])
         return rowvm.add(z if z.dtype == FP else f32(z), f32(y), dtype=BF), bank, None
+
+    def _finish_attention(self, x, bank, history, a, messages, *, scratch=None, row=0):
+        d = self.dec
+        z_bf, z_fp, xm = self.c.visit_scratch if scratch is None else scratch.visit
+        z = z_bf if self.block_boundary else z_fp
+        residual = None if self.block_boundary else x
+        append = None
+        if isinstance(bank, _DecodeBank):
+            S, J, start = bank
+            if self.block_boundary:
+                bank, bank_row = bank.append()
+                append = (x, bank_row)
+        else:
+            S, J = bank
+            start = 0
+        mixed = rowvm.attnres_mix(
+            S,
+            a,
+            d.q_mlp[2],
+            J,
+            weight=d.norm_post if messages is None else None,
+            dtype=BF if messages is None else FP,
+            out=(xm,) if messages is None else None if scratch is None else (scratch.mixed_fp,),
+            memory_config=L1 if messages is None else DRAM,
+            convolution=(history, d.pa_taps, residual, z),
+            bank_start=start,
+            shared_prefix=bool(start),
+            append=append,
+            partial_row=row,
+        )[0]
+        if messages is not None:
+            mixed = self.gate_msg(
+                "mlp",
+                mixed,
+                messages[3],
+                weight=d.norm_post,
+                out=xm,
+                controller_out=None if scratch is None else scratch.mlp_down,
+            )
+        return mixed, bank, z
 
     def _finish_visit(self, branch, bank, residual, history, next_mix, *, out=None, mixed_out=None):
         taps = self.dec.pm_taps

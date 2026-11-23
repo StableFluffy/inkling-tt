@@ -10,6 +10,7 @@ from inkling_tt import rowvm
 from inkling_tt.model import HD, HKV, LOOP0, LOOP1, NB, NPASS, VOCAB, D, visit_slot
 from inkling_tt.model2 import BF, DRAM, FP, L1, MTP_TAP_VISITS, RM, TILE, Step, _DecodeBank
 from inkling_tt.mtp_experts import VerifyExperts
+from inkling_tt.mtp_projection import SharedProjection
 from inkling_tt.mtp_weights import PADDED_VOCAB
 from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
 
@@ -98,7 +99,7 @@ def _tile_row(src, dst, *, source=0, target=0):
 class TargetVerify:
     """Run a layer-major block with B1 row arithmetic and read-only committed state."""
 
-    def __init__(self, model, proposals, *, streaming=False):
+    def __init__(self, model, proposals, *, streaming=False, shared=True):
         c = model.c
         if (
             model.trace_id is not None
@@ -129,6 +130,13 @@ class TargetVerify:
         )
         layer = model.layers[0]
         q_weight, o_weight = layer.dq.weight, layer.wo
+        global_layer = next(layer for layer in model.layers if layer.is_global)
+        self.shared = shared
+        if shared:
+            self.q, self.k, self.v, self.k_dyn, self.v_dyn, self.o = (
+                SharedProjection(device, w)
+                for w in (q_weight, layer.wk, layer.wv, global_layer.k_wproj, global_layer.v_wproj, o_weight)
+            )
         self.scratch = tuple(
             SimpleNamespace(
                 visit=tuple(
@@ -226,8 +234,8 @@ class TargetVerify:
             visit = SimpleNamespace(klen=live.klen, k=live.k, v=live.v, conv=self.histories)
             for source, dest in zip(live.conv, self.histories):
                 ttnn.copy(source, dest)
-            pending = []
-            for i, ((x, bank, attention_input), step, row_slot) in enumerate(zip(states, self.steps, self.slots)):
+            messages_by_row = []
+            for i, (x, _, _) in enumerate(states):
                 if (tap := MTP_TAP_VISITS.get((layer.i, pass_id))) is not None:
                     _tile_row(x, self.taps[tap], target=i)
                 messages = None
@@ -241,22 +249,56 @@ class TargetVerify:
                         bank_start=prev_bank.tail_start + 1,
                         out=self.scratch[i].messages,
                     )
-                mixed, bank, residual = layer._forward(
+                messages_by_row.append(messages)
+            inputs = [
+                layer._attention_inputs(x, bank, messages, attention_input, scratch=scratch)
+                for (x, bank, attention_input), messages, scratch in zip(states, messages_by_row, self.scratch)
+            ]
+            projections = None
+            if self.shared:
+                xq, xk, xv = zip(*inputs)
+                q = self.q.project(layer.dq.weight, xq)
+                k = self.k.project(layer.wk, xk)
+                v = self.v.project(layer.wv, xv)
+                kd = self.k_dyn.project(layer.k_wproj, xk) if layer.is_global else None
+                vd = self.v_dyn.project(layer.v_wproj, xv) if layer.is_global else None
+                projections = (q, k, v, kd, vd)
+            attention = []
+            for i, (xqkv, step, row_slot, scratch) in enumerate(zip(inputs, self.steps, self.slots, self.scratch)):
+                attention.append(
+                    layer.attention(
+                        *xqkv,
+                        visit,
+                        step,
+                        staging=(staged.k, staged.v, self.steps[0].pos_g, row_slot),
+                        scratch=scratch,
+                        projections=projections,
+                        output=self.o.input if self.shared else None,
+                        row=i if self.shared else 0,
+                    )
+                )
+                for h in range(2):
+                    _tile_row(self.histories[h], staged.conv[h], target=i)
+            if self.shared:
+                projected = self.o.project(layer.wo)
+                attention = [projected] * self.rows
+            pending = []
+            for i, ((x, bank, _), a, messages, scratch) in enumerate(
+                zip(states, attention, messages_by_row, self.scratch)
+            ):
+                mixed, bank, residual = layer._finish_attention(
                     x,
                     bank,
-                    visit,
-                    step,
+                    self.histories[2],
+                    a,
                     messages,
-                    attention_input=attention_input,
-                    staging=(staged.k, staged.v, self.steps[0].pos_g, row_slot),
-                    defer_experts=True,
-                    scratch=self.scratch[i],
+                    scratch=scratch,
+                    row=i if self.shared else 0,
                 )
                 ids, gamma = self.routes[i]
                 rowvm.fused_router(mixed, layer.router_w.tensor, layer.dec.router_b, ids_out=ids, gamma_out=gamma)
                 _tile_row(mixed, self.mlp, target=i)
-                for source, target in zip(self.histories[:3], staged.conv[:3]):
-                    _tile_row(source, target, target=i)
+                _tile_row(self.histories[2], staged.conv[2], target=i)
                 pending.append((bank, residual))
             grouped = self.experts.run(self.mlp, self.routes, layer.expert_stream)
             states = []

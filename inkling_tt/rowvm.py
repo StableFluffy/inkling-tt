@@ -594,9 +594,16 @@ def head_norm(
     return _run(args, readers, [_Region(y, dim, row_step=1)], heads)
 
 
-def _row_window(x, width, col_offset, *, allow_sharded=False):
+def _row_window(x, width, col_offset, *, allow_sharded=False, row=None):
     _validate(x, allow_sharded=allow_sharded)
-    if tuple(x.shape)[:3] != (1, 1, 1) or col_offset < 0 or col_offset % 16 or col_offset + width > x.shape[-1]:
+    rows = x.shape[-2]
+    if (
+        tuple(x.shape)[:2] != (1, 1)
+        or (rows != 1 if row is None else not 0 <= row < min(rows, 32))
+        or col_offset < 0
+        or col_offset % 16
+        or col_offset + width > x.shape[-1]
+    ):
         raise ValueError("rowvm requires a row window within [1,1,1,N] with a 16-aligned column offset")
 
 
@@ -629,8 +636,8 @@ def head_norm_from_row(
     return _norm_row_heads(x, y, dim, threshold, tau=tau, round_before_tau=round_before_tau, col_offset=col_offset)
 
 
-def _norm_row_heads(x, y, dim, threshold, *, tau=None, round_before_tau=True, col_offset=0, group=None):
-    readers = [_Region(x, dim, col=col_offset, col_step=dim)]
+def _norm_row_heads(x, y, dim, threshold, *, tau=None, round_before_tau=True, col_offset=0, group=None, row=0):
+    readers = [_Region(x, dim, row=row, col=col_offset, col_step=dim)]
     flags = 2 if y.dtype == BF else 0
     if tau is not None:
         if threshold is None:
@@ -670,20 +677,20 @@ def sink_tile(x, *, col_offset=0, out=None):
     return _run((_SINK_TILE,), [_Region(x, 32, col=col_offset)], [_Region(y, 32)])
 
 
-def attention_heads(x, q, r, sink, *, q_threshold, r_threshold, tau=None, _group=None):
+def attention_heads(x, q, r, sink, *, q_threshold, r_threshold, tau=None, _group=None, row=0):
     """Produce Q, zero-extended R, and sink tiles from the packed projection."""
     _validate(q, (1, 1, 24, 128))
     _validate(r, (1, 1, 24, 32))
     _validate(sink, (32, 32), rank=2)
     r_col = 24 * 128
     sink_col = r_col + 24 * 16
-    _row_window(x, sink_col + 32, 0, allow_sharded=True)
+    _row_window(x, sink_col + 32, 0, allow_sharded=True, row=row)
     if any(t.dtype != BF for t in (x, q, r, sink)):
         raise ValueError("packed attention head preparation requires BF16 tensors")
     group = _Group() if _group is None else _group
-    _norm_row_heads(x, q, 128, q_threshold, tau=tau, group=group)
-    _norm_row_heads(x, r, 16, r_threshold, tau=tau, col_offset=r_col, group=group)
-    _run((_SINK_TILE,), [_Region(x, 32, col=sink_col)], [_Region(sink, 32)], group=group)
+    _norm_row_heads(x, q, 128, q_threshold, tau=tau, group=group, row=row)
+    _norm_row_heads(x, r, 16, r_threshold, tau=tau, col_offset=r_col, group=group, row=row)
+    _run((_SINK_TILE,), [_Region(x, 32, row=row, col=sink_col)], [_Region(sink, 32)], group=group)
     if _group is None:
         group.launch()
 
@@ -704,6 +711,7 @@ def update_kv(
     v_dyn=None,
     wrap,
     _group=None,
+    row=0,
     _wait_for_kv=False,
 ):
     """Convolve and normalize each head, then update the corresponding cache row."""
@@ -720,7 +728,7 @@ def update_kv(
         (_CONV_K, k, k_cache, k_history, k_taps, k_dyn),
         (_CONV_V, v, v_cache, v_history, v_taps, v_dyn),
     ):
-        _validate(x, (1, 1, 1, 1024))
+        _row_window(x, 1024, 0, row=row)
         _validate(history, (1, 1, 4, 1024))
         _validate(taps, history.shape)
         length = cache.shape[-2]
@@ -729,10 +737,14 @@ def update_kv(
             raise ValueError("invalid BF16 cache shape or ring length")
         if history.dtype != FP:
             raise ValueError("rowvm cache convolution history must use float32")
-        readers = [_stripe(t, 128, 1024, rows=n) for t, n in ((x, 1), (history, 3), (taps, 4))]
+        readers = [
+            _stripe(x, 128, 1024, row=row),
+            _stripe(history, 128, 1024, rows=3),
+            _stripe(taps, 128, 1024, rows=4),
+        ]
         if dyn is not None:
-            _validate(dyn, (1, 1, 1, 32))
-            readers.append(_Region(dyn, 32))
+            _row_window(dyn, 32, 0, row=row)
+            readers.append(_Region(dyn, 32, row=row))
         _run(
             (op, 128, 2 | (4 if dyn is not None else 0), _bits(threshold), int(wrap)),
             readers,
@@ -764,6 +776,7 @@ def prepare_attention(
     k_dyn,
     v_dyn,
     wrap,
+    row=0,
     kv_projection=None,
 ):
     """Dispatch head preparation and K/V cache writes together."""
@@ -774,7 +787,7 @@ def prepare_attention(
         occupied = {(x, y) for x, y, _ in _kv_placement(device)}
         cores = tuple((x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in occupied)
     group = _Group(cores)
-    attention_heads(qrsg, q, r, sink, q_threshold=q_threshold, r_threshold=r_threshold, tau=tau, _group=group)
+    attention_heads(qrsg, q, r, sink, q_threshold=q_threshold, r_threshold=r_threshold, tau=tau, _group=group, row=row)
     update_kv(
         k,
         v,
@@ -787,6 +800,7 @@ def prepare_attention(
         v_dyn=v_dyn,
         wrap=wrap,
         _group=group,
+        row=row,
         _wait_for_kv=kv_projection is not None,
     )
     group.launch((*kv_projection, k, v) if kv_projection is not None else None)
@@ -1185,6 +1199,7 @@ def attnres_mix(
     shared_prefix=False,
     append=None,
     round_residual=False,
+    partial_row=0,
 ):
     """Read a normalized bank with up to four pre-scaled queries.
 
@@ -1193,7 +1208,12 @@ def attnres_mix(
     With a convolution, partial is the branch input and the convolution
     tuple supplies its history, taps, optional residual, and output row.
     """
-    width = _width(partial, allow_sharded=convolution is not None)
+    width = partial.shape[-1]
+    row_shape = (1, 1, 1, width)
+    if convolution is None:
+        _width(partial)
+    else:
+        _row_window(partial, width, 0, allow_sharded=True, row=partial_row)
     _validate(bank, (1, 1, 32, width))
     _validate(queries)
     nq = queries.shape[2]
@@ -1212,16 +1232,14 @@ def attnres_mix(
         _validate(weight, queries.shape)
     if out is not None and len(out) != nq:
         raise ValueError("rowvm mix needs one output tensor per query")
-    ys = tuple(
-        _output(partial, partial.shape, dtype, None if out is None else out[q], memory_config) for q in range(nq)
-    )
+    ys = tuple(_output(partial, row_shape, dtype, None if out is None else out[q], memory_config) for q in range(nq))
     if any(t.memory_config() != ys[0].memory_config() for t in ys):
         raise ValueError("rowvm mix outputs must use the same memory configuration")
     if valid_rows == 0 and nq == 1 and weight is None and convolution is None:
         return (rms_norm(partial, dtype=dtype, out=ys[0]),)
     chunk, stripes = _stripes(width, _MIX_CHUNK)
     readers = [
-        _stripe(partial, chunk, width),
+        _stripe(partial, chunk, width, row=partial_row),
         _stripe(queries, chunk, width, row_step=1),
         _stripe(
             bank,
@@ -1243,18 +1261,24 @@ def attnres_mix(
         history, taps, residual, z = convolution
         _validate(history, (1, 1, 4, width))
         _validate(taps, history.shape)
-        _validate(z, partial.shape)
+        _validate(z, row_shape)
         if history.dtype != FP or z.dtype != (BF if residual is None or round_residual else FP):
             raise ValueError("invalid convolution history or residual output precision")
         if residual is not None:
-            _validate(residual, partial.shape)
+            _validate(residual, row_shape)
             flags |= 16
         if round_residual:
             flags |= 64
         if weight is None:
             # Keep convolution input CBs at the same offsets for both variants.
-            readers.append(_stripe(partial, chunk, width))
-        readers.extend(_stripe(t, chunk, width, rows=n) for t, n in ((partial, 1), (history, 3), (taps, 4)))
+            readers.append(_stripe(partial, chunk, width, row=partial_row))
+        readers.extend(
+            (
+                _stripe(partial, chunk, width, row=partial_row),
+                _stripe(history, chunk, width, rows=3),
+                _stripe(taps, chunk, width, rows=4),
+            )
+        )
         if residual is not None:
             readers.append(_stripe(residual, chunk, width))
         writers.extend((_stripe(history, chunk, width, rows=4), _stripe(z, chunk, width)))
@@ -1263,7 +1287,7 @@ def attnres_mix(
         entry, row = append
         if op != _CONV_MIX or residual is not None or valid_rows >= 32 or not 0 <= row < 32:
             raise ValueError("bank append requires a block-boundary convolution feeding the mix")
-        _validate(entry, partial.shape)
+        _validate(entry, row_shape)
         readers.append(_stripe(entry, chunk, width))
         writers.append(_stripe(bank, chunk, width, row=row))
         flags |= 32
