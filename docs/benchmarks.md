@@ -47,21 +47,21 @@ Each chunk goes to whichever bucket costs less for the tokens that remain. A 300
 
 `tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` alternates B1 and adaptive
 DSpark requests against the same source server. Both prefill buckets and the standard dispatch
-ring are resident with `--mtp 3 --lmax 8192`. All 30 requests match in streamed choices and
-usage. A separate check against standalone B1 with the larger dispatch ring also matches on
-all five prompts. Values are median/p95.
+ring are resident with `--mtp 3 --lmax 8192 --prefill-chunk 2048`. All 42 requests match in streamed
+choices and usage. Values are median/p95.
 
 | Prompt | B1 decode, ms/ID | MTP decode, ms/ID | B1 TTFT, ms | MTP TTFT, ms |
 |---|---:|---:|---:|---:|
-| Chat | 19.40/19.58 | 19.80/19.98 | 139.30/141.10 | 141.20/141.74 |
-| Python | 19.50/19.59 | 17.10/17.10 | 150.40/150.49 | 150.60/150.60 |
-| Korean | 19.50/19.59 | 19.30/19.39 | 159.20/159.65 | 158.90/158.90 |
-| 1,580 tokens | 20.10/20.10 | 19.00/19.09 | 1065.90/1067.88 | 1067.50/1067.68 |
-| 7,820 tokens | 20.80/21.16 | 21.30/21.57 | 4790.40/4791.30 | 4839.90/4841.07 |
+| Chat | 19.84/20.07 | 20.02/20.34 | 138.70/149.68 | 141.10/144.70 |
+| Python | 19.77/19.78 | 17.27/17.31 | 148.70/150.41 | 148.90/149.62 |
+| Korean | 19.78/19.92 | 19.69/19.72 | 158.40/158.76 | 158.50/159.13 |
+| 1,580 tokens | 20.51/20.58 | 19.21/19.23 | 1043.60/1049.00 | 1045.80/1046.43 |
+| 7,820 tokens | 20.86/21.48 | 21.36/21.86 | 4693.30/4696.36 | 4741.70/4751.87 |
+| Long Python | 20.20/20.46 | 19.05/19.22 | 307.10/309.71 | 307.80/309.69 |
+| Math | 20.14/20.29 | 15.53/15.58 | 171.50/174.47 | 168.30/174.60 |
 
-The mean of the five decode medians is 19.86 ms/ID in B1 mode and 19.30 ms/ID with MTP.
-Chat and the 7,820-token case have higher decode medians with MTP, so B1 is the server
-default. The 7,820-token MTP request reaches its first token in about 4.84 seconds.
+The mean of the seven decode medians is 20.16 ms/ID in B1 mode and 18.88 ms/ID with MTP.
+The 7,820-token case takes 0.50 ms/ID longer with MTP. B1 is the server default.
 
 ## Accuracy
 

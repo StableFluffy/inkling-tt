@@ -61,12 +61,29 @@ def main():
     long = "Tenstorrent Blackhole p150a cards connect over Ethernet. " * 120
     chat = ("chat", "Explain KV caching in two sentences.")
     if args.compare_mtp:
+        medians = {False: [], True: []}
         for name, msg in (
             chat,
             ("code", "Write a Python function to compute the longest common prefix of a list of strings."),
             ("Korean", "Tenstorrent의 Blackhole 칩과 GPU의 차이를 한국어로 간단히 설명해 주세요."),
-            ("1k", "Summarize this: " + long),
-            ("8k", "Summarize this: " + long * 5),
+            ("1.6k", "Summarize this: " + long),
+            ("7.8k", "Summarize this: " + long * 5),
+            (
+                "long code",
+                "Implement a streaming CSV join in Python 3.12, with no dependencies outside the standard library. "
+                "Each input is sorted by an integer key in the first column and has a header. Read both from open "
+                "text streams and yield tuples containing the key and the original row from each input. Support "
+                "inner and left joins, duplicates on either side, and quoted fields with embedded newlines. "
+                "Keep memory proportional to the largest group of rows with the same key. Detect unsorted inputs "
+                "and invalid keys with an exception that identifies the input and its record number. "
+                "Provide type annotations, a command-line example, and tests for missing keys and duplicate groups.",
+            ),
+            (
+                "math",
+                "An urn contains five red balls and seven blue balls. Draw without replacement until the third red "
+                "ball appears. Find the expected draw on which this happens and the probability that it happens "
+                "on an even-numbered draw. Derive both results and give the probability as a reduced fraction.",
+            ),
         ):
             streams = None
             times = {False: [], True: []}
@@ -79,11 +96,20 @@ def main():
                         streams = output
                     assert output == streams, f"Greedy stream changed for {name} with MTP={mtp}"
                     t = d["timings"]
-                    times[mtp].append(t["ms_per_token"])
+                    tokens = d["usage"]["completion_tokens"] - 1
+                    if tokens < 1:
+                        raise RuntimeError(f"{name} ended before a decode token")
+                    times[mtp].append(t["decode_ms"] / tokens)
                     first[mtp].append(t["ttft_ms"])
             for mtp in (False, True):
                 label = "MTP" if mtp else "B1"
+                medians[mtp].append(statistics.median(times[mtp]))
                 print(f"{name} {label}: decode {report(times[mtp])}, TTFT {report(first[mtp])}", flush=True)
+        print(
+            f"Mean decode median: B1 {statistics.fmean(medians[False]):.2f} ms/ID, "
+            f"MTP {statistics.fmean(medians[True]):.2f} ms/ID",
+            flush=True,
+        )
         return
     for name, msg in (
         ("short", "Write a haiku about Tenstorrent chips."),
