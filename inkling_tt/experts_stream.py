@@ -396,7 +396,15 @@ class _PrefillWorkspace:
 
 
 def prepare_prefill(
-    device, tokens, *, broadcast_down=False, full_tiles=False, lanes=0, wide_l1_blocks=None, weight_buffers=2
+    device,
+    tokens,
+    *,
+    broadcast_down=False,
+    full_tiles=False,
+    lanes=0,
+    wide_l1_blocks=None,
+    weight_buffers=2,
+    verify_rows=None,
 ):
     """Allocate reusable scratch for one prefill chunk on a single device.
 
@@ -416,6 +424,10 @@ def prepare_prefill(
     rows = 32 if full_tiles else _PREFILL_ROWS
     page = rows * 64
     capacity = _prefill_capacity(tokens, rows)
+    if verify_rows is not None:
+        if tokens != 32 or full_tiles or not 2 <= verify_rows <= _PREFILL_ROWS:
+            raise ValueError("expert verify uses one compact tile and two to eight live rows")
+        capacity = verify_rows * _TOPK
     # Leave room for the native BF16 head's circular buffers during decode warmup.
     wide_blocks = min(capacity, 512) if full_tiles else capacity
     if lanes and wide_l1_blocks is None:

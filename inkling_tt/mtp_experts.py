@@ -85,7 +85,7 @@ class VerifyExperts:
             raise ValueError("Expert verify needs two to eight live rows")
         self.rows = rows
         self.verify_mode = 2 if streaming else 1
-        self.workspace = experts.prepare_prefill(device, 32)
+        self.workspace = experts.prepare_prefill(device, 32, verify_rows=rows)
         zeros = ttnn.from_torch(torch.zeros(1, 1, 32, D), dtype=BF, layout=TILE)
         ttnn.copy_host_to_device_tensor(zeros, self.workspace.output)
 
