@@ -332,11 +332,12 @@ def _bits(value):
 
 
 @lru_cache(maxsize=32)
-def _heads_program(tasks, src_cols, col_offset, row_tiles, scaled, rms, threshold, specs):
+def _heads_program(tasks, src_cols, col_offset, row_tiles, scaled, head_width, rms, threshold, specs):
     grid, rt = _grid(tasks)
-    args = [src_cols, col_offset, row_tiles, int(scaled)]
+    args = [src_cols, col_offset, row_tiles, int(scaled), head_width]
     reader, writer = tuple(sum(group, ()) for group in specs)
-    cbs = [_tile_cb(grid, 0, BF, 8), _tile_cb(grid, 16, BF, 8)]
+    pages = 2 * ((head_width + 31) // 32)
+    cbs = [_tile_cb(grid, 0, BF, pages), _tile_cb(grid, 16, BF, pages)]
     if scaled:
         cbs.append(_tile_cb(grid, 1, FP, 2))
     kernels = [
@@ -358,7 +359,7 @@ def _heads_program(tasks, src_cols, col_offset, row_tiles, scaled, rms, threshol
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "heads_compute.cpp"),
             core_ranges=grid,
-            compile_time_args=[*args, int(rms), _bits(threshold), _bits(EPS), _bits(1.0 / HD)],
+            compile_time_args=[*args, int(rms), _bits(threshold), _bits(EPS), _bits(1.0 / head_width)],
             runtime_args=rt,
             config=_compute((1,), full_sync=True),
         ),
@@ -366,10 +367,11 @@ def _heads_program(tasks, src_cols, col_offset, row_tiles, scaled, rms, threshol
     return _program(kernels, cbs)
 
 
-def _heads(x, col_offset, heads, *, rms=False, threshold=0.0, tau=None):
-    """Clip or RMS-scale 128-channel heads per row and return them head-major."""
+def _heads(x, col_offset, heads, *, rms=False, threshold=0.0, tau=None, width=HD, out=None):
+    """Clip or RMS-scale heads per row and write zero-padded head-major tiles."""
     t = x.shape[-2]
-    out = _alloc(x.device(), (1, heads, t, HD))
+    if out is None:
+        out = _alloc(x.device(), (1, heads, t, max(32, width)))
     _launch(
         _heads_program,
         (
@@ -378,6 +380,7 @@ def _heads(x, col_offset, heads, *, rms=False, threshold=0.0, tau=None):
             col_offset // 32,
             t // 32,
             tau is not None,
+            width,
             rms,
             threshold,
         ),
@@ -539,6 +542,8 @@ class Prefill:
         self.tau = _alloc(self.dev, (1, chunk, 1, 1), FP)
         self.tau_col = _alloc(self.dev, (1, 1, chunk, 32), FP)
         self._fused_heads = os.environ.get("INK_PREFILL_HEADS", "1") == "1"
+        self._fused_relative = self._fused_heads and os.environ.get("INK_PREFILL_RELATIVE_HEADS", "1") == "1"
+        self.relative = _alloc(self.dev, (1, HQ, chunk, 32)) if self._fused_relative else None
         self._fused_gate = os.environ.get("INK_PREFILL_GATE", "1") == "1"
         self._reuse_items = os.environ.get("INK_PREFILL_REUSE_ITEMS", "1") == "1"
         self._project_distance = os.environ.get("INK_PREFILL_PROJECT_DISTANCE", "1") == "1"
@@ -709,12 +714,23 @@ class Prefill:
             if layer.is_global:
                 q = ttnn.multiply(f32(q), self.tau, dtype=BF)
             q = ttnn.permute(q, (0, 2, 1, 3))
-        r = self.hclip(ttnn.reshape(columns(3072, 3456), [1, t, HQ, DR]), 8.0)
-        if layer.is_global:
-            r = ttnn.multiply(f32(r), self.tau, dtype=BF)
+        if self._fused_relative:
+            r = _heads(
+                qrsg,
+                3072,
+                HQ,
+                threshold=8.0,
+                width=DR,
+                tau=self.tau_col if layer.is_global else None,
+                out=self.relative,
+            )
+        else:
+            r = self.hclip(ttnn.reshape(columns(3072, 3456), [1, t, HQ, DR]), 8.0)
+            if layer.is_global:
+                r = ttnn.multiply(f32(r), self.tau, dtype=BF)
+            r = ttnn.permute(r, (0, 2, 1, 3))
+            r = ttnn.pad(r, [(0, 0), (0, 0), (0, 0), (0, 32 - DR)], 0.0)
         sink, gate = columns(3456, 3488), columns(3488, 6560)
-        r = ttnn.permute(r, (0, 2, 1, 3))
-        r = ttnn.pad(r, [(0, 0), (0, 0), (0, 0), (0, 32 - DR)], 0.0)
         table = self.rel_weights[layer.i] if self._project_distance else None
         distance = r if table is not None else self.c.mm(r, self.rel_weights[layer.i])
 

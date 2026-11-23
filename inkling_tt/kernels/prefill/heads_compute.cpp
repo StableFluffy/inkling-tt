@@ -1,4 +1,4 @@
-// Per-row, per-head L2 clip or RMS scale of 128-channel heads in FP32.
+// Per-row, per-head L2 clip or RMS scale in FP32.
 // Global queries are then rounded and multiplied by the row's position scale.
 #include "api/compute/common.h"
 #include "api/compute/compute_kernel_api.h"
@@ -18,9 +18,6 @@
 using namespace ckernel;
 
 namespace {
-constexpr uint32_t head_tiles = 4;
-constexpr uint32_t sums = 4;
-constexpr uint32_t scratch = 5;
 constexpr uint32_t one = 0x3f800000;
 
 #ifdef TRISC_MATH
@@ -72,10 +69,13 @@ void gather_groups(uint32_t to, uint32_t target, uint32_t) {
 void kernel_main() {
     constexpr uint32_t row_tiles = get_compile_time_arg_val(2);
     constexpr bool scaled = get_compile_time_arg_val(3);
-    constexpr bool rms = get_compile_time_arg_val(4);
-    constexpr uint32_t threshold = get_compile_time_arg_val(5);
-    constexpr uint32_t epsilon = get_compile_time_arg_val(6);
-    constexpr uint32_t inv_width = get_compile_time_arg_val(7);
+    constexpr uint32_t head_tiles = (get_compile_time_arg_val(4) + 31) / 32;
+    constexpr bool rms = get_compile_time_arg_val(5);
+    constexpr uint32_t threshold = get_compile_time_arg_val(6);
+    constexpr uint32_t epsilon = get_compile_time_arg_val(7);
+    constexpr uint32_t inv_width = get_compile_time_arg_val(8);
+    constexpr uint32_t sums = head_tiles;
+    constexpr uint32_t scratch = sums + 1;
     const uint32_t start = get_arg_val<uint32_t>(0);
     const uint32_t end = get_arg_val<uint32_t>(1);
     compute_kernel_hw_startup(0, 16);
