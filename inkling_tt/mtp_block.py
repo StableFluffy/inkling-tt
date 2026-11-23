@@ -131,7 +131,16 @@ class DraftBlock:
     """Device transformer on one DSpark block with fixed-size prefix storage."""
 
     def __init__(
-        self, device, weights, rows, prefix_capacity, *, sharded_mlp=True, short_prefix=False, pack_queries=True
+        self,
+        device,
+        weights,
+        rows,
+        prefix_capacity,
+        *,
+        sharded_mlp=True,
+        sharded_attention=True,
+        short_prefix=False,
+        pack_queries=True,
     ):
         if not 2 <= rows <= 8 or prefix_capacity < 32 or prefix_capacity % 32:
             raise ValueError("DSpark needs 2-8 rows and a positive, tile-aligned prefix capacity")
@@ -146,20 +155,23 @@ class DraftBlock:
             return ttnn.from_torch(x.contiguous(), dtype=BF, layout=TILE, device=device, memory_config=DRAM)
 
         self.weights = {}
-        self.mlp_work = {}
+        self.linear_work = {}
         for name, weight in weights.items():
             if (name.startswith("layers.") and "ctx" not in name and "dflare" not in name) or name == "norm.weight":
-                if sharded_mlp and ".mlp." in name:
+                sharded = (sharded_mlp and ".mlp." in name) or (
+                    sharded_attention and ".self_attn." in name and weight.ndim == 2
+                )
+                if sharded:
                     handle = dense.prepare_weight(device, weight.T)
                     self.weights[name] = handle
                     shape = (handle.k, handle.n)
-                    if shape not in self.mlp_work:
+                    if handle.input_shards is not None and shape not in self.linear_work:
                         args = _head_copy_args(device, handle)
                         bufs = tuple(
                             ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 32, width)), BF, TILE, device, mem)
                             for width, mem in ((handle.k, handle.input_shards), (handle.n, handle.output_shards))
                         )
-                        self.mlp_work[shape] = (*bufs, args)
+                        self.linear_work[shape] = (*bufs, args)
                 else:
                     self.weights[name] = upload(weight.T if weight.ndim == 2 else weight.reshape(1, 1, 1, -1))
         row = lambda n, dtype=BF: _alloc(device, (1, 1, 32, n), dtype)
@@ -214,7 +226,16 @@ class DraftBlock:
         if not isinstance(weight, dense.DenseWeight):
             ttnn.linear(x, weight, compute_kernel_config=self.ck, optional_output_tensor=dest)
             return
-        inputs, output, copy_args = self.mlp_work[(weight.k, weight.n)]
+        if weight.input_shards is None:
+            ttnn.linear(
+                x,
+                weight.tensor,
+                program_config=weight.program,
+                compute_kernel_config=weight.compute,
+                optional_output_tensor=dest,
+            )
+            return
+        inputs, output, copy_args = self.linear_work[(weight.k, weight.n)]
         ttnn.interleaved_to_sharded(x, weight.input_shards, preallocated_output=inputs)
         ttnn.linear(
             inputs,
