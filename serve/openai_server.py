@@ -114,15 +114,12 @@ class Engine:
     def __init__(self, args):
         import ttnn
 
-        from serve.runtime import DEVICE_PARAMS, InklingRuntime
+        from inkling_tt.device import open_device
+        from serve.runtime import InklingRuntime
 
         self.ttnn = ttnn
         self.lmax = args.lmax
-        self.dev = ttnn.open_device(
-            device_id=args.device_id,
-            l1_small_size=DEVICE_PARAMS["l1_small_size"],
-            trace_region_size=DEVICE_PARAMS["trace_region_size"],
-        )
+        self.dev = open_device(args.device_id)
         self.rt = InklingRuntime(self.dev, args.weights, lmax=args.lmax, chunk=args.prefill_chunk, log=log.info)
         self.rt.fast_prefill = not args.no_fast_prefill
         if not args.no_trace:

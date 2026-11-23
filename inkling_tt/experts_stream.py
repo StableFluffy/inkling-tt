@@ -10,6 +10,7 @@ import torch
 import ttnn
 
 from . import dense, rowvm
+from .device import has_default_l1_budget
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "experts"
 _BF, _FP, _BFP8 = ttnn.bfloat16, ttnn.float32, ttnn.bfloat8_b
@@ -426,6 +427,8 @@ def prepare_prefill(device, tokens, *, broadcast_down=False, full_tiles=False, l
         grid = device.compute_with_storage_grid_size()
         workers = grid.x * grid.y
         default_blocks = 600 if workers >= 130 else 540 if workers >= 120 else 480
+        if not has_default_l1_budget(device):
+            default_blocks -= 56
         down_l1_blocks = min(capacity, int(os.environ.get("INK_PREFILL_EXPERT_DOUT_L1", default_blocks)))
     wide_tail = (
         _prefill_alloc(device, (1, 1, (capacity - wide_blocks) * _GU_K, page // 2), _BF, _RM, _DRAM)

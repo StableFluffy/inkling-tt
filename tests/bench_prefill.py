@@ -19,6 +19,7 @@ import ttnn
 
 import inkling_tt.prefill as pp
 from inkling_tt import dense
+from inkling_tt.device import open_device
 from inkling_tt.model import Precision
 from inkling_tt.model2 import InklingTT2
 
@@ -65,7 +66,7 @@ def skip_instance(pf, names):
 
 
 def main():
-    dev = ttnn.open_device(device_id=0, l1_small_size=16384, trace_region_size=400_000_000)
+    dev = open_device()
     t = time.perf_counter()
     spec = Precision(
         expert_dtype=ttnn.bfloat8_b,

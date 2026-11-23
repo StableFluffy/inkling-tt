@@ -25,7 +25,7 @@ Device profile of one token on the tested card (13x10 workers, `lmax` 2048, BFP8
 | Readout, layout and small epilogues | 38 | 0.1 |
 | **Total** | **655** | **18.5** |
 
-The first four rows stream weights. The firmware span includes about 1.1 ms between programs. Unprofiled greedy decode runs at about 19.5 ms per token ([benchmarks.md](benchmarks.md)).
+The first four rows stream weights. The larger dispatch ring cuts time outside kernels from 1.13 ms to 0.21 ms per token in the device profile. Unprofiled greedy decode runs at about 18.7 ms per token ([benchmarks.md](benchmarks.md)).
 
 ## From the first port to this release
 
@@ -47,6 +47,8 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 ## The pieces
 
 **Trace with persistent inputs.** `InklingTT2` (`inkling_tt/model2.py`) allocates every intermediate once and captures the whole step with `ttnn.begin_trace_capture`. Per-step data (token embedding row, positions, cache slots, masks) lives in device tensors that the host overwrites before each replay. Anything allocated or compiled after capture starts can alias trace memory, so the model and both prefill buckets run once eagerly before `capture()` is called.
+
+**Dispatch memory.** The standalone runtime reserves about 128 KiB per worker for Metal's kernel-config ring. The larger ring lets dispatch stage more programs while earlier programs are still running. The 2048-row bucket keeps fewer global-attention score tiles and spills more of the expert down projection to DRAM to fit the smaller L1 partition.
 
 **Dense projections.** Batch-1 projections are matrix-vector products, bound by weight bandwidth. `inkling_tt/dense.py` picks a DRAM-sharded matmul configuration per shape, so each DRAM bank feeds the workers next to it. The four attention projections of a visit (Q, relative-bias query, sink, output gate) share one fused weight and one program. A second program streams both K and V matrices, each with its own input. See [dense.md](dense.md).
 
@@ -71,4 +73,4 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 
 ## Remaining budget
 
-About 4 ms of kernel time and 1 ms of gaps sit outside weight streaming. The largest items are the 120 attention-residual mixes (1.3 ms), attention preparation and fused attention (0.8 ms), the message-gate up projections (0.7 ms, partly FP32 weight reads) and the router (0.5 ms). Shaving single programs has small returns now. The next real gain needs overlap across programs, for example prefetching the next visit's weights on a sub-device while the epilogues run, or a persistent decode kernel.
+About 4 ms of kernel time and 0.2 ms of dispatch overhead sit outside weight streaming. The largest items are the 120 attention-residual mixes (1.3 ms), attention preparation and fused attention (0.8 ms), the message-gate up projections (0.7 ms, partly FP32 weight reads) and the router (0.5 ms). Shaving single programs has small returns now. The next real gain needs overlap across programs, for example prefetching the next visit's weights on a sub-device while the epilogues run, or a persistent decode kernel.

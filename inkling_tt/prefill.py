@@ -11,6 +11,7 @@ import torch
 import ttnn
 
 from inkling_tt import dense, experts_stream
+from inkling_tt.device import has_default_l1_budget
 from inkling_tt.model import (
     DR,
     EPS,
@@ -491,6 +492,8 @@ class Prefill:
         self._broadcast_dense = os.environ.get("INK_PREFILL_DENSE", "broadcast") == "broadcast"
         self._retain_scores = os.environ.get("INK_PREFILL_KEEP_SCORES", "1") == "1"
         wide_score_tiles = 188 if grid.x * grid.y >= 130 else 160
+        if chunk > 1024 and not has_default_l1_budget(self.dev):
+            wide_score_tiles -= 12
         score_tiles = int(
             os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", str(wide_score_tiles if chunk > 1024 else 97))
         )

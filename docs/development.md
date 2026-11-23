@@ -56,6 +56,8 @@ scripts/dev_run.sh "python -u tests/bench_prefill.py 128 2048" # warm TTFT per p
 INKLING_URL=http://localhost:8000 python3 tools/bench_server.py  # end to end through HTTP
 ```
 
+`INK_LARGE_DISPATCH_RING=0` restores the pinned tt-metal default ring for the standalone server and full-model harnesses.
+
 Decode timings are medians over 64 tokens after four warm-up tokens. Run A/B comparisons in the same process or interleaved in one job; host jitter alone moves a single run by about 0.3 ms.
 
 ## Profiling

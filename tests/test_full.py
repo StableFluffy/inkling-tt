@@ -7,6 +7,7 @@ import torch
 import ttnn
 
 from inkling_tt import paths
+from inkling_tt.device import open_device
 from inkling_tt.model import Precision
 from inkling_tt.model2 import InklingTT2
 
@@ -16,7 +17,7 @@ def main():
     layers = int(sys.argv[2]) if len(sys.argv) > 2 else None
     cap = torch.load(paths.golden("capture_haiku.pt"), weights_only=False)
     ids, gen, ref = cap["ids"][0].tolist(), cap["gen"], cap["logits"]
-    dev = ttnn.open_device(device_id=0, l1_small_size=16384, trace_region_size=400_000_000)
+    dev = open_device()
     prec = Precision(
         expert_dtype=ttnn.bfloat8_b,
         dense_dtype=ttnn.bfloat16,

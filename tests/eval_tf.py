@@ -11,6 +11,7 @@ import torch
 import ttnn
 
 from inkling_tt import paths
+from inkling_tt.device import open_device
 from inkling_tt.model import Precision
 from inkling_tt.model2 import InklingTT2
 from inkling_tt.prefill import Prefill
@@ -22,7 +23,7 @@ def main():
     )
     fid = getattr(ttnn.MathFidelity, sys.argv[4]) if len(sys.argv) > 4 else ttnn.MathFidelity.HiFi4
     data = torch.load(paths.golden("eval3x128.pt"), weights_only=False)
-    dev = ttnn.open_device(device_id=0, l1_small_size=16384, trace_region_size=400_000_000)
+    dev = open_device()
     prec = Precision(expert_dtype=ed, dense_dtype=dd, expert_fidelity=fid, dense_fidelity=ttnn.MathFidelity.HiFi4)
     prec.head_dtype = hd
     import os

@@ -8,30 +8,30 @@ Measurements on one p150a in the [tested configuration](hardware.md#tested-confi
 
 | Path | Median | p95 | Tokens/s |
 |---|---:|---:|---:|
-| Greedy, device argmax | 19.92 ms | 20.05 ms | 50.2 |
-| Full logits read back to the host | 21.06 ms | 21.74 ms | 47.5 |
+| Greedy, device argmax | 18.65–18.70 ms | 18.79–19.00 ms | 53.5–53.6 |
+| Full logits read back to the host | 19.72–19.76 ms | 19.83–20.97 ms | 50.6–50.7 |
 | Greedy, stock SDPA attention (`INK_ATTN_DECODE=0`) | 22.79 ms | 22.84 ms | 43.9 |
 | Greedy, restricted to 11x10 (`INK_GRID=11x10`) | 20.54 ms | 20.58 ms | 48.7 |
 
-The default-path rows use 120 timed steps per mode, alternating the two-block reader with the v0.1.0 three-block reader in one job. The three-block reader measured 20.15 ms median and 20.33 ms p95 for greedy decode. Both produced the same 64 greedy tokens. The stock SDPA, restricted grid, and server figures are from v0.1.0.
+The default-path rows give the range across two 60-step passes per mode. The two passes ran with the standard and larger dispatch rings interleaved. The standard ring measured 19.41–19.45 ms median and 19.43–19.58 ms p95 for greedy decode. The stock SDPA, restricted grid, and server figures are from v0.1.0.
 
 Decode slows slightly with context length because global-attention visits read more cache: about 20.7 ms/token after a 1.6k-token prompt and 21.3 ms/token after 7.8k tokens (server measurements below).
 
 ## Prefill
 
-`scripts/run_tests.sh buckets` measures warm prefill from position 0 with both buckets (128 and 2048 rows) resident at `lmax` 32768, including the readback of the last logits. Up to 8,192 tokens, the table uses ten runs per length per reader, alternating the compact readers in one job.
+`scripts/run_tests.sh buckets` measures warm prefill from position 0 with both buckets (128 and 2048 rows) resident at `lmax` 32768, including the readback of the last logits. The 128-, 2,048-, 8,192- and 32,768-token rows use three warmed runs per length with the larger dispatch ring. The other rows use ten runs with the standard ring.
 
 | Prompt tokens | Median TTFT | p95 TTFT | Tokens/s |
 |---:|---:|---:|---:|
 | 22 | 0.1362 s | 0.1365 s | 162 |
-| 128 | 0.1865 s | 0.1868 s | 686 |
+| 128 | 0.1872 s | 0.1875 s | 684 |
 | 300 | 0.5127 s | 0.5130 s | 585 |
 | 1,024 | 0.8529 s | 0.8538 s | 1,201 |
-| 2,048 | 1.0362 s | 1.0385 s | 1,976 |
-| 8,192 | 4.3112 s | 4.3133 s | 1,900 |
-| 32,768 | 22.885 s | 22.889 s | 1,432 |
+| 2,048 | 1.0376 s | 1.0378 s | 1,974 |
+| 8,192 | 4.3115 s | 4.3118 s | 1,900 |
+| 32,768 | 22.549 s | 22.554 s | 1,453 |
 
-The previous compact reader took 0.2069 s median at 128 tokens and 0.5663 s at 300 tokens in the same job. Logits match bit-for-bit at all six measured lengths through 8,192 tokens. The full-cache row uses three runs from the bucket suite.
+The full-cache median was 22.458 s with the standard ring in the same job. The larger ring reserves L1 for dispatch and leaves fewer FP32 score tiles resident during global attention.
 
 Each chunk goes to whichever bucket costs less for the tokens that remain, so a 300-token prompt runs as three 128-row chunks and an 8,192-token prompt as four 2048-row chunks. Throughput falls at 32k because attention over the global layers grows with the prompt. The 32,768-token row fills the whole cache and leaves no room for output.
 
@@ -65,7 +65,7 @@ The reference is Hugging Face's eager implementation in BF16 on the CPU. These c
 
 ## Memory and conversion
 
-At `lmax` 32768 with the decode trace, both prefill buckets and the embedding table resident, tt-metal reports 31.05 GB of DRAM allocated out of 33.78 GB.
+At `lmax` 32768 with the decode trace, both prefill buckets and the embedding table resident, tt-metal reports 31.27 GB of DRAM allocated out of 33.78 GB.
 
 The converter took 2 minutes 17 seconds, peaked at 59.2 GiB of RAM and wrote 52.8 GB. A repeat conversion matched all 27 reference hashes.
 

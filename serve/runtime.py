@@ -7,8 +7,6 @@ from inkling_tt import paths
 from inkling_tt.model import VOCAB, Precision
 from inkling_tt.model2 import InklingTT2
 
-DEVICE_PARAMS = {"l1_small_size": 16384, "trace_region_size": 400_000_000}
-
 
 def default_precision():
     prec = Precision(

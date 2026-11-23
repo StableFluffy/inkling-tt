@@ -42,3 +42,5 @@ Set it before the process opens the device, and leave it unset on a stock card. 
 ## Memory
 
 At `lmax` 32768, with the decode trace, both prefill buckets and the on-device embedding table resident, tt-metal reports 31.27 GB of DRAM allocated out of 33.78 GB. A shorter `lmax` shrinks the KV caches of the eight global-attention visits. The 40 sliding-window visits use fixed 1024-slot rings.
+
+With both prefill buckets resident, the larger dispatch ring leaves 1,105,216 contiguous L1 bytes per worker. Wide global attention uses 1,095,808 bytes of that space for its circular buffers.
