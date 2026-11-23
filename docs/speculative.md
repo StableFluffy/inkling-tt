@@ -95,15 +95,17 @@ drafter share one width-sharded BF16 head workspace.
 The target publishes the next anchor, absolute position and adaptive width. It selects the width
 using replay costs measured at startup and a decaying estimate of proposal acceptance. With
 estimated conditional acceptance `a`, a width `R` yields an expected `1 + a + ... + a^(R-1)` IDs.
-Width one switches the request to B1.
+
+An adaptive request starts with two rows if its projected overhead fits 0.3 ms per allowed
+decode ID. Each round charges its estimated replay time and credits the B1 time of its emitted
+IDs. A wider round must fit the remaining budget even if every proposal is rejected. The
+budget allows one two-row probe. Width one switches the request to B1.
 
 The host queues an asynchronous read of the 64-byte result, followed by the context update and
 the next shared draft trace when another speculative round fits and pays off at the lowest possible acceptance. The draft starts from the
 device-published anchor and position. The host uses the returned width to submit the matching
 scoring and verification traces while the draft runs. Near the short-prefix boundary or the
 output limit, the next launch waits for the accepted position.
-On the 32-ID ring-boundary fixture, the two schedules have similar medians and prequeueing
-reduces p95 from 20.89 to 20.55 ms per ID.
 
 ## Device checks
 

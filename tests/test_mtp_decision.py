@@ -37,6 +37,33 @@ def main():
             decide.accept(position_input, target, drafts, meta)
             decide.publish(anchor, position_input)
 
+        for count in (1, 2):
+            prepare(29, count)
+            decide.set_policy(
+                [
+                    lmax,
+                    4,
+                    1024,
+                    20_000,
+                    35_000,
+                    42_000,
+                    50_000,
+                    20_000,
+                    35_000,
+                    42_000,
+                    50_000,
+                    6963,
+                    1229,
+                    0,
+                    15_000,
+                    0,
+                ]
+            )
+            decide.accept(position_input, target[:2], drafts[:1], meta)
+            decide.publish(anchor, position_input)
+            assert decide.read(include_width=True) == (expected_ids[:count], 29 + count, count)
+        print("A rejected narrow probe exhausts the replay budget", flush=True)
+
         prepare(1023, 1)
         run()
         assert decide.read() == (expected_ids[:1], 1024)

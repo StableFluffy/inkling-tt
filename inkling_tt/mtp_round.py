@@ -17,6 +17,7 @@ from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tile_cb
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
 _SHORT_PREFIX = 1024
+_PROBE_COST_PER_ID = 0.0003
 
 
 @lru_cache(maxsize=8)
@@ -126,6 +127,8 @@ class SpeculativeRound:
         self.draft_ready = False
         self.next_width = None
         self.policy_deadline = None
+        self.credit = 0.0
+        self.probe_cost = 0.0
 
     def can_run(self, position, rows=None):
         rows = self.rows if rows is None else rows
@@ -149,6 +152,13 @@ class SpeculativeRound:
         else:
             acceptance = self.accepted / (self.accepted + self.rejected)
             width = self._pick_width(position, limit, acceptance)
+            if self.adaptive and self.pending is None and width > 1:
+                short = self._short(position)
+                baseline = self.costs[short, 1]
+                probe = self.costs[short, 2]
+                width = (
+                    2 if probe < (1 + acceptance) * baseline and probe - baseline <= _PROBE_COST_PER_ID * limit else 1
+                )
         self.plain = width == 1
         return width
 
@@ -158,13 +168,21 @@ class SpeculativeRound:
             return False
         if self._short(position + 1) != self._short(end):
             return False
+        if self.adaptive:
+            short = self._short(position)
+            next_short = self._short(end)
+            credit = self.credit + self.costs[short, 1] - self.costs[short, rows]
+            if credit + self.probe_cost < self.costs[next_short, 2] - self.costs[next_short, 1]:
+                return False
         lower_acceptance = 0.9 * self.accepted / (0.9 * (self.accepted + self.rejected) + 1)
         return self._pick_width(end, remaining - rows, lower_acceptance) > 1
 
-    def _set_policy(self, deadline):
+    def _set_policy(self, deadline, position):
         if not self.adaptive or self.policy_deadline == deadline:
             return
         costs = [round(self.costs.get((short, r), 0.0) * 1e6) for short in (False, True) for r in range(1, 5)]
+        short = self._short(position)
+        self.probe_cost = max(0.0, self.costs[short, 2] - self.costs[short, 1])
         self.decision.set_policy(
             [
                 deadline,
@@ -173,8 +191,8 @@ class SpeculativeRound:
                 *costs,
                 round(self.accepted * 4096),
                 round(self.rejected * 4096),
-                0,
-                0,
+                round(self.credit * 1e6),
+                round(self.probe_cost * 1e6),
                 0,
             ]
         )
@@ -305,7 +323,7 @@ class SpeculativeRound:
             self.draft_ready = False
         self.pending = None
         deadline = min(position + remaining, self.model.lmax) if remaining else 0
-        self._set_policy(deadline)
+        self._set_policy(deadline, position)
         if not self.draft_ready:
             ttnn.execute_trace(self.device, self.draft_core_traces[self._short(position)], cq_id=0, blocking=False)
         ttnn.execute_trace(self.device, self.draft_traces[rows], cq_id=0, blocking=False)
@@ -319,6 +337,10 @@ class SpeculativeRound:
             ttnn.execute_trace(self.device, next_trace, cq_id=0, blocking=False)
         ttnn.event_synchronize(ready)
         emitted, end, self.next_width = self.decision.read(result, include_width=True)
+        if self.adaptive:
+            short = self._short(position)
+            baseline = self.costs[short, 1]
+            self.credit = min(self.credit + len(emitted) * baseline - self.costs[short, rows], 2 * baseline)
         accepted = len(emitted) - 1
         self.accepted = 0.9 * self.accepted + accepted
         self.rejected = 0.9 * self.rejected + int(accepted < rows - 1)
