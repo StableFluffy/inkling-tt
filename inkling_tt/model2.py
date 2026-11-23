@@ -610,7 +610,7 @@ class Layer:
         hn = self.ops.rms(rows[0]) if shared else None
         return tuple(self.gate_msg(s, u, m, hn, weight=norm) for s, u, m, norm in zip("qkv", rows, messages, norms))
 
-    def attention(self, xq, xk, xv, vs: Visit, st: Step):
+    def attention(self, xq, xk, xv, vs: Visit, st: Step, *, staging=None):
         c = self.c
         qrsg = _linear_to_shards(xq, self.dq.weight) if c.shard_fusion else dense.linear(xq, self.dq.weight)
         r_col = HQ * HD
@@ -652,6 +652,11 @@ class Layer:
         else:
             kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
         if c.layout_fusion:
+            if staging is None:
+                caches, cache_pos, wrap = (vs.k, vs.v), st.pos_g, not self.is_global
+            else:
+                staged_k, staged_v, _, cache_pos = staging
+                caches, wrap = (staged_k, staged_v), False
             k_dyn = dense.linear(xk, self.k_wproj) if self.is_global else None
             v_dyn = dense.linear(xv, self.v_wproj) if self.is_global else None
             if c.join_attention_prep:
@@ -662,33 +667,32 @@ class Layer:
                     sinkt,
                     kr,
                     vr,
-                    (vs.k, vs.v),
+                    caches,
                     vs.conv[:2],
                     (self.dec.k_taps, self.dec.v_taps),
-                    st.pos_g,
+                    cache_pos,
                     q_threshold=QK_CLIP,
                     r_threshold=REL_CLIP,
                     tau=tau,
                     k_dyn=k_dyn,
                     v_dyn=v_dyn,
-                    wrap=not self.is_global,
+                    wrap=wrap,
                     kv_projection=kv_projection,
                 )
             else:
                 rowvm.update_kv(
                     kr,
                     vr,
-                    vs.k,
-                    vs.v,
+                    *caches,
                     vs.conv[0],
                     vs.conv[1],
                     self.dec.k_taps,
                     self.dec.v_taps,
-                    st.pos_g,
+                    cache_pos,
                     threshold=QK_CLIP,
                     k_dyn=k_dyn,
                     v_dyn=v_dyn,
-                    wrap=not self.is_global,
+                    wrap=wrap,
                 )
         else:
             if self.is_global:
@@ -719,6 +723,7 @@ class Layer:
                 global_cache=self.is_global,
                 gate_col=gate_col,
                 out=c.gated_shards,
+                staged=None if staging is None else staging[:3],
             )
             return _linear_to_shards(c.gated_shards, self.wo)
         if c.position_fusion:
@@ -780,7 +785,9 @@ class Layer:
     def forward(self, x, bank, vs, st, messages=None):
         return self._forward(x, bank, vs, st, messages)[0]
 
-    def _forward(self, x, bank, vs, st, messages=None, *, attention_input=None, next_mix=None):
+    def _forward(
+        self, x, bank, vs, st, messages=None, *, attention_input=None, next_mix=None, staging=None, defer_experts=False
+    ):
         ops, d = self.ops, self.dec
         block_residual = x
         if self.is_global:
@@ -802,7 +809,7 @@ class Layer:
             else:
                 h = attention_input if attention_input is not None else ops.mix(bank, x, d.q_attn, 1)[0]
                 xq, xk, xv = self._gate_attention((h,) * 3, messages, (d.norm_in,) * 3, shared=True)
-        a = self.attention(xq, xk, xv, vs, st)
+        a = self.attention(xq, xk, xv, vs, st, staging=staging)
         if self.block_boundary and not isinstance(bank, _DecodeBank):
             bank = ops.bank_append(bank, block_residual)
         if self.c.visit_fusion:
@@ -834,28 +841,10 @@ class Layer:
             )[0]
             if messages is not None:
                 mixed = self.gate_msg("mlp", mixed, messages[3], weight=d.norm_post, out=xm)
+            if defer_experts:
+                return mixed, bank, z
             branch = self._visit_moe(mixed, vs)
-            if next_mix is None:
-                return rowvm.conv_residual(vs.conv[3], branch, d.pm_taps, z), bank, None
-            query, weight = next_mix
-            rm = self.c.row_major_state
-            y = ttnn.allocate_tensor_on_device(
-                ttnn.Shape(x.shape), BF, RM if rm else TILE, self.c.dev, L1 if rm else DRAM
-            )
-            h = rowvm.attnres_mix(
-                bank.tensor,
-                branch,
-                query,
-                bank.count,
-                bank_start=bank.tail_start,
-                shared_prefix=True,
-                weight=weight,
-                dtype=BF if weight is not None else FP,
-                convolution=(vs.conv[3], d.pm_taps, z, y),
-                round_residual=True,
-                memory_config=L1 if self.c.paired_kv and weight is not None else DRAM,
-            )[0]
-            return y, bank, h
+            return self._finish_visit(branch, bank, z, vs.conv[3], next_mix)
 
         a = self.sconv(a, self.pa_taps, vs.conv[2])
         z = a if self.block_boundary else rowvm.add(block_residual, a, dtype=FP)
@@ -865,6 +854,33 @@ class Layer:
             xm = self.gate_msg("mlp", ops.mix(bank, z, self.q_mlp, 1)[0], messages[3], weight=self.norm_post)
         y = self.sconv(self._visit_moe(xm, vs), self.pm_taps, vs.conv[3])
         return rowvm.add(z if z.dtype == FP else f32(z), f32(y), dtype=BF), bank, None
+
+    def _finish_visit(self, branch, bank, residual, history, next_mix, *, out=None, mixed_out=None):
+        taps = self.dec.pm_taps
+        if next_mix is None:
+            return rowvm.conv_residual(history, branch, taps, residual, out=out), bank, None
+        query, weight = next_mix
+        rm = self.c.row_major_state
+        y = out
+        if y is None:
+            y = ttnn.allocate_tensor_on_device(
+                ttnn.Shape(residual.shape), BF, RM if rm else TILE, self.c.dev, L1 if rm else DRAM
+            )
+        mix = rowvm.attnres_mix(
+            bank.tensor,
+            branch,
+            query,
+            bank.count,
+            bank_start=bank.tail_start,
+            shared_prefix=True,
+            weight=weight,
+            dtype=BF if weight is not None else FP,
+            out=(mixed_out,) if mixed_out is not None else None,
+            convolution=(history, taps, residual, y),
+            round_residual=True,
+            memory_config=L1 if self.c.paired_kv and weight is not None else DRAM,
+        )[0]
+        return y, bank, mix
 
 
 def init_attention_glue(c, lmax):
@@ -1070,16 +1086,6 @@ class InklingTT2:
                         prev_bank.count - 2,
                         bank_start=prev_bank.tail_start + 1,
                     )
-                next_mix = None
-                # At a pass restart the next layer consumes the saved pre-loop row.
-                next_i = layer.i + 1
-                if next_i == len(layers):
-                    if not layer.is_loop or p == NPASS - 1:
-                        next_mix = (self.dec_final_q[2], self.dec_norm)
-                elif (next_i != LOOP1 or p == NPASS - 1) and not layers[next_i].is_global:
-                    after = layers[next_i]
-                    weight = None if p and after.is_loop else after.dec.norm_in
-                    next_mix = (after.dec.q_attn[2], weight)
                 visit = self.visits[visit_slot(layer.i, p if layer.is_loop else 0)]
                 x, bank, attention_input = layer._forward(
                     x,
@@ -1088,7 +1094,7 @@ class InklingTT2:
                     self.st,
                     messages,
                     attention_input=attention_input,
-                    next_mix=next_mix,
+                    next_mix=self._next_mix(layer, p),
                 )
 
         run_range(0, LOOP0, 0)
@@ -1104,6 +1110,17 @@ class InklingTT2:
         if attention_input is None:
             attention_input = self.ops.mix(bank, x, self.dec_final_q, 1, weight=self.dec_norm, dtype=BF)[0]
         return attention_input
+
+    def _next_mix(self, layer, pass_id):
+        next_i = layer.i + 1
+        if next_i == len(self.layers):
+            if not layer.is_loop or pass_id == NPASS - 1:
+                return self.dec_final_q[2], self.dec_norm
+        elif (next_i != LOOP1 or pass_id == NPASS - 1) and not self.layers[next_i].is_global:
+            after = self.layers[next_i]
+            weight = None if pass_id and after.is_loop else after.dec.norm_in
+            return after.dec.q_attn[2], weight
+        return None
 
     def _readout(self, h):
         """Logits leave the graph row-major (host untilize of the tiled 201k row costs ~9 ms; device ~0.04 ms).

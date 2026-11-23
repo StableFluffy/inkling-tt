@@ -1021,7 +1021,7 @@ def depthwise_conv(history, x, taps, *, dyn=None, dtype=FP, out=None, memory_con
     )
 
 
-def conv_residual(history, x, taps, residual):
+def conv_residual(history, x, taps, residual, *, out=None):
     """Shift convolution history, round the convolution, and add the residual in BF16."""
     width = _width(x)
     _validate(residual, x.shape)
@@ -1030,7 +1030,7 @@ def conv_residual(history, x, taps, residual):
     if history.dtype != FP:
         raise ValueError("rowvm convolution history must use float32")
     chunk, stripes = _stripes(width, 128)
-    y = _output(x, x.shape, BF, None, None)
+    y = _output(x, x.shape, BF, out, None)
     return _run(
         (_CONV_ADD, chunk, 2 | 16),
         [_stripe(t, chunk, width, rows=n) for t, n in ((x, 1), (history, 3), (taps, 4), (residual, 1))],

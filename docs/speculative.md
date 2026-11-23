@@ -3,7 +3,8 @@
 The Inkling-2-Mini checkpoint ships a three-layer DSpark drafter in `mtp.safetensors`. The device
 drafter uses target features to propose several tokens for one pending token. A lossless round
 requires the target to reproduce B1 logits and state for each proposed input before committing the
-matching prefix.
+matching prefix. The eager verifier processes each visit in layer order across the block. It
+shares the LM head and the routed-expert weights across the verify rows.
 
 ## Draft context
 
@@ -64,6 +65,7 @@ scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_verify.py"
 INK_LMAX=2048 scripts/bench_decode.sh
 ```
 
@@ -71,7 +73,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 |---|---|
 | Three proposals, 1,088-slot draft global prefix | 9.99 ms median, 10.03 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
-| Four expert rows, union of 20 | 0.485 ms median, 0.493 ms p95 |
+| Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
 | Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Staged local and global attention | 128/128 bitwise-equal rows |
@@ -85,10 +87,9 @@ The device drafter with serial B1 verification delivers 3.048 and 3.368 IDs per 
 33-token explanation and 35-token Python fixtures respectively. Both runs reproduce all 64
 generated IDs. These measurements cover draft acceptance with the serial B1 oracle.
 
-With the CPU study's estimated 2.307 emitted tokens per three-proposal round, a 20.0 ms B1
-baseline allows about 46.1 ms per round. At a 20-expert union, extrapolating the isolated
-expert replay to 48 visits gives 23.3 ms. Adding the 12.9 ms B1 non-expert budget and the draft
-replay reaches 46.2 ms before additional verification and commit work.
+The eager verifier matches four serial B1 rows bitwise for logits and taps at four starting
+positions. Committing any prefix length reproduces serial B1 KV and convolution histories,
+including a block that spans the local ring wrap and one that ends at the global cache limit.
 
-The OpenAI server uses the B1 decode path. Serving qualification requires bitwise agreement
-with B1 across the full target and its committed state.
+The OpenAI server uses the B1 decode path. The verifier shares the target LM head and experts
+across rows. It runs the other target projections and epilogues once per row.
