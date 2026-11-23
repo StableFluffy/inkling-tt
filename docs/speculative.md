@@ -138,10 +138,10 @@ that reaches the 1,024-key window boundary. Times exclude prefill and draft cont
 
 | Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
 |---|---:|---:|
-| Chat | 18.41 / 18.41 | 12.65 / 12.65 |
-| Python | 18.45 / 18.51 | 13.62 / 13.62 |
-| Korean | 18.51 / 18.53 | 18.61 / 18.63 |
-| Ring wrap | 18.95 / 19.02 | 19.33 / 19.35 |
+| Chat | 19.28/19.32 | 12.60/12.60 |
+| Python | 19.25/19.28 | 13.59/13.60 |
+| Korean | 19.16/19.16 | 19.63/19.64 |
+| Ring wrap | 19.72/19.73 | 16.16/16.16 |
 
 ## HTTP serving
 
