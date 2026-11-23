@@ -11,7 +11,7 @@ Inkling-2-Mini is a 26B-parameter mixture-of-experts model from Thinking Machine
 | Context | 32,768 tokens |
 | Agreement with HF (BF16, CPU) | 380/384 top-1, 384/384 top-5 next-token predictions |
 
-These are server-side measurements on the tested card (all 14 Tensix columns enabled, 380 W). [docs/benchmarks.md](docs/benchmarks.md) has the setup and commands.
+These are server-side measurements of the v0.1.0 image on the tested card (all 14 Tensix columns enabled, 380 W). Current source benchmarks and reproduction commands are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Quickstart
 
@@ -43,7 +43,7 @@ The first start compiles the kernels and takes about four minutes. To run the te
 
 ## How it works
 
-A decode step is a single captured trace of 655 device programs. Most of the time goes to reading weights. The DRAM-sharded dense projections and a custom expert streamer, which reads the eight routed experts from bank-local packs, run near the card's memory bandwidth. Between the matmuls, chains of small operations (norms, depth mixing, routing, convolutions) are each fused into one custom program, because launching a program costs more than most of these chains compute. Attention, the readout and greedy token feedback also run as fused programs on the device, so the host leaves the loop during generation.
+A decode step is a single captured trace of 607 device programs on the tested grid. Most of the time goes to reading weights. The DRAM-sharded dense projections and a custom expert streamer, which reads the eight routed experts from bank-local packs, run near the card's memory bandwidth. Between the matmuls, chains of small operations (norms, depth mixing, routing, convolutions) are each fused into one custom program, because launching a program costs more than most of these chains compute. Attention, the readout and greedy token feedback also run as fused programs on the device, so the host leaves the loop during generation.
 
 Read [docs/design.md](docs/design.md) for the time budget and the main techniques.
 

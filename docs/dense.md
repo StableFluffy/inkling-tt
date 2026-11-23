@@ -71,9 +71,11 @@ and streams its column of weights from one bank. The compute kernel keeps the sa
 K blocks and FP32 accumulation order as the 1D projections. The resulting rows stay in two
 persistent L1 buffers for convolution, normalization and the cache write.
 
-The pair takes about 25 µs in isolation, compared with 27 µs for the two 1D matmuls. It saves
-48 launches per token. The model keeps the original interleaved weights for prefill and uses
-about 226 MB of additional DRAM for the bank-local decode copies.
+The pair takes about 25 µs in isolation, compared with 27 µs for the two 1D matmuls. On a 13x10
+grid it shares a launch with head preparation and the cache writers, saving a further 48 launches
+per token. The model keeps the original interleaved weights for prefill and uses about 226 MB
+of additional DRAM for the bank-local decode copies. The cache handoff is described in
+[attention.md](attention.md).
 
 ## Bandwidth
 
