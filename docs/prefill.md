@@ -77,6 +77,8 @@ another 0.28 s on a 32k-token prompt.
 - Depth mixing computes RMS and the depth logits with TTNN ops and the weighted sum over bank entries with `mix_compute.cpp`, for one, three or four query rows.
 - The message-gate kernel (`gate_compute.cpp`) evaluates `u * (1 - tanh(h W_f)) + m * tanh(h W_g)` in FP32 for one output tile.
 
+The 2048-row bucket uses `norm_compute.cpp` to normalize 32 rows at a time and write BF16 directly. The same program writes the two normalized halves of the controller down input into one buffer. The K and V controllers reuse the first half from Q when all three use the same sliding-window input. The kernel preserves TTNN's reduction order and BF16 rounding. It saves about 27 ms on a full 2048-row chunk.
+
 ## Handoff to decode
 
 Prefill and decode share the visit state of `InklingTT2`: the 48 K/V caches, the 192 convolution histories and the position. After the last chunk the cache holds the whole prompt, the readout gives the first output token, and decode continues at `position = len(prompt)`. Cache slots past the position are masked, so a new request only zeroes the convolution histories (`InklingRuntime.reset`).

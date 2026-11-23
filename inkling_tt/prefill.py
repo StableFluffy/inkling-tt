@@ -331,6 +331,83 @@ def _bits(value):
     return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
+@lru_cache(maxsize=16)
+def _norm_program(tasks, cols, input_dtype, output_dtype, weighted, stride, offset, rows, paired, specs):
+    grid, rt = _grid(tasks)
+    args = [
+        cols,
+        int(weighted),
+        int(output_dtype == BF),
+        int(input_dtype == BF),
+        _bits(EPS),
+        _bits(1.0 / (32 * cols)),
+        stride,
+        offset,
+        rows,
+        int(paired),
+    ]
+    reader, writer = tuple(sum(group, ()) for group in specs)
+    cbs = [
+        _tile_cb(grid, 0, input_dtype, cols),
+        _tile_cb(grid, 1, FP),
+        _tile_cb(grid, 2, FP),
+        _tile_cb(grid, 3, FP, cols),
+        _tile_cb(grid, 4, FP),
+        _tile_cb(grid, 5, FP),
+        _tile_cb(grid, 16, output_dtype, 8),
+    ]
+    if weighted:
+        cbs.append(_tile_cb(grid, 6, FP, cols))
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "norm_io.cpp"),
+            core_ranges=grid,
+            compile_time_args=[*args, *reader],
+            runtime_args=rt,
+            defines=[("PREFILL_WEIGHT", "1")] if weighted else [],
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "norm_io.cpp"),
+            core_ranges=grid,
+            compile_time_args=[*args, *writer],
+            runtime_args=rt,
+            defines=[("PREFILL_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "norm_compute.cpp"),
+            core_ranges=grid,
+            compile_time_args=args,
+            runtime_args=rt,
+            config=_compute((6,) if weighted else (), full_sync=weighted),
+        ),
+    ]
+    return _program(kernels, cbs)
+
+
+def _norm(x, weight=None, *, out, offset=0, other=None):
+    cols, rows = x.shape[-1] // 32, x.shape[-2] // 32
+    inputs = tuple(t for t in (x, weight, other) if t is not None)
+    _launch(
+        _norm_program,
+        (
+            _tasks(x.device(), rows if other is None else 2 * rows),
+            cols,
+            x.dtype,
+            out.dtype,
+            weight is not None,
+            out.shape[-1] // 32,
+            offset,
+            rows,
+            other is not None,
+        ),
+        inputs,
+        (out,),
+    )
+    return out
+
+
 @lru_cache(maxsize=32)
 def _heads_program(tasks, src_cols, col_offset, row_tiles, scaled, head_width, rms, threshold, specs):
     grid, rt = _grid(tasks)
@@ -545,6 +622,10 @@ class Prefill:
         self._fused_relative = self._fused_heads and os.environ.get("INK_PREFILL_RELATIVE_HEADS", "1") == "1"
         self.relative = _alloc(self.dev, (1, HQ, chunk, 32)) if self._fused_relative else None
         self._fused_gate = os.environ.get("INK_PREFILL_GATE", "1") == "1"
+        self._fused_norm = chunk == 2048 and os.environ.get("INK_PREFILL_NORM", "1") == "1"
+        if self._fused_norm:
+            self._norm_rows = tuple(_alloc(self.dev, self.rows.shape) for _ in range(3))
+            self._controller_rows = _alloc(self.dev, (1, 1, chunk, 2 * D))
         self._reuse_items = os.environ.get("INK_PREFILL_REUSE_ITEMS", "1") == "1"
         self._project_distance = os.environ.get("INK_PREFILL_PROJECT_DISTANCE", "1") == "1"
         self._bank_items = {}
@@ -838,20 +919,27 @@ class Prefill:
         y = ttnn.reshape(y, (1, E, self.chunk, D))
         return bf16(ttnn.sum(ttnn.multiply(y, gamma), dim=1, keepdim=True))
 
-    def gate_msg(self, layer, s, u, m, un=None):
+    def gate_msg(self, layer, s, u, m, un=None, *, reuse_input=False):
         if not self._message_dense:
             return layer.gate_msg(s, u, m, un)
         dn, wf, wg = layer.gates[s]
         u, m = f32(u), f32(m)
-        # Rounding each half before the concat gives the same BF16 operand with less traffic.
-        if un is None:
-            un16 = bf16(self.ops.rms(u))
-        elif self._un16 is not None and self._un16[0] is un:
-            un16 = self._un16[1]
+        if self._fused_norm:
+            hin = self._controller_rows
+            if reuse_input:
+                _norm(m, out=hin, offset=D // 32)
+            else:
+                _norm(u, out=hin, other=m)
         else:
-            un16 = bf16(un)
-            self._un16 = (un, un16)
-        hin = ttnn.concat([un16, bf16(self.ops.rms(m))], dim=-1)
+            # Rounding each half before the concat gives the same BF16 operand with less traffic.
+            if un is None:
+                un16 = bf16(self.ops.rms(u))
+            elif self._un16 is not None and self._un16[0] is un:
+                un16 = self._un16[1]
+            else:
+                un16 = bf16(un)
+                self._un16 = (un, un16)
+            hin = ttnn.concat([un16, bf16(self.ops.rms(m))], dim=-1)
         h = f32(self.lin(hin, dn))
         if self._fused_gate:
             return _message_gate(h, wf, wg, u, m)
@@ -860,20 +948,31 @@ class Prefill:
         kept = ttnn.multiply(u, forget, input_tensor_b_activations=[act("TANH"), act("RSUB", 1.0)])
         return ttnn.add(kept, ttnn.multiply(m, message, input_tensor_b_activations=[act("TANH")]))
 
+    def _input_norm(self, x, weight, slot=0):
+        if self._fused_norm:
+            return _norm(x, weight, out=self._norm_rows[slot])
+        return self.ops.rms(x, weight, BF)
+
     def layer(self, layer, x, bank, visit, messages):
         ops = self.ops
         if layer.is_global:
             qkv = [f32(x)] * 3 if layer.q_attn is None else self.mix(bank, x, layer.q_attn, 3)
             if messages is not None:
                 qkv = [self.gate_msg(layer, s, u, v) for s, u, v in zip("qkv", qkv, messages)]
-            qkv = [ops.rms(u, w, BF) for u, w in zip(qkv, (layer.norm_q, layer.norm_k, layer.norm_v))]
+            qkv = [
+                self._input_norm(u, w, i)
+                for i, (u, w) in enumerate(zip(qkv, (layer.norm_q, layer.norm_k, layer.norm_v)))
+            ]
         else:
             h = f32(x) if layer.q_attn is None else self.mix(bank, x, layer.q_attn, 1)[0]
             if messages is None:
-                qkv = [ops.rms(h, layer.norm_in, BF)] * 3
+                qkv = [self._input_norm(h, layer.norm_in)] * 3
             else:
-                hn = ops.rms(h)
-                qkv = [ops.rms(self.gate_msg(layer, s, h, v, hn), layer.norm_in, BF) for s, v in zip("qkv", messages)]
+                hn = None if self._fused_norm and self._message_dense else ops.rms(h)
+                qkv = [
+                    self._input_norm(self.gate_msg(layer, s, h, v, hn, reuse_input=i != 0), layer.norm_in, i)
+                    for i, (s, v) in enumerate(zip("qkv", messages))
+                ]
 
         a = self.attention(layer, *qkv, visit)
         z = _stencil(a, layer.pa_taps, visit.conv[2], self.meta, residual=None if layer.block_boundary else x, dtype=FP)
@@ -882,7 +981,7 @@ class Prefill:
         hm = self.mix(bank, z, layer.q_mlp, 1)[0]
         if messages is not None:
             hm = self.gate_msg(layer, "mlp", hm, messages[3])
-        y = self.moe(layer, ops.rms(hm, layer.norm_post, BF))
+        y = self.moe(layer, self._input_norm(hm, layer.norm_post))
         return _stencil(y, layer.pm_taps, visit.conv[3], self.meta, residual=z), bank
 
     def _body(self):
@@ -916,7 +1015,7 @@ class Prefill:
             run_range(LOOP0, LOOP1, p, previous)
         run_range(LOOP1, len(layers), 0)
 
-        h = self.ops.rms(self.mix(bank, x, m.final_q, 1)[0], m.norm, BF)
+        h = self._input_norm(self.mix(bank, x, m.final_q, 1)[0], m.norm)
         _launch(
             _state_program, (_tasks(self.dev, D // 32), self.chunk // 32, 0, D // 32, True), (self.meta, h, self.last)
         )

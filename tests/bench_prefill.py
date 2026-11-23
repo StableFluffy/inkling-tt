@@ -57,12 +57,12 @@ def skip_instance(pf, names):
     from inkling_tt.model2 import f32
 
     if "gatemsg" in names:
-        pf.gate_msg = lambda layer, s, u, m, un=None: f32(u)
+        pf.gate_msg = lambda layer, s, u, m, un=None, **kwargs: f32(u)
     if "mix" in names:
         pf.mix = lambda bank, partial, qm, nq: [f32(partial)] * nq
     if "msgonly" in names:
         original = pf.gate_msg
-        pf.gate_msg = lambda layer, s, u, m, un=None: (original(layer, s, u, m, un), f32(u))[1]
+        pf.gate_msg = lambda layer, s, u, m, un=None, **kwargs: (original(layer, s, u, m, un, **kwargs), f32(u))[1]
 
 
 def main():
