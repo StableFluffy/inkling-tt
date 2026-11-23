@@ -39,12 +39,13 @@ def _tile_view(x, shape):
 
 
 @lru_cache(maxsize=8)
-def _head_copy_program(tasks, shard_tiles, total_tiles, grid_width, specs):
+def _head_copy_program(tasks, shard_tiles, total_tiles, grid_width, specs, *, rows=0):
     grid, _ = _grid(tasks)
     kernel = ttnn.KernelDescriptor(
         kernel_source=str(_KERNELS / "base_head.cpp"),
         core_ranges=grid,
         compile_time_args=[shard_tiles, total_tiles, grid_width, *specs[0][1]],
+        defines=[("DRAFT_BASE_ROWS", str(rows))] if rows else [],
         config=ttnn.ReaderConfigDescriptor(),
     )
     return _program([kernel], [])
@@ -204,7 +205,7 @@ class DraftBlock:
 
 
 class DraftHeadProjection:
-    def __init__(self, device, head, weights, proposals):
+    def __init__(self, device, head, weights, proposals, *, direct=True):
         self.head = head
         self.idx = range(1, proposals + 1)
         self.hidden_shards = ttnn.allocate_tensor_on_device(
@@ -213,7 +214,7 @@ class DraftHeadProjection:
         self.head_shards = ttnn.allocate_tensor_on_device(
             ttnn.Shape((1, 1, 32, PADDED_VOCAB)), BF, TILE, device, head.output_shards
         )
-        self.base = _alloc(device, self.head_shards.shape)
+        self.base = None if direct else _alloc(device, self.head_shards.shape)
         shard_tiles = head.output_shards.shard_spec.shape[1] // 32
         total_tiles = PADDED_VOCAB // 32
         workers = (total_tiles + shard_tiles - 1) // shard_tiles
@@ -243,7 +244,10 @@ class DraftHeadProjection:
             memory_config=head.output_shards,
             optional_output_tensor=self.head_shards,
         )
-        _launch(_head_copy_program, self.copy_args, (self.head_shards, self.base))
+        if self.base is None:
+            _launch(_head_copy_program, self.copy_args, (self.head_shards, *self.base_rows), rows=len(self.base_rows))
+        else:
+            _launch(_head_copy_program, self.copy_args, (self.head_shards, self.base))
         for rows, w, dst in (
             (hidden, self.hidden_weight, self.hidden_fixed),
             (last, self.last_weight, self.last_fixed),
@@ -252,6 +256,7 @@ class DraftHeadProjection:
         ttnn.add(self.last_fixed, self.bias, output_tensor=self.context_bias)
         ttnn.add(self.hidden_fixed, self.context_bias, output_tensor=self.fixed)
         for i, base, context in zip(self.idx, self.base_rows, self.context_rows):
-            ttnn.slice(self.base, [0, 0, i, 0], [1, 1, i + 1, PADDED_VOCAB], output_tensor=base)
+            if self.base is not None:
+                ttnn.slice(self.base, [0, 0, i, 0], [1, 1, i + 1, PADDED_VOCAB], output_tensor=base)
             ttnn.slice(self.fixed, [0, 0, i, 0], [1, 1, i + 1, 3 * RANK], output_tensor=context)
         return self.base_rows, self.context_rows

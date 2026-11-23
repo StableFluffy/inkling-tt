@@ -76,7 +76,7 @@ def main():
         device.enable_program_cache()
         block = DraftBlock(device, weights, count + 1, 1088)
         head = dense.prepare_weight(device, torch.nn.functional.pad(head.T, (0, PADDED_VOCAB - VOCAB)))
-        projection = DraftHeadProjection(device, head, weights, count)
+        projections = [DraftHeadProjection(device, head, weights, count, direct=direct) for direct in (False, True)]
         markov = MarkovDraftHead(device, weights, fold, bias, count)
         anchor = _alloc(device, (1, 1), ttnn.uint32, RM)
         position = _alloc(device, (1,), ttnn.uint32, RM)
@@ -90,7 +90,7 @@ def main():
             positions.rotate(context.meta, context.cos, context.sin)
             context.extend(features)
 
-        def forward():
+        def forward(projection):
             positions.prepare(block, anchor, position, embedding)
             base, rnn_context = projection.project(block.forward(), last)
             markov.score(base, rnn_context, anchor)
@@ -118,8 +118,13 @@ def main():
                     (per_position >= cap) & (per_position < cap + block.rows)
                 )
                 assert torch.equal(bits, expected_mask), "draft attention mask"
-            forward()
+            forward(projections[0])
             ids, hidden, logits = read()
+            forward(projections[1])
+            actual_ids, actual_hidden, actual_logits = read()
+            assert actual_ids == ids
+            assert torch.equal(actual_hidden, hidden)
+            assert torch.equal(actual_logits, logits)
             hidden_error = (hidden.float() - case[3]).norm() / case[3].float().norm()
             expected_ids, expected_logits = case[4]
             logit_error = (logits.float() - expected_logits).norm() / expected_logits.float().norm()
@@ -137,11 +142,14 @@ def main():
         context_trace = ttnn.begin_trace_capture(device, cq_id=0)
         extend()
         ttnn.end_trace_capture(device, context_trace, cq_id=0)
-        trace = ttnn.begin_trace_capture(device, cq_id=0)
-        forward()
-        ttnn.end_trace_capture(device, trace, cq_id=0)
+        traces = []
+        for projection in projections:
+            trace = ttnn.begin_trace_capture(device, cq_id=0)
+            forward(projection)
+            ttnn.end_trace_capture(device, trace, cq_id=0)
+            traces.append(trace)
         try:
-            ms = []
+            ms = [[], []]
             for i in range(16):
                 j = i % len(cases)
                 stage_case(
@@ -153,19 +161,24 @@ def main():
                     position,
                 )
                 ttnn.synchronize_device(device)
-                start = time.perf_counter()
-                ttnn.execute_trace(device, trace, cq_id=0, blocking=True)
-                ms.append(1000 * (time.perf_counter() - start))
-                ids, hidden, logits = read()
-                assert ids == eager[j][0]
-                assert torch.equal(hidden, eager[j][1])
-                assert torch.equal(logits, eager[j][2])
-            print(
-                f"DSpark {count} drafts: median {statistics.median(ms[4:]):.2f} ms, p95 {max(ms[4:]):.2f} ms",
-                flush=True,
-            )
+                for k in (0, 1) if i % 2 == 0 else (1, 0):
+                    start = time.perf_counter()
+                    ttnn.execute_trace(device, traces[k], cq_id=0, blocking=True)
+                    ms[k].append(1000 * (time.perf_counter() - start))
+                    ids, hidden, logits = read()
+                    assert ids == eager[j][0]
+                    assert torch.equal(hidden, eager[j][1])
+                    assert torch.equal(logits, eager[j][2])
+            for label, timings in zip(("full tile copy", "live row copy"), ms):
+                p95 = statistics.quantiles(timings[4:], n=20, method="inclusive")[-1]
+                print(
+                    f"DSpark {count} drafts ({label}): median {statistics.median(timings[4:]):.2f} ms, "
+                    f"p95 {p95:.2f} ms",
+                    flush=True,
+                )
         finally:
-            ttnn.release_trace(device, trace)
+            for trace in traces:
+                ttnn.release_trace(device, trace)
             ttnn.release_trace(device, context_trace)
     finally:
         ttnn.close_device(device)

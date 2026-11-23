@@ -28,7 +28,8 @@ committed context and the entire transient block. RoPE uses the block's absolute
 transient self-projected K/V occupy separate slots from the feature-projected prefix.
 
 Rows 1 through K predict the K proposals at their own positions. The block reads the target
-unembedding once for their BF16 base scores. The Markov head starts each round with a zero
+unembedding once for their BF16 base scores. A copy from the width-sharded head output collects
+only each proposal's live row. The Markov head starts each round with a zero
 recurrent state and uses the previous ID, the draft hidden row and the last context mixture. Its
 256-wide output projects through the checkpoint hidden-out matrix and the untied target
 unembedding. Folding these weights and the bias on the CPU in FP64 leaves one BF16 vocabulary
@@ -71,7 +72,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 9.99 ms median, 10.03 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 9.21 ms median, 9.29 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
 | Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
