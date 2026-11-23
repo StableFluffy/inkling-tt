@@ -27,7 +27,7 @@ The decode graph uses these shapes, all with BF16 weights at HiFi4 and FP32 accu
 |---|---|---|---:|---:|---|
 | Q, relative, sink, gate (fused) | 2304 x 6560 | pipe | 4 | 2 | 4 / 4 |
 | O | 3072 x 2304 | pipe | 4 | 2 | 4 / 2 |
-| LM head | 2304 x 201024 | pipe | 8 | 2 | 4 / 61 |
+| LM head | 2304 x 201024 | pipe | 4 | 2 | 4 / 61 |
 | K, V | 2304 x 1024 | 1d | | 8 | |
 | Dynamic conv taps (global) | 2304 x 32 | 1d | | 24 | |
 | Router | 2304 x 128 | 1d | | 36 | |
@@ -73,7 +73,7 @@ time:
 | Projection | GB/s | Share of 512 GB/s |
 |---|---:|---:|
 | Q, relative, sink, gate (fused) | 470 | 92 % |
-| LM head | 464 | 91 % |
+| LM head | 489 | 95 % |
 | O | 451 | 88 % |
 | K or V | 358 | 70 % |
 | Router | 74 | 15 % |
