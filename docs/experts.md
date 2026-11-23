@@ -121,6 +121,10 @@ chunk of T rows (`moe_prefill`, called from `inkling_tt/prefill.py`):
 4. A combine program restores token order and sums each token's eight weighted terms in FP32 in
    increasing expert-ID order.
 
+The compact 8-row projections keep one 13 KB DRAM read in flight per worker. A worker's next
+expert slice stays in the second circular buffer slot while compute consumes the first. Across two
+layers with 128 prompt rows, the full MoE kernel chain takes about 2.5 ms per visit.
+
 All workspace shapes depend only on T, so new routes never compile new programs, and the whole path
 can be captured in the prefill trace.
 

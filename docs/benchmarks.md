@@ -19,16 +19,19 @@ Decode slows slightly with context length because global-attention visits read m
 
 ## Prefill
 
-`scripts/run_tests.sh buckets`: warm prefill from position 0 with both buckets (128 and 2048 rows) resident at `lmax` 32768, including the readback of the last logits. Median of three runs.
+`scripts/run_tests.sh buckets` measures warm prefill from position 0 with both buckets (128 and 2048 rows) resident at `lmax` 32768, including the readback of the last logits. Up to 8,192 tokens, the table uses ten runs per length per reader, alternating the compact readers in one job.
 
-| Prompt tokens | Time to first token | Tokens/s |
-|---:|---:|---:|
-| 128 | 0.207 s | 618 |
-| 300 | 0.567 s | 530 |
-| 1,024 | 0.852 s | 1,201 |
-| 2,048 | 1.036 s | 1,976 |
-| 8,192 | 4.313 s | 1,900 |
-| 32,768 | 22.88 s | 1,432 |
+| Prompt tokens | Median TTFT | p95 TTFT | Tokens/s |
+|---:|---:|---:|---:|
+| 22 | 0.1362 s | 0.1365 s | 162 |
+| 128 | 0.1865 s | 0.1868 s | 686 |
+| 300 | 0.5127 s | 0.5130 s | 585 |
+| 1,024 | 0.8529 s | 0.8538 s | 1,201 |
+| 2,048 | 1.0362 s | 1.0385 s | 1,976 |
+| 8,192 | 4.3112 s | 4.3133 s | 1,900 |
+| 32,768 | 22.885 s | 22.889 s | 1,432 |
+
+The previous compact reader took 0.2069 s median at 128 tokens and 0.5663 s at 300 tokens in the same job. Logits match bit-for-bit at all six measured lengths through 8,192 tokens. The full-cache row uses three runs from the bucket suite.
 
 Each chunk goes to whichever bucket costs less for the tokens that remain, so a 300-token prompt runs as three 128-row chunks and an 8,192-token prompt as four 2048-row chunks. Throughput falls at 32k because attention over the global layers grows with the prompt. The 32,768-token row fills the whole cache and leaves no room for output.
 

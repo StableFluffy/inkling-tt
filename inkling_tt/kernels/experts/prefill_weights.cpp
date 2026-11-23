@@ -36,6 +36,10 @@ void kernel_main() {
     constexpr uint32_t lane = 0;
     constexpr uint32_t lanes = 1;
 #endif
+    const auto read_packet = [](uint64_t source, uint32_t target) {
+        noc_async_read<packet_bytes>(source, target, packet_bytes);
+        noc_async_read_barrier();
+    };
     for (uint32_t expert = lane; expert < 128; expert += lanes) {
         if (offsets[expert] == (expert == 0 ? 0 : offsets[expert - 1])) {
             continue;
@@ -48,16 +52,15 @@ void kernel_main() {
             const uint32_t src = expert * k * 9 * tile_bytes + group +
                                  (shared ? block / 2 : block) * block_bytes;
             for (uint32_t p = 0; p < block_bytes; p += packet_bytes) {
-                noc_async_read<packet_bytes>(bank + src + p, dest + block * block_bytes + p, packet_bytes);
+                read_packet(bank + src + p, dest + block * block_bytes + p);
             }
         }
 #else
         const uint32_t src = (expert * 9 + col) * weight_tiles * tile_bytes;
         for (uint32_t p = 0; p < weight_tiles * tile_bytes; p += packet_bytes) {
-            noc_async_read<packet_bytes>(bank + src + p, dest + p, packet_bytes);
+            read_packet(bank + src + p, dest + p);
         }
 #endif
-        noc_async_read_barrier();
         cb_push_back(1, weight_tiles);
     }
 }

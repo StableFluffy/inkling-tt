@@ -8,7 +8,7 @@ The code is `inkling_tt/prefill.py`, the expert path in `inkling_tt/experts_stre
 
 `Prefill(m, chunk)` owns one fixed chunk shape: a multiple of 32 between 128 and 2048 rows. Rows past the prompt are padding. A small descriptor in device memory holds the chunk's start position and valid row count, and every kernel reads it, so one trace serves first chunks, middle chunks and short tails. A chunk must start at a multiple of 32.
 
-The server runtime (`serve/runtime.py`) builds two buckets, 128 rows and `--prefill-chunk` (default 2048). `prefill_buckets(buckets, tokens)` picks the bucket for each chunk from the tokens still to run, minimizing `ceil(rest / rows) * (rows + 352)`. That is the fitted cost of a warm chunk: a fixed part worth about 352 rows plus a part proportional to the rows. In practice 512 or fewer remaining tokens run as 128-row chunks and anything longer takes a 2048-row chunk.
+The server runtime (`serve/runtime.py`) builds two buckets, 128 rows and `--prefill-chunk` (default 2048). `prefill_buckets(buckets, tokens)` picks the bucket for each chunk from the tokens still to run, minimizing `ceil(rest / rows) * (rows + 352)`. The estimate adds a fixed cost equivalent to 352 rows to the cost of processing the full bucket. In practice 512 or fewer remaining tokens run as 128-row chunks and anything longer takes a 2048-row chunk.
 
 | Prompt tokens | Chunks |
 |---:|---|
@@ -47,7 +47,9 @@ Prefill reads the decode weights in place; there is no second copy. Most schedul
 
 Routing stays on the device. `route_prefill` adds the correction bias to the sigmoid scores, then `route.cpp` picks eight experts per token (exact ties go to the lower expert ID) and normalizes the unbiased scores in FP32. A second phase on one core builds the maps for the expert kernels: where each expert's rows end, which token fills each compact row, and where each token's eight results land. Every expert's row count is rounded up to whole blocks of 8 rows (128 bucket) or 32 rows (512 rows and up), so buffer shapes depend only on the chunk size and new routes never compile a new program.
 
-`moe_prefill` runs four stages: gather the routed rows into expert-ordered compact tiles, gate/up with the softcapped SwiGLU, down, and combine. The projections stream the same bank-local BFP8_B expert pack that decode uses; one copy of the 26 GB pack fits on the card, a second layout would not. At 512 rows and above the projections run as lanes of 18 workers, seven lanes on a 13x10 grid and six on 11x10. Each lane takes a contiguous range of compact blocks and streams the weights of the experts in that range. Lane members take turns reading an activation block and multicasting it to the lane, and each worker keeps only a few DRAM reads in flight, because deep request queues lowered total read bandwidth.
+`moe_prefill` runs four stages: gather the routed rows into expert-ordered compact tiles, gate/up with the softcapped SwiGLU, down, and combine. The projections stream the same bank-local BFP8_B expert pack that decode uses; one copy of the 26 GB pack fits on the card, a second layout would not. The 128-row bucket uses compact 8-row tiles and keeps one 13 KB weight read in flight per worker.
+
+At 512 rows and above the projections run as lanes of 18 workers, seven lanes on a 13x10 grid and six on 11x10. Each lane takes a contiguous range of compact blocks and streams the weights of the experts in that range. Lane members take turns reading an activation block and multicasting it to the lane. A bounded read window per worker limits contention at the DRAM banks.
 
 The combine sums each token's eight expert outputs, weighted by `gamma`, in FP32 and in expert-ID order, and writes BF16. Math is HiFi4 with FP32 accumulation and the BF16 boundaries of [model.md](model.md#cast-points).
 
