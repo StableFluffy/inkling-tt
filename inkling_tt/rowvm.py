@@ -1420,12 +1420,13 @@ _ROUTER_STRIPES = int(os.environ.get("INK_ROUTER_STRIPES", "24"))
 
 
 @lru_cache(maxsize=4)
-def _router_program(accessors, stripes, grid_width):
+def _router_program(accessors, stripes, grid_width, rows=1):
     coords = tuple((i % grid_width, i // grid_width) for i in range(stripes))
     grid = _rects(coords)
     k_tiles = 72 // stripes
     args = [k_tiles, stripes, grid_width]
     io_args = [*args, *(a for acc in accessors for a in acc)]
+    defines = [("ROUTER_BLOCK_ROWS", str(rows))] if rows > 1 else []
     compute = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4,
         math_approx_mode=False,
@@ -1441,17 +1442,22 @@ def _router_program(accessors, stripes, grid_width):
             kernel_source=str(_KERNELS / "router_io.cpp"),
             core_ranges=grid,
             compile_time_args=io_args,
+            defines=defines,
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "router_io.cpp"),
             core_ranges=grid,
             compile_time_args=io_args,
-            defines=[("ROUTER_WRITER", "1")],
+            defines=[*defines, ("ROUTER_WRITER", "1")],
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
-            kernel_source=str(_KERNELS / "router_compute.cpp"), core_ranges=grid, compile_time_args=args, config=compute
+            kernel_source=str(_KERNELS / "router_compute.cpp"),
+            core_ranges=grid,
+            compile_time_args=args,
+            defines=defines,
+            config=compute,
         ),
     ]
     aggregate = (stripes * 512 + 4095) // 4096
@@ -1479,6 +1485,25 @@ def fused_router(x, weight, bias, *, ids_out=None, gamma_out=None):
     per K stripe and sums the stripe partials in FP32.
     """
     _validate(x, (1, 1, 1, 2304))
+    mem = x.memory_config()
+    shape = (1, 1, 1, 8)
+    gamma = _output(x, shape, FP, gamma_out, mem)
+    if ids_out is None:
+        ids_out = ttnn.allocate_tensor_on_device(ttnn.Shape(shape), ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT, x.device(), mem)
+    _launch_router(x, weight, bias, (ids_out,), (gamma,))
+    return ids_out, gamma
+
+
+def fused_router_block(x, weight, bias, routes):
+    """Project all verify rows with the B1 K partitions and one top-8 leader per row."""
+    _validate(x, (1, 1, 32, 2304))
+    if not 2 <= len(routes) <= min(8, _ROUTER_STRIPES):
+        raise ValueError("fused block router needs two to eight verify rows")
+    indices, gammas = zip(*routes)
+    _launch_router(x, weight, bias, indices, gammas)
+
+
+def _launch_router(x, weight, bias, indices, gammas):
     if x.dtype != BF:
         raise ValueError("fused router requires a BF16 activation")
     if tuple(weight.shape)[-2:] != (2304, 128) or weight.dtype != BF or weight.layout != TILE or weight.is_sharded():
@@ -1489,22 +1514,19 @@ def fused_router(x, weight, bias, *, ids_out=None, gamma_out=None):
     grid = device.compute_with_storage_grid_size()
     if grid.x * grid.y < _ROUTER_STRIPES:
         raise ValueError("fused router requires one worker per stripe")
-    mem = x.memory_config()
-    shape = (1, 1, 1, 8)
-    gamma = _output(x, shape, FP, gamma_out, mem)
-    if ids_out is None:
-        ids_out = ttnn.allocate_tensor_on_device(ttnn.Shape(shape), ttnn.uint16, ttnn.ROW_MAJOR_LAYOUT, device, mem)
-    operands = (x, weight, bias, ids_out, gamma)
-    accessors = tuple(tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args()) for t in operands)
-    leader = device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
+    rows = len(indices)
+    accessors = tuple(
+        tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args()) for t in (x, weight, bias, indices[0], gammas[0])
+    )
+    leaders = tuple(device.worker_core_from_logical_core(ttnn.CoreCoord(i % grid.x, i // grid.x)) for i in range(rows))
+    operands = (x, weight, bias, *indices, *gammas)
     with _launch_lock:
-        desc, kernels = _router_program(accessors, _ROUTER_STRIPES, grid.x)
-        common = [t.buffer_address() for t in operands] + [leader.x | (leader.y << 16)]
-        kernels[0].common_runtime_args = common
-        kernels[1].common_runtime_args = common
+        desc, kernels = _router_program(accessors, _ROUTER_STRIPES, grid.x, rows)
+        common = [t.buffer_address() for t in operands] + [leader.x | (leader.y << 16) for leader in leaders]
+        for kernel in kernels[:2]:
+            kernel.common_runtime_args = common
         desc.kernels = kernels
-        ttnn.generic_op([x, weight, bias, ids_out, gamma], desc)
-    return ids_out, gamma
+        ttnn.generic_op(list(operands), desc)
 
 
 _MATVEC_STRIPES = int(os.environ.get("INK_MATVEC_STRIPES", "18"))

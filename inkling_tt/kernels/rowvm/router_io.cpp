@@ -2,11 +2,16 @@
 // sigmoid + correction bias, top-8 selection (lowest ID on ties) and unbiased gamma.
 #include "../common/read_vc.h"
 
+#ifndef ROUTER_BLOCK_ROWS
+#define ROUTER_BLOCK_ROWS 1
+#endif
+
 namespace {
 constexpr uint32_t k_tiles = get_compile_time_arg_val(0);
 constexpr uint32_t stripes = get_compile_time_arg_val(1);
 constexpr uint32_t grid_x = get_compile_time_arg_val(2);
 constexpr uint32_t n_tiles = 4;
+constexpr uint32_t rows = ROUTER_BLOCK_ROWS;
 constexpr uint32_t x_cb = 0, w_cb = 1, bias_cb = 2, aggregate_cb = 3, selection_cb = 8;
 constexpr uint32_t partial_cb = 16, gamma_cb = 17, scores_cb = 18;
 constexpr uint32_t aggregate_pages = (stripes * 512 + 4095) / 4096;
@@ -17,8 +22,8 @@ constexpr auto bias_args = TensorAccessorArgs<w_args.next_compile_time_args_offs
 constexpr auto ids_args = TensorAccessorArgs<bias_args.next_compile_time_args_offset()>();
 constexpr auto gamma_args = TensorAccessorArgs<ids_args.next_compile_time_args_offset()>();
 
-uint64_t leader_addr(uint32_t address) {
-    const uint32_t packed = get_common_arg_val<uint32_t>(5);
+uint64_t leader_addr(uint32_t row, uint32_t address) {
+    const uint32_t packed = get_common_arg_val<uint32_t>(3 + 2 * rows + row);
     return get_noc_addr(packed & 0xffff, packed >> 16, address);
 }
 }  // namespace
@@ -41,7 +46,7 @@ void kernel_main() {
     for (uint32_t k = 0; k < k_tiles; ++k) {
         noc_async_read_tile(task * k_tiles + k, x, xdst + k * 2048);
     }
-    if (task == 0) {
+    if (task < rows) {
         const auto bias = TensorAccessor(bias_args, get_common_arg_val<uint32_t>(2), 512);
         cb_reserve_back(bias_cb, 1);
         noc_async_read(bias.get_noc_addr(0), get_write_ptr(bias_cb), 512);
@@ -49,7 +54,7 @@ void kernel_main() {
     noc_async_read_barrier();
     cb_push_back(w_cb, k_tiles * n_tiles);
     cb_push_back(x_cb, k_tiles);
-    if (task == 0) {
+    if (task < rows) {
         cb_push_back(bias_cb, 1);
         cb_reserve_back(aggregate_cb, aggregate_pages);
         auto sem = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(0));
@@ -58,20 +63,24 @@ void kernel_main() {
         cb_push_back(aggregate_cb, aggregate_pages);
     }
 #else
-    // Row 0 of each FP32 output tile is face 0 row 0 and face 1 row 0.
     cb_wait_front(partial_cb, n_tiles);
     const uint32_t partial = get_read_ptr(partial_cb);
     const uint32_t aggregate = get_write_ptr(aggregate_cb) + task * 512;
-    for (uint32_t n = 0; n < n_tiles; ++n) {
-        for (uint32_t f = 0; f < 2; ++f) {
-            noc_async_write<64>(partial + n * 4096 + f * 1024, leader_addr(aggregate + n * 128 + f * 64), 64);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t n = 0; n < n_tiles; ++n) {
+            for (uint32_t f = 0; f < 2; ++f) {
+                const uint32_t src = partial + n * 4096 + f * 1024 + row * 64;
+                noc_async_write<64>(src, leader_addr(row, aggregate + n * 128 + f * 64), 64);
+            }
         }
     }
     noc_async_write_barrier();
-    noc_semaphore_inc(leader_addr(get_semaphore(0)), 1);
+    for (uint32_t row = 0; row < rows; ++row) {
+        noc_semaphore_inc(leader_addr(row, get_semaphore(0)), 1);
+    }
     noc_async_atomic_barrier();
     cb_pop_front(partial_cb, n_tiles);
-    if (task != 0) {
+    if (task >= rows) {
         return;
     }
     constexpr uint32_t experts = 128;
@@ -109,12 +118,12 @@ void kernel_main() {
     for (uint32_t i = 0; i < k; ++i) {
         id_stick[i] = ids[i];
     }
-    const auto index = TensorAccessor(ids_args, get_common_arg_val<uint32_t>(3), 16);
+    const auto index = TensorAccessor(ids_args, get_common_arg_val<uint32_t>(3 + task), 16);
     noc_async_write<16>(selected + 256, index.get_noc_addr(0), 16);
     cb_pop_front(scores_cb, 2);
     cb_push_back(selection_cb, 1);
     cb_wait_front(gamma_cb, 1);
-    const auto gamma = TensorAccessor(gamma_args, get_common_arg_val<uint32_t>(4), 4096);
+    const auto gamma = TensorAccessor(gamma_args, get_common_arg_val<uint32_t>(3 + rows + task), 4096);
     noc_async_write<64>(get_read_ptr(gamma_cb), gamma.get_noc_addr(0), 64);
     noc_async_write_barrier();
     cb_pop_front(gamma_cb, 1);

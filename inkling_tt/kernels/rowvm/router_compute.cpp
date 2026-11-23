@@ -7,6 +7,10 @@
 #include "llk_math_eltwise_binary_sfpu_macros.h"
 #endif
 
+#ifndef ROUTER_BLOCK_ROWS
+#define ROUTER_BLOCK_ROWS 1
+#endif
+
 using namespace ckernel;
 namespace {
 constexpr uint32_t k_tiles = get_compile_time_arg_val(0);
@@ -117,7 +121,7 @@ void kernel_main() {
     cb_push_back(partial_cb, n_tiles);
     cb_pop_front(x_cb, k_tiles);
     cb_pop_front(w_cb, k_tiles * n_tiles);
-    if (task != 0) {
+    if (task >= ROUTER_BLOCK_ROWS) {
         return;
     }
     cb_wait_front(aggregate_cb, aggregate_pages);

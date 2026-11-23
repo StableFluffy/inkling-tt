@@ -41,6 +41,10 @@ def _tile_rows_program(tasks, rows, specs):
     return _program([kernel], [_tile_cb(grid, 0, BF)])
 
 
+def _pack_rows(matrix, inputs, tasks):
+    _launch(_tile_rows_program, (tasks, len(inputs)), (matrix, *inputs))
+
+
 class SharedProjection:
     def __init__(self, device, weight):
         self.input = ttnn.allocate_tensor_on_device(
@@ -53,7 +57,7 @@ class SharedProjection:
 
     def project(self, weight, inputs=None):
         if inputs is not None:
-            _launch(_tile_rows_program, (self.input_tasks, len(inputs)), (self.input, *inputs))
+            _pack_rows(self.input, inputs, self.input_tasks)
         return ttnn.linear(
             self.input,
             weight.tensor,

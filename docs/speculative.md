@@ -52,7 +52,8 @@ O each use one sweep of their B1 weights. Head preparation and the causal attent
 the query's row directly from the packed projections. The output gate writes into that same row
 of the O projection's input shards.
 
-The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
+The router projects all verify rows in one program. Each row has its own top-8 leader and keeps
+B1's K-stripe sum and tie-breaking order. The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
 B1's eight routes and FP32 weights per row, streams the existing BFP8_B weight pack at HiFi4 and
 combines the results in the original routing-slot order.
 
@@ -78,6 +79,7 @@ scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_block.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64 --proposals 4"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 INK_PREFILL_EXPERT_DOUT_L1=480 python -u tests/bench_mtp_acceptance.py --steps 64 --long-context"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_router.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
@@ -90,6 +92,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 |---|---|
 | Three proposals, 1,088-slot draft global prefix | 8.86 ms median, 8.94 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
+| Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
 | Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
 | Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |

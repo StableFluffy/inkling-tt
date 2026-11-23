@@ -10,7 +10,7 @@ from inkling_tt import rowvm
 from inkling_tt.model import HD, HKV, LOOP0, LOOP1, NB, NPASS, VOCAB, D, visit_slot
 from inkling_tt.model2 import BF, DRAM, FP, L1, MTP_TAP_VISITS, RM, TILE, Step, _DecodeBank
 from inkling_tt.mtp_experts import VerifyExperts
-from inkling_tt.mtp_projection import SharedProjection, _tile_row
+from inkling_tt.mtp_projection import SharedProjection, _pack_rows, _tile_row
 from inkling_tt.mtp_weights import PADDED_VOCAB
 from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
 
@@ -157,6 +157,7 @@ class TargetVerify:
                 scratch.attended = row(o_weight.n, mem=o_weight.output_shards)
         self.histories = tuple(_alloc(device, (1, 1, 4, width), FP) for width in (HKV * HD, HKV * HD, D, D))
         self.mlp = _alloc(device, (1, 1, 32, D))
+        self.mlp_tasks = _tasks(device, D // 32)
         self.branch = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, D)), BF, TILE, device, L1)
         self.routes = tuple(
             (
@@ -286,6 +287,7 @@ class TargetVerify:
                 projected = self.o.project(layer.wo)
                 attention = [projected] * self.rows
             pending = []
+            mixed_rows = []
             for i, ((x, bank, _), a, messages, scratch) in enumerate(
                 zip(states, attention, messages_by_row, self.scratch)
             ):
@@ -298,11 +300,17 @@ class TargetVerify:
                     scratch=scratch,
                     row=i if self.shared else 0,
                 )
-                ids, gamma = self.routes[i]
-                rowvm.fused_router(mixed, layer.router_w.tensor, layer.dec.router_b, ids_out=ids, gamma_out=gamma)
-                _tile_row(mixed, self.mlp, target=i)
+                if self.shared:
+                    mixed_rows.append(mixed)
+                else:
+                    ids, gamma = self.routes[i]
+                    rowvm.fused_router(mixed, layer.router_w.tensor, layer.dec.router_b, ids_out=ids, gamma_out=gamma)
+                    _tile_row(mixed, self.mlp, target=i)
                 _tile_row(self.histories[2], staged.conv[2], target=i)
                 pending.append((bank, residual))
+            if self.shared:
+                _pack_rows(self.mlp, mixed_rows, self.mlp_tasks)
+                rowvm.fused_router_block(self.mlp, layer.router_w.tensor, layer.dec.router_b, self.routes)
             grouped = self.experts.run(self.mlp, self.routes, layer.expert_stream)
             states = []
             for i, (bank, residual) in enumerate(pending):
