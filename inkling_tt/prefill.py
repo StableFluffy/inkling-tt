@@ -611,8 +611,8 @@ def _copy_program(tasks, page, offset, specs):
 
 
 def _copy_into(src, dst, slot):
-    """Write src into slot `slot` of dst along dim 1 (same tile shape and dtype)."""
-    tiles = src.shape[-2] * src.shape[-1] // 1024
+    """Write the tiles of src to a consecutive slot of dst (same tile shape and dtype)."""
+    tiles = src.padded_shape[-2] * src.padded_shape[-1] // 1024
     page = 4096 if src.dtype == FP else 2048
     _launch(_copy_program, (_tasks(src.device(), tiles), page, slot * tiles), (src,), (dst,))
 
