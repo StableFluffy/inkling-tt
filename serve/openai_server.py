@@ -556,7 +556,7 @@ def main():
         default=0,
         type=int,
         choices=range(1, 8),
-        help="enable DSpark for greedy requests with this many proposals (default 3)",
+        help="enable greedy DSpark with up to this many proposals (3 when omitted)",
     )
     ap.add_argument("--no-fast-prefill", action="store_true")
     ap.add_argument("--prefill-chunk", type=int)

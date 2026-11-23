@@ -18,9 +18,7 @@ def main():
     try:
         device.enable_program_cache()
         weight = Weights(paths.hf_sd()).get("lm_head.weight")
-        head = dense.prepare_weight(
-            device, torch.nn.functional.pad(weight.T, (0, PADDED_VOCAB - VOCAB)), workers_per_bank=8
-        )
+        head = dense.prepare_weight(device, torch.nn.functional.pad(weight.T, (0, PADDED_VOCAB - VOCAB)))
         generator = torch.Generator().manual_seed(869)
         cases = [torch.randn(1, 1, 32, D, generator=generator, dtype=torch.bfloat16) for _ in range(2)]
 

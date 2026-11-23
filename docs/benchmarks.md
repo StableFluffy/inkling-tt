@@ -46,22 +46,22 @@ Each chunk goes to whichever bucket costs less for the tokens that remain. A 300
 ## Adaptive greedy MTP
 
 `tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` alternates B1 and adaptive
-DSpark requests against the same source server. The server runs with `--mtp 3 --lmax 8192`
-and both prefill buckets resident. The streamed choices and usage are identical across all
-30 requests. Values are median/p95.
+DSpark requests against the same source server. Both prefill buckets and the standard dispatch
+ring are resident with `--mtp 3 --lmax 8192`. All 30 requests match in streamed choices and
+usage. A separate check against standalone B1 with the larger dispatch ring also matches on
+all five prompts. Values are median/p95.
 
 | Prompt | B1 decode, ms/ID | MTP decode, ms/ID | B1 TTFT, ms | MTP TTFT, ms |
 |---|---:|---:|---:|---:|
-| Chat | 18.60/18.69 | 19.00/19.18 | 141.90/142.62 | 142.50/143.04 |
-| Python | 18.70/19.24 | 15.60/15.60 | 153.60/153.69 | 153.90/154.26 |
-| Korean | 19.20/19.29 | 19.30/19.30 | 166.00/172.12 | 167.80/172.12 |
-| 1,580 tokens | 19.90/19.99 | 20.40/20.40 | 1125.50/1166.54 | 1120.30/1144.60 |
-| 7,820 tokens | 20.60/20.60 | 20.60/21.05 | 4955.70/4981.71 | 4999.80/5007.90 |
+| Chat | 19.40/19.58 | 19.80/19.98 | 139.30/141.10 | 141.20/141.74 |
+| Python | 19.50/19.59 | 17.10/17.10 | 150.40/150.49 | 150.60/150.60 |
+| Korean | 19.50/19.59 | 19.30/19.39 | 159.20/159.65 | 158.90/158.90 |
+| 1,580 tokens | 20.10/20.10 | 19.00/19.09 | 1065.90/1067.88 | 1067.50/1067.68 |
+| 7,820 tokens | 20.80/21.16 | 21.30/21.57 | 4790.40/4791.30 | 4839.90/4841.07 |
 
-The mean of the five decode medians is 19.40 ms/ID for B1 and 18.98 ms/ID for MTP.
-Chat and the 1,580-token prompt have higher median latency with MTP, so B1 is the server
-default. With MTP enabled, the 7,820-token prompt reaches its first token in about five
-seconds.
+The mean of the five decode medians is 19.86 ms/ID in B1 mode and 19.30 ms/ID with MTP.
+Chat and the 7,820-token case have higher decode medians with MTP, so B1 is the server
+default. The 7,820-token MTP request reaches its first token in about 4.84 seconds.
 
 ## Accuracy
 

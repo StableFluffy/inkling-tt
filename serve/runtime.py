@@ -87,7 +87,7 @@ class InklingRuntime:
                 c,
                 warmup=not self.mtp,
                 global_score_tiles=56 if self.mtp else None,
-                weight_buffers=1 if self.mtp else 2,
+                weight_buffers=1 if self.mtp and c >= 512 else 2,
             )
             for c in sorted({128, self.chunk})
         ]

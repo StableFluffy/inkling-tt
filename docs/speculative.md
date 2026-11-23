@@ -83,9 +83,10 @@ for the next round.
 ## Round replay
 
 The round allocates scratch and warms each width before capture. Draft, target verification
-and the accepted-context projection use separate traces on one command queue. Prefill, B1, the verifier and the drafter share one width-sharded head workspace when MTP is
-enabled. A narrow call copies its live row into that workspace. Smaller rounds score a prefix of the
-draft block and verify only those rows.
+and the accepted-context projection use separate traces on one command queue. Prefill, B1,
+the verifier and the drafter share one width-sharded head workspace when MTP is enabled. A
+narrow call copies its live row into that workspace. Smaller rounds score a prefix of the draft
+block and verify only those rows.
 
 The server selects one to four target rows using the startup replay times and a decaying
 estimate of proposal acceptance. With estimated conditional acceptance `a`, a width `R` produces
@@ -101,8 +102,6 @@ The component tests run through the pinned dev image.
 
 ```sh
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-projections"
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64 --proposals 4"
-scripts/dev_run.sh "OMP_NUM_THREADS=4 INK_PREFILL_EXPERT_DOUT_L1=480 python -u tests/bench_mtp_acceptance.py --steps 64 --long-context"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_router.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
@@ -118,30 +117,17 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Three proposals, 1,088-slot draft global prefix | 6.90 ms median, 6.91 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
-| Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
-| Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
-| Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
+| Four expert rows, union of 20 | 0.460 ms median, 0.464 ms p95 |
+| Four BF16 target head rows, serial | 7.708 ms median, 7.742 ms p95 |
+| Four BF16 target head rows, shared | 2.030 ms median, 2.058 ms p95 |
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
 | Batched attention against serial B1 | 88/88 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 39.13 ms median, 39.20 ms p95 |
-| B1 greedy in the same job | 19.33 ms median, 19.43 ms p95 |
+| Four-row target verify at `lmax=1120` | 39.04 ms median, 39.17 ms p95 |
+| B1 greedy in the same job | 19.08 ms median, 19.09 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
-
-The serial B1 oracle checks 64 generated IDs on each acceptance fixture. These runs use 8,192
-prefix slots for K=3 and 2,048 for K=4.
-
-| Prompt | Input tokens | K=3 emitted per round | K=4 emitted per round |
-|---|---:|---:|---:|
-| Chat | 33 | 3.200 | 3.368 |
-| Python | 35 | 3.368 | 3.765 |
-| Korean | 43 | 2.370 | 2.783 |
-| Summarization | 7,825 | 2.667 | — |
-
-The 7,825-token fixture uses an 8,192-slot draft global prefix and takes 9.20 ms median and
-9.29 ms p95 for three proposals.
 
 The serial verifier check compares logits and taps at the local window boundary, the physical
 ring wrap and the global cache limit. It also runs B1 with alternate continuations after each
@@ -152,10 +138,10 @@ that reaches the 1,024-key window boundary. Times exclude prefill and draft cont
 
 | Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
 |---|---:|---:|
-| Chat | 19.58 / 19.70 | 12.77 / 12.77 |
-| Python | 19.63 / 19.69 | 13.78 / 13.78 |
-| Korean | 19.53 / 19.56 | 19.95 / 19.96 |
-| Ring wrap | 20.06 / 20.09 | 16.43 / 16.44 |
+| Chat | 18.41 / 18.41 | 12.65 / 12.65 |
+| Python | 18.45 / 18.51 | 13.62 / 13.62 |
+| Korean | 18.51 / 18.53 | 18.61 / 18.63 |
+| Ring wrap | 18.95 / 19.02 | 19.33 / 19.35 |
 
 ## HTTP serving
 

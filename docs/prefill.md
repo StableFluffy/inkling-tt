@@ -88,9 +88,9 @@ Prefill and decode share the visit state of `InklingTT2`: the 48 K/V caches, the
 
 The MTP runtime allocates both buckets, the verifier and the drafter before it warms any
 prefill or speculative trace. The buckets share the LM head projection with decode and the
-drafter. Compact gate/up and wide expert lanes use one resident expert weight buffer each.
-More of the wide down-projection output goes to DRAM, and global attention retains up to
-56 score tiles per worker. The remaining tiles are recomputed in the second FP32 pass.
+drafter. Wide expert lanes use one resident expert weight buffer each. Route weights and
+more of the wide down-projection output go to DRAM. Global attention retains up to 56 score
+tiles per worker. The remaining tiles are recomputed in the second FP32 pass.
 
 ## Capture order
 

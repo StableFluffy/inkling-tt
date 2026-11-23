@@ -6,19 +6,21 @@ import torch
 import ttnn
 
 from inkling_tt import paths
+from inkling_tt.device import open_device
 from inkling_tt.model2 import InklingTT2
 from inkling_tt.mtp_round import SpeculativeRound
 from inkling_tt.prefill import Prefill
-from serve.runtime import DEVICE_PARAMS, default_precision
+from serve.runtime import default_precision
 
 
 def main(proposals, adaptive):
-    dev = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
+    dev = open_device(large_dispatch_ring=False)
     try:
         lmax = 1056
         model = InklingTT2(dev, paths.hf_sd(), default_precision(), lmax=lmax, capture_taps=True)
-        pf = Prefill(model, 128)
+        pf = Prefill(model, 128, warmup=False, global_score_tiles=56)
         spec = SpeculativeRound(model, [pf], paths.snapshot(), proposals=proposals, adaptive=adaptive)
+        pf._warm()
         spec.warm()
         model.capture()
         spec.capture()

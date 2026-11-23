@@ -1041,7 +1041,7 @@ class InklingTT2:
         self.norm = self.c.row(g("norm.weight"))
         self.dec_final_q, self.dec_norm = self.c.decode_query(self.final_q), self.c.decode_row(self.norm)
         self.dec_msg_q = [self.c.decode_query(q) for q in self.msg_q]
-        self._prepare_head(g("lm_head.weight"), resident_scratch=capture_taps)
+        self._prepare_head(g("lm_head.weight"))
         self.head_workspace = self._alloc_head_workspace() if capture_taps and hasattr(self, "head_logits") else None
         self.st = Step(self.c, lmax)
         if self.c.device_feedback and hasattr(self, "head_logits"):
@@ -1081,14 +1081,11 @@ class InklingTT2:
         )
         self._shift_cache = {}
 
-    def _prepare_head(self, head, *, resident_scratch=False):
+    def _prepare_head(self, head):
         c = self.c
         head = torch.cat([head, torch.zeros(201024 - head.shape[0], D, dtype=head.dtype)], 0)
         self.head = dense.prepare_weight(
-            c.dev,
-            head.T.contiguous(),
-            getattr(c.prec, "head_dtype", None) or c.prec.dense_dtype,
-            workers_per_bank=8 if resident_scratch else None,
+            c.dev, head.T.contiguous(), getattr(c.prec, "head_dtype", None) or c.prec.dense_dtype
         )
         vm = torch.zeros(1, 1, 1, 201024)
         vm[..., VOCAB:] = -1e4

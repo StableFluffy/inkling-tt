@@ -436,6 +436,7 @@ def prepare_prefill(
         if not has_default_l1_budget(device):
             default_blocks -= 56
         down_l1_blocks = min(capacity, int(os.environ.get("INK_PREFILL_EXPERT_DOUT_L1", default_blocks)))
+    routing_mem = _DRAM if weight_buffers == 1 else _L1
     wide_tail = (
         _prefill_alloc(device, (1, 1, (capacity - wide_blocks) * _GU_K, page // 2), _BF, _RM, _DRAM)
         if wide_blocks < capacity
@@ -447,7 +448,7 @@ def prepare_prefill(
         _prefill_alloc(device, (1, 1, 1, _EXPERTS), ttnn.uint32, _RM),
         _prefill_alloc(device, (1, 1, 1, capacity * rows), ttnn.uint32, _RM),
         _prefill_alloc(device, (1, 1, tokens // 32, 32 * _TOPK), ttnn.uint32, _RM),
-        _prefill_alloc(device, (1, tokens // 32, _TOPK * 32, 32), _FP, _TILE),
+        _prefill_alloc(device, (1, tokens // 32, _TOPK * 32, 32), _FP, _TILE, routing_mem),
         _prefill_alloc(device, (1, 1, wide_blocks * _GU_K, page // 2), _BF, _RM),
         wide_tail,
         _prefill_alloc(

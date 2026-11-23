@@ -18,8 +18,9 @@ def main(trace_only):
     try:
         lmax = 1120
         model = InklingTT2(dev, paths.hf_sd(), default_precision(), lmax=lmax, capture_taps=True)
-        pf = Prefill(model, 128)
+        pf = Prefill(model, 128, warmup=False, global_score_tiles=56)
         verifier = TargetVerify(model, 3, streaming=True, compare_serial=True)
+        pf._warm()
         fixture = torch.load(paths.golden("capture_haiku.pt"), weights_only=False)
         prompt = fixture["ids"][0].tolist()
         block = fixture["gen"][:4]

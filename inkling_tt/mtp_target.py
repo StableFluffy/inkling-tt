@@ -72,8 +72,10 @@ class TargetVerify:
         self.scratch = tuple(
             SimpleNamespace(
                 visit=tuple(
-                    ttnn.allocate_tensor_on_device(t.shape, t.dtype, t.layout, device, t.memory_config())
-                    for t in c.visit_scratch
+                    ttnn.allocate_tensor_on_device(
+                        t.shape, t.dtype, t.layout, device, DRAM if i < 2 else t.memory_config()
+                    )
+                    for i, t in enumerate(c.visit_scratch)
                 ),
                 inputs_fp=tuple(row(D, FP) for _ in range(3)),
                 inputs_bf=tuple(row(D) for _ in range(3)),
@@ -97,7 +99,7 @@ class TargetVerify:
         )
         self.mlp = _alloc(device, (1, 1, 32, D))
         self.mlp_tasks = _tasks(device, D // 32)
-        self.branch = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, D)), BF, TILE, device, L1)
+        self.branch = _alloc(device, (1, 1, 1, D))
         self.routes = tuple(
             (
                 ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, 8)), ttnn.uint16, RM, device, L1),
