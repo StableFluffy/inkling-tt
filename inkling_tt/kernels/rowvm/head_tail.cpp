@@ -8,6 +8,7 @@ constexpr uint32_t total_tiles = get_compile_time_arg_val(1);
 constexpr uint32_t vocab = get_compile_time_arg_val(2);
 constexpr uint32_t workers = get_compile_time_arg_val(3);
 constexpr uint32_t grid_x = get_compile_time_arg_val(4);
+constexpr uint32_t row = get_compile_time_arg_val(5);
 constexpr uint32_t tile_bytes = 2048;
 constexpr uint32_t row_bytes = shard_tiles * 64;
 constexpr uint32_t staging_cb = 0;
@@ -16,8 +17,8 @@ constexpr uint32_t mailbox_cb = 1;
 
 void kernel_main() {
     const uint32_t shard = get_common_arg_val<uint32_t>(0);
-    const auto logits = TensorAccessor(TensorAccessorArgs<5>(), get_common_arg_val<uint32_t>(1), total_tiles * 64);
-    constexpr auto index_args = TensorAccessorArgs<TensorAccessorArgs<5>::next_compile_time_args_offset()>();
+    const auto logits = TensorAccessor(TensorAccessorArgs<6>(), get_common_arg_val<uint32_t>(1), total_tiles * 64);
+    constexpr auto index_args = TensorAccessorArgs<TensorAccessorArgs<6>::next_compile_time_args_offset()>();
     const auto index = TensorAccessor(index_args, get_common_arg_val<uint32_t>(2), 4);
     const uint32_t leader = get_common_arg_val<uint32_t>(3);
     const uint32_t worker = get_absolute_logical_y() * grid_x + get_absolute_logical_x();
@@ -36,11 +37,11 @@ void kernel_main() {
     const uint32_t tiles = local_end - local_first;
     const uint32_t slot = 2 * worker + half;
 
-    // Row 0 of each tile lives in the first face row of faces 0 and 1.
     const uint32_t staging = get_write_ptr(staging_cb) + local_first * 64;
     auto dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(staging);
+    constexpr uint32_t row_offset = (row / 16 * 2) * 512 + (row % 16) * 32;
     for (uint32_t t = 0; t < tiles; ++t) {
-        auto src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(shard + (local_first + t) * tile_bytes);
+        auto src = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(shard + (local_first + t) * tile_bytes + row_offset);
 #pragma GCC unroll 8
         for (uint32_t w = 0; w < 8; ++w) {
             dst[16 * t + w] = src[w];

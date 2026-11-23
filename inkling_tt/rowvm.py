@@ -1304,10 +1304,10 @@ def router(logits, bias, *, ids_out=None, gamma_out=None, memory_config=None):
     return ids_out, gamma
 
 
-@lru_cache(maxsize=4)
-def _head_tail_program(core_coords, grid_width, shard_tiles, total_tiles, vocab, accessors):
+@lru_cache(maxsize=16)
+def _head_tail_program(core_coords, grid_width, shard_tiles, total_tiles, vocab, row, accessors):
     grid = _rects(core_coords)
-    args = [shard_tiles, total_tiles, vocab, len(core_coords), grid_width, *accessors[0], *accessors[1]]
+    args = [shard_tiles, total_tiles, vocab, len(core_coords), grid_width, row, *accessors[0], *accessors[1]]
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "head_tail.cpp"),
@@ -1330,7 +1330,7 @@ def _head_tail_program(core_coords, grid_width, shard_tiles, total_tiles, vocab,
     return desc, kernels
 
 
-def head_tail(logits, out, index, vocab):
+def head_tail(logits, out, index, vocab, *, row=0):
     """Copy width-sharded BF16 head logits into a row-major row and write the masked argmax.
 
     Ties resolve to the lowest index; columns at or beyond vocab are excluded.
@@ -1340,18 +1340,20 @@ def head_tail(logits, out, index, vocab):
     if (
         logits.dtype != BF
         or logits.layout != TILE
-        or tuple(logits.shape)[:3] != (1, 1, 1)
+        or len(logits.shape) != 4
+        or tuple(logits.shape)[:2] != (1, 1)
+        or not 0 <= row < logits.shape[-2] <= 32
         or logits.memory_config().memory_layout != ttnn.TensorMemoryLayout.WIDTH_SHARDED
         or logits.memory_config().buffer_type != ttnn.BufferType.L1
         or shard is None
         or shard.orientation != ttnn.ShardOrientation.ROW_MAJOR
         or next(iter(shard.shape)) != 32
     ):
-        raise ValueError("head_tail requires row-major width-sharded BF16 [1,1,1,N] L1 logits")
+        raise ValueError("head_tail requires one tile row of width-sharded BF16 L1 logits")
     if (
         out.layout != ttnn.ROW_MAJOR_LAYOUT
         or out.dtype != BF
-        or tuple(out.shape) != tuple(logits.shape)
+        or tuple(out.shape) != (1, 1, 1, width)
         or out.is_sharded()
         or out.memory_config().buffer_type != ttnn.BufferType.DRAM
     ):
@@ -1374,7 +1376,7 @@ def head_tail(logits, out, index, vocab):
     accessors = tuple(tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args()) for t in (out, index))
     leader = device.worker_core_from_logical_core(ttnn.CoreCoord(0, 0))
     with _launch_lock:
-        desc, kernels = _head_tail_program(coords, grid.x, shard_tiles, total_tiles, vocab, accessors)
+        desc, kernels = _head_tail_program(coords, grid.x, shard_tiles, total_tiles, vocab, row, accessors)
         for kernel in kernels:
             kernel.common_runtime_args = [
                 logits.buffer_address(),
