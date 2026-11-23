@@ -1,6 +1,6 @@
 // Greedy token feedback: the next step's embedding row, position, tau and an ID history entry
 // from the head's argmax. Scalars move as aligned 64-byte blocks (read-modify-write).
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 namespace {
 constexpr uint32_t row_bytes = get_compile_time_arg_val(0);
@@ -28,6 +28,7 @@ volatile tt_l1_ptr uint32_t& word(const Word& w) { return *reinterpret_cast<vola
 }  // namespace
 
 void kernel_main() {
+    select_read_vc();
     const auto index = TensorAccessor(index_args, get_common_arg_val<uint32_t>(0), 4);
     const auto table = TensorAccessor(table_args, get_common_arg_val<uint32_t>(1), row_bytes);
     const auto x = TensorAccessor(x_args, get_common_arg_val<uint32_t>(2), row_bytes);

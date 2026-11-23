@@ -1,6 +1,7 @@
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 void kernel_main() {
+    select_read_vc();
     const uint32_t first = get_arg_val<uint32_t>(0);
     const uint32_t end = get_arg_val<uint32_t>(1);
 #ifdef ROWVM_WRITE

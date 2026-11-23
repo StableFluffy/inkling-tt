@@ -25,7 +25,7 @@ Device profile of one token on the tested card (13x10 workers, `lmax` 2048, BFP8
 | Readout, layout and small epilogues | 38 | 0.1 |
 | **Total** | **655** | **18.5** |
 
-The first four rows stream weights. The larger dispatch ring cuts time outside kernels from 1.13 ms to 0.21 ms per token in the device profile. Unprofiled greedy decode runs at about 18.7 ms per token ([benchmarks.md](benchmarks.md)).
+The first four rows stream weights. The larger dispatch ring cuts time outside kernels from 1.13 ms to 0.21 ms per token in the device profile. Unprofiled greedy decode runs at about 18.5 ms per token ([benchmarks.md](benchmarks.md)).
 
 ## From the first port to this release
 
@@ -49,6 +49,8 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 **Trace with persistent inputs.** `InklingTT2` (`inkling_tt/model2.py`) allocates every intermediate once and captures the whole step with `ttnn.begin_trace_capture`. Per-step data (token embedding row, positions, cache slots, masks) lives in device tensors that the host overwrites before each replay. Anything allocated or compiled after capture starts can alias trace memory, so the model and both prefill buckets run once eagerly before `capture()` is called.
 
 **Dispatch memory.** The standalone runtime reserves about 128 KiB per worker for Metal's kernel-config ring. The larger ring lets dispatch stage more programs while earlier programs are still running. The 2048-row bucket keeps fewer global-attention score tiles and spills more of the expert down projection to DRAM to fit the smaller L1 partition.
+
+**NoC reads.** Decode data-movement kernels pick a read virtual channel from their logical worker row modulo four. This removes dependence on the inherited read command state. Expert weight streams still select their own channels for the bank-local packets.
 
 **Dense projections.** Batch-1 projections are matrix-vector products, bound by weight bandwidth. `inkling_tt/dense.py` picks a DRAM-sharded matmul configuration per shape, so each DRAM bank feeds the workers next to it. The four attention projections of a visit (Q, relative-bias query, sink, output gate) share one fused weight and one program. A second program streams both K and V matrices, each with its own input. See [dense.md](dense.md).
 

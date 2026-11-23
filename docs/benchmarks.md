@@ -8,12 +8,12 @@ Measurements on one p150a in the [tested configuration](hardware.md#tested-confi
 
 | Path | Median | p95 | Tokens/s |
 |---|---:|---:|---:|
-| Greedy, device argmax | 18.65–18.70 ms | 18.79–19.00 ms | 53.5–53.6 |
-| Full logits read back to the host | 19.72–19.76 ms | 19.83–20.97 ms | 50.6–50.7 |
+| Greedy, device argmax | 18.45 ms | 18.49 ms | 54.2 |
+| Full logits read back to the host | 19.40 ms | 19.78 ms | 51.6 |
 | Greedy, stock SDPA attention (`INK_ATTN_DECODE=0`) | 22.79 ms | 22.84 ms | 43.9 |
 | Greedy, restricted to 11x10 (`INK_GRID=11x10`) | 20.54 ms | 20.58 ms | 48.7 |
 
-The default-path rows give the range across two 60-step passes per mode. The two passes ran with the standard and larger dispatch rings interleaved. The standard ring measured 19.41–19.45 ms median and 19.43–19.58 ms p95 for greedy decode. The stock SDPA, restricted grid, and server figures are from v0.1.0.
+The first two rows use 120 timed steps per mode from a 29-token prompt, alternating the read virtual channel policy in one job. Letting the readers inherit the channel gave 18.56 ms median and 18.71 ms p95 for greedy decode. After a 2,048-token prompt, fixing the read channel moved greedy decode from 19.15/19.44 ms median/p95 to 19.06/19.13 ms. The stock SDPA, restricted grid, and server figures are from v0.1.0.
 
 Decode slows slightly with context length because global-attention visits read more cache: about 20.7 ms/token after a 1.6k-token prompt and 21.3 ms/token after 7.8k tokens (server measurements below).
 

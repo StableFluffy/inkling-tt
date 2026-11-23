@@ -1,9 +1,10 @@
 // BRISC gathers and scatters only the first two face rows of B1 tiles.
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 #include "ckernel.h"
 #include "ckernel_defs.h"
 
 void kernel_main() {
+    select_read_vc();
     constexpr uint32_t cb_x = 0;
     constexpr uint32_t cb_gamma = 3;
     constexpr uint32_t cb_out = 16;

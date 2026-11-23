@@ -1,6 +1,6 @@
 // Fused decode router: K-split BF16 projection partials, gathered on one core for
 // sigmoid + correction bias, top-8 selection (lowest ID on ties) and unbiased gamma.
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 namespace {
 constexpr uint32_t k_tiles = get_compile_time_arg_val(0);
@@ -24,6 +24,7 @@ uint64_t leader_addr(uint32_t address) {
 }  // namespace
 
 void kernel_main() {
+    select_read_vc();
     const uint32_t task = get_absolute_logical_y() * grid_x + get_absolute_logical_x();
 #ifndef ROUTER_WRITER
     const auto w = TensorAccessor(w_args, get_common_arg_val<uint32_t>(1), 2048);

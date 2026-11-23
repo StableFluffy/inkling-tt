@@ -1,6 +1,7 @@
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 void kernel_main() {
+    select_read_vc();
     constexpr uint32_t tile_bytes = 2048;
     constexpr uint32_t face_row_bytes = 32;
     const uint32_t face = get_common_arg_val<uint32_t>(3);

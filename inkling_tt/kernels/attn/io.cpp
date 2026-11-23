@@ -1,4 +1,4 @@
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 #include "api/debug/kernel_profiler.hpp"
 #include "common.h"
 
@@ -264,6 +264,7 @@ void write_output(uint32_t head, uint32_t d) {
 }  // namespace
 
 void kernel_main() {
+    select_read_vc();
     const uint32_t worker = get_absolute_logical_y() * grid_width + get_absolute_logical_x();
     const uint32_t head = first_head + worker / splits;
     const uint32_t split = worker % splits;

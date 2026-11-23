@@ -1,7 +1,8 @@
 // Stage the live data once before it fans out to the expert readers.
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 void kernel_main() {
+    select_read_vc();
     constexpr uint32_t workers = get_compile_time_arg_val(0);
     constexpr uint32_t pages = get_compile_time_arg_val(1);
     constexpr uint32_t page_bytes = get_compile_time_arg_val(2);

@@ -1,6 +1,6 @@
 // Grouped batch-one BF16 projections: each group splits K over stripes, gathers FP32 row
 // partials on its leader and writes the BF16-rounded row into a TILE [1,1,1,N] output.
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 namespace {
 constexpr uint32_t k_tiles = get_compile_time_arg_val(0);
@@ -22,6 +22,7 @@ uint64_t leader_addr(uint32_t group, uint32_t address) {
 }  // namespace
 
 void kernel_main() {
+    select_read_vc();
     const uint32_t task = get_absolute_logical_y() * grid_x + get_absolute_logical_x();
     const uint32_t group = task / stripes;
     const uint32_t stripe = task % stripes;

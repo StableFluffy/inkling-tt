@@ -1,6 +1,7 @@
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 void kernel_main() {
+    select_read_vc();
     constexpr uint32_t block = get_compile_time_arg_val(0);
     constexpr uint32_t block_bytes = block * 2048;
     constexpr uint32_t blocks = 72 / block;

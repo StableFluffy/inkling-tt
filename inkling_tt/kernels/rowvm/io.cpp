@@ -1,5 +1,5 @@
 // Move only the logical face rows. Dense scratch is contiguous in physical face order.
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 #include "api/debug/kernel_profiler.hpp"
 #ifdef ROWVM_ZONES
 #define RV_ZONE(name) DeviceZoneScopedN(name)
@@ -400,6 +400,7 @@ void transfer_late(uint32_t task, std::integer_sequence<uint32_t, I...>) {
 }  // namespace
 
 void kernel_main() {
+    select_read_vc();
     const uint32_t task = rowvm_task();
 #ifndef ROWVM_WRITE
     {

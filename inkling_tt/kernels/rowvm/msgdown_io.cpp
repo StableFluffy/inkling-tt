@@ -1,7 +1,7 @@
 // Message-gate controller input and down projection in one launch. Per gate, 18 stripes own 256
 // columns of [u | m]: RMS over each half via its leader, BF16 rounding, a K-stripe matmul, and an
 // FP32 row reduction on the gate leader that writes the BF16 [1,1,1,64] result.
-#include "api/dataflow/dataflow_api.h"
+#include "../common/read_vc.h"
 
 namespace {
 constexpr uint32_t half_stripes = get_compile_time_arg_val(0);
@@ -31,6 +31,7 @@ uint64_t peer(uint32_t task, uint32_t address) {
 }  // namespace
 
 void kernel_main() {
+    select_read_vc();
     const uint32_t task = get_absolute_logical_y() * grid_x + get_absolute_logical_x();
     const uint32_t group = task / stripes;
     const uint32_t stripe = task % stripes;
