@@ -9,6 +9,7 @@ from inkling_tt import dense, rowvm
 from inkling_tt.model import HD, HKV, HQ, D
 from inkling_tt.model2 import BF, DRAM, FP, TILE
 from inkling_tt.mtp_markov import _cast
+from inkling_tt.mtp_projection import _tile_row
 from inkling_tt.mtp_weights import MLP_WIDTH, PADDED_VOCAB, RANK
 from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
 
@@ -289,5 +290,5 @@ class DraftHeadProjection:
         for i, base, context in zip(self.idx, self.base_rows, self.context_rows):
             if self.base is not None:
                 ttnn.slice(self.base, [0, 0, i, 0], [1, 1, i + 1, PADDED_VOCAB], output_tensor=base)
-            ttnn.slice(self.fixed, [0, 0, i, 0], [1, 1, i + 1, 3 * RANK], output_tensor=context)
+            _tile_row(self.fixed, context, source=i)
         return self.base_rows, self.context_rows

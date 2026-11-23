@@ -3,10 +3,29 @@ from pathlib import Path
 
 import ttnn
 
-from inkling_tt.model2 import BF, DRAM, TILE
+from inkling_tt.model2 import BF, DRAM, FP, TILE
 from inkling_tt.prefill import _grid, _launch, _program, _tasks, _tile_cb
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
+
+
+@lru_cache(maxsize=64)
+def _tile_row_program(tasks, dtype, src_row, dst_row, specs):
+    grid, rt = _grid(tasks)
+    tile = 4096 if dtype == FP else 2048
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=str(_KERNELS / "tile_row.cpp"),
+        core_ranges=grid,
+        runtime_args=rt,
+        compile_time_args=[tile, src_row, dst_row, *sum(specs[0], ())],
+        config=ttnn.ReaderConfigDescriptor(),
+    )
+    return _program([kernel], [_tile_cb(grid, 0, dtype)])
+
+
+def _tile_row(src, dst, *, source=0, target=0):
+    args = (_tasks(src.device(), src.shape[-1] // 32), src.dtype, source, target)
+    _launch(_tile_row_program, args, (src, dst))
 
 
 @lru_cache(maxsize=32)

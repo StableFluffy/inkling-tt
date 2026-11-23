@@ -10,7 +10,7 @@ from inkling_tt import rowvm
 from inkling_tt.model import HD, HKV, LOOP0, LOOP1, NB, NPASS, VOCAB, D, visit_slot
 from inkling_tt.model2 import BF, DRAM, FP, L1, MTP_TAP_VISITS, RM, TILE, Step, _DecodeBank
 from inkling_tt.mtp_experts import VerifyExperts
-from inkling_tt.mtp_projection import SharedProjection
+from inkling_tt.mtp_projection import SharedProjection, _tile_row
 from inkling_tt.mtp_weights import PADDED_VOCAB
 from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
 
@@ -75,25 +75,6 @@ class TargetCommit:
         self.kernel.common_runtime_args = [self.meta.buffer_address(), self.addresses.buffer_address()]
         self.program.kernels = [self.kernel]
         ttnn.generic_op([self.meta, self.addresses, *self.tensors], self.program)
-
-
-@lru_cache(maxsize=64)
-def _tile_row_program(tasks, dtype, src_row, dst_row, specs):
-    grid, rt = _grid(tasks)
-    tile = 4096 if dtype == FP else 2048
-    kernel = ttnn.KernelDescriptor(
-        kernel_source=str(_KERNELS / "tile_row.cpp"),
-        core_ranges=grid,
-        runtime_args=rt,
-        compile_time_args=[tile, src_row, dst_row, *sum(specs[0], ())],
-        config=ttnn.ReaderConfigDescriptor(),
-    )
-    return _program([kernel], [_tile_cb(grid, 0, dtype)])
-
-
-def _tile_row(src, dst, *, source=0, target=0):
-    args = (_tasks(src.device(), src.shape[-1] // 32), src.dtype, source, target)
-    _launch(_tile_row_program, args, (src, dst))
 
 
 @lru_cache(maxsize=8)
