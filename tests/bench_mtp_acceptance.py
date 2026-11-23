@@ -17,14 +17,29 @@ from inkling_tt.prefill import Prefill, _alloc
 from serve.runtime import DEVICE_PARAMS, default_precision
 
 
-def main(steps):
-    proposals = 3
-    lmax = 2048
+def main(steps, proposals, long_context):
+    lmax = 8192 if long_context else 2048
     data = torch.load(paths.golden("eval3x128.pt"), weights_only=False)
+    prompts = [(name, row["ids"].tolist()) for name, row in zip(("chat", "code", "Korean"), data)]
+    if long_context:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(paths.snapshot(), local_files_only=True)
+        passage = "Tenstorrent Blackhole p150a cards connect over Ethernet. " * 600
+        content = "Summarize the hardware described in this text: " + passage
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": content}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+        )["input_ids"]
+        prompts.append(("long", prompt))
+    if steps < 1 or any(len(ids) + steps + proposals >= lmax for _, ids in prompts):
+        raise ValueError("Requested prompt and generation must fit in lmax")
     device = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
     try:
         model = InklingTT2(device, paths.hf_sd(), default_precision(), lmax=lmax, capture_taps=True)
-        prefill = Prefill(model, 128)
+        prefill = Prefill(model, 2048 if long_context else 128)
         weights = load_drafter(paths.snapshot())
         fold, bias = fold_head(model.wts.get("lm_head.weight"), weights)
         block = DraftBlock(device, weights, proposals + 1, lmax)
@@ -82,17 +97,18 @@ def main(steps):
             ttnn.execute_trace(device, traces[i], cq_id=0, blocking=blocking)
 
         try:
-            for case, row in enumerate(data[:2]):
-                prompt = row["ids"].tolist()
+            for case, prompt in prompts:
                 model.reset()
                 logits, pos = prefill.prefill(prompt)
                 first = int(logits.argmax())
                 baseline = model.greedy(first, pos, steps)
                 model.reset()
-                logits = prefill.run_chunk(prompt, 0)
+                for start in range(0, len(prompt), prefill.chunk):
+                    chunk = prompt[start : start + prefill.chunk]
+                    logits = prefill.run_chunk(chunk, start, return_logits=start + len(chunk) == len(prompt))
+                    set_context(prompt_context, start, len(chunk))
+                    replay(0)
                 assert int(logits.argmax()) == first
-                set_context(prompt_context, 0, pos)
-                replay(0)
                 current = first
                 emitted, timings, histogram = [], [], Counter()
                 while len(emitted) < steps:
@@ -116,12 +132,13 @@ def main(steps):
                     histogram[matched] += 1
                 total = sum(histogram.values())
                 assert emitted == baseline
+                p95 = statistics.quantiles(timings, n=20, method="inclusive")[-1] if len(timings) > 1 else timings[0]
                 print(
-                    f"prompt {case} ({len(prompt)} input tokens): {steps} IDs match serial B1, "
+                    f"K={proposals} {case} ({len(prompt)} input tokens): {steps} IDs match serial B1, "
                     f"{total} rounds, {steps / total:.3f} emitted/round, "
                     f"accepted histogram {[histogram[i] for i in range(proposals + 1)]}, "
                     f"draft median {statistics.median(timings):.2f} ms, "
-                    f"p95 {statistics.quantiles(timings, n=20, method='inclusive')[-1]:.2f} ms",
+                    f"p95 {p95:.2f} ms",
                     flush=True,
                 )
         finally:
@@ -134,4 +151,7 @@ def main(steps):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=64)
-    main(parser.parse_args().steps)
+    parser.add_argument("--proposals", type=int, choices=range(1, 8), default=3)
+    parser.add_argument("--long-context", action="store_true")
+    args = parser.parse_args()
+    main(args.steps, args.proposals, args.long_context)

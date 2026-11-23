@@ -75,7 +75,8 @@ The component tests run through the pinned dev image.
 
 ```sh
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_block.py"
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64 --proposals 4"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 INK_PREFILL_EXPERT_DOUT_L1=480 python -u tests/bench_mtp_acceptance.py --steps 64 --long-context"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
@@ -100,12 +101,20 @@ INK_LMAX=2048 scripts/bench_decode.sh
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
 
-The device drafter with serial B1 verification delivers 3.048 and 3.368 IDs per round on the
-33-token explanation and 35-token Python fixtures respectively. Both runs reproduce all 64
-generated IDs. These measurements cover draft acceptance with the serial B1 oracle.
+The serial B1 oracle checks 64 generated IDs on each acceptance fixture. Four proposals raise
+the number of emitted IDs per round on each of the short prompts.
 
-The verifier replays four serial B1 rows bitwise for logits and taps at four starting
-positions after warming the graph and allocating its scratch. Committing any prefix length reproduces serial B1 KV and convolution histories,
+| Prompt | Input tokens | K=3 emitted per round | K=4 emitted per round |
+|---|---:|---:|---:|
+| Chat | 33 | 3.048 | 3.368 |
+| Python | 35 | 3.368 | 3.765 |
+| Korean | 43 | 2.370 | 2.783 |
+| Summarization | 7,825 | 2.667 | — |
+
+The 7,825-token fixture uses an 8,192-slot draft global prefix and takes 11.07 ms median and
+11.14 ms p95 for three proposals.
+
+The traced verifier matches serial B1 logits and taps bitwise at four starting positions. Committing any prefix length reproduces serial B1 KV and convolution histories,
 including a block that spans the local ring wrap and one that ends at the global cache limit.
 
 The shared projections cut four-row verification from 68.11 to 50.08 ms in the same job. The
