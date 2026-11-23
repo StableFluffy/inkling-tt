@@ -35,6 +35,8 @@ from inkling_tt.model2 import BF, DRAM, FP, RM, TILE, act, bf16, f32
 
 ISQ = 1.0 / math.sqrt(HD)
 _ROUTER_K_BLOCK = 96
+_MESSAGE_QUERIES = 4
+_MESSAGES_PER_TILE = 32 // _MESSAGE_QUERIES
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "prefill"
 _LOCK = Lock()
 
@@ -361,9 +363,9 @@ def _depth_score_program(tasks, cols, rows, specs):
 
 
 @lru_cache(maxsize=32)
-def _mix_program(tasks, cols, rows, depth, queries, separate, specs):
+def _mix_program(tasks, cols, rows, depth, queries, separate, query_offset, specs):
     grid, rt = _grid(tasks)
-    args = [cols, rows, depth, queries]
+    args = [cols, rows, depth, queries, query_offset]
     reader, writer = tuple(sum(group, ()) for group in specs)
     kernels = [
         ttnn.KernelDescriptor(
@@ -701,6 +703,13 @@ class Prefill:
         self._reuse_items = os.environ.get("INK_PREFILL_REUSE_ITEMS", "1") == "1"
         self._fused_depth_mix = os.environ.get("INK_PREFILL_DEPTH_MIX", "1") == "1"
         self._depth_logits = {}
+        self._pack_message_queries = self._fused_depth_mix and os.environ.get("INK_PREFILL_PACK_MESSAGE", "1") == "1"
+        if self._pack_message_queries:
+            if not hasattr(m, "_prefill_message_queries"):
+                queries = m.wts.get("message_input.query").float().reshape(-1, D) / math.sqrt(D)
+                queries = torch.nn.functional.pad(queries, (0, 0, 0, (-queries.shape[0]) % 32))
+                m._prefill_message_queries = tuple(self.c.up(q.T.reshape(1, 1, D, 32), FP) for q in queries.split(32))
+            self._message_queries = m._prefill_message_queries
         self._project_distance = os.environ.get("INK_PREFILL_PROJECT_DISTANCE", "1") == "1"
         self._bank_items = {}
         self._un16 = None
@@ -831,27 +840,33 @@ class Prefill:
                 self._bank_items.pop(next(iter(self._bank_items)))
         return items
 
+    def _depth_probabilities(self, entries, query):
+        depth = len(entries)
+        scores = self._depth_logits.get(depth)
+        if scores is None:
+            scores = self._depth_logits[depth] = _alloc(self.dev, (1, depth, self.chunk, 32), FP)
+        rows = self.chunk // 32
+        _launch(_depth_score_program, (_tasks(self.dev, depth * rows), D // 32, rows), (query, *entries), (scores,))
+        return ttnn.softmax(scores, dim=1)
+
     def mix(self, bank, partial, qm, nq):
         current = self.ops.rms(partial)
         if not bank:
             return [current] * nq
-        cols, rows = D // 32, self.chunk // 32
-        depth = len(bank) + 1
+        entries = (*bank, current)
         if self._fused_depth_mix:
-            entries = (*bank, current)
-            scores = self._depth_logits.get(depth)
-            if scores is None:
-                scores = self._depth_logits[depth] = _alloc(self.dev, (1, depth, self.chunk, 32), FP)
-            _launch(_depth_score_program, (_tasks(self.dev, depth * rows), cols, rows), (qm[0], *entries), (scores,))
-            inputs = (ttnn.softmax(scores, dim=1), *entries)
+            inputs = (self._depth_probabilities(entries, qm[0]), *entries)
         else:
             items = self._items(bank, current)
-            scores = self.c.mm(items, qm[0])
-            inputs = (items, ttnn.softmax(scores, dim=1))
+            inputs = (items, ttnn.softmax(self.c.mm(items, qm[0]), dim=1))
+        return self._weighted_mix(inputs, len(entries), nq)
+
+    def _weighted_mix(self, inputs, depth, nq, query_offset=0):
+        cols, rows = D // 32, self.chunk // 32
         out = [_alloc(self.dev, (1, 1, self.chunk, D), FP) for _ in range(nq)]
         _launch(
             _mix_program,
-            (_tasks(self.dev, cols * rows), cols, rows, depth, nq, self._fused_depth_mix),
+            (_tasks(self.dev, cols * rows), cols, rows, depth, nq, self._fused_depth_mix, query_offset),
             inputs,
             tuple(out),
         )
@@ -1100,11 +1115,22 @@ class Prefill:
 
         def run_range(start, stop, p, previous=None):
             nonlocal x, bank
+            if previous is not None and self._pack_message_queries:
+                prev_x, prev_bank = previous
+                entries = (*prev_bank, self.ops.rms(prev_x))
+                weights = tuple(self._depth_probabilities(entries, q) for q in self._message_queries)
             for layer in layers[start:stop]:
                 messages = None
                 if previous is not None:
-                    prev_x, prev_bank = previous
-                    messages = self.mix(prev_bank, prev_x, m.msg_q[layer.i - LOOP0], 4)
+                    j = layer.i - LOOP0
+                    if self._pack_message_queries:
+                        tile, slot = divmod(j, _MESSAGES_PER_TILE)
+                        messages = self._weighted_mix(
+                            (weights[tile], *entries), len(entries), _MESSAGE_QUERIES, slot * _MESSAGE_QUERIES
+                        )
+                    else:
+                        prev_x, prev_bank = previous
+                        messages = self.mix(prev_bank, prev_x, m.msg_q[j], _MESSAGE_QUERIES)
                 x, bank = self.layer(layer, x, bank, m.visits[visit_slot(layer.i, p)], messages)
 
         run_range(0, LOOP0, 0)

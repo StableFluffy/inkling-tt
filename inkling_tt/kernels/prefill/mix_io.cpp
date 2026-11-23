@@ -12,7 +12,7 @@ uint32_t face_index(uint32_t row, uint32_t col) {
 
 void kernel_main() {
     const auto addr = [](uint32_t i) { return get_common_arg_val<uint32_t>(i); };
-    constexpr auto a0 = TensorAccessorArgs<4>();
+    constexpr auto a0 = TensorAccessorArgs<5>();
     const uint32_t first = get_arg_val<uint32_t>(0);
     const uint32_t end = get_arg_val<uint32_t>(1);
 #ifdef PREFILL_WRITE
@@ -34,6 +34,7 @@ void kernel_main() {
     const auto slabs = TensorAccessor(a0, addr(0), fp_bytes);
     const auto weights = TensorAccessor(a1, addr(1), fp_bytes);
 #endif
+    constexpr uint32_t query_offset = get_compile_time_arg_val(4);
     const uint32_t scratch = get_write_ptr(2);
     for (uint32_t tile = first; tile < end; ++tile) {
         const uint32_t row_block = tile / cols;
@@ -50,7 +51,7 @@ void kernel_main() {
             for (uint32_t q = 0; q < queries; ++q) {
                 for (uint32_t d = 0; d < depth; ++d) {
                     for (uint32_t row = 0; row < 32; ++row) {
-                        dst[(q * depth + d) * 1024 + face_index(row, 0)] = p[d * 1024 + face_index(row, q)];
+                        dst[(q * depth + d) * 1024 + face_index(row, 0)] = p[d * 1024 + face_index(row, q + query_offset)];
                     }
                 }
             }
