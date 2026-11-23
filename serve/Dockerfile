@@ -28,6 +28,7 @@ WORKDIR /opt/inkling/code
 EXPOSE 8000
 # 0.0.0.0 is the address inside the container. Publish the port on the host loopback only
 # (docker run -p 127.0.0.1:8000:8000); the API has no authentication.
+# Extra arguments such as --mtp --lmax 8192 are appended to the server command.
 ENTRYPOINT ["python", "-u", "-m", "serve.openai_server", "--weights", "/models/hf_sd", "--tokenizer", "/models/Inkling-2-Mini", "--host", "0.0.0.0", "--port", "8000"]
 
 # Metadata last, so a new revision label does not invalidate the layers above.

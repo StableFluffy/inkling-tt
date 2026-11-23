@@ -6,7 +6,7 @@ The server has no authentication and no rate limiting. It binds to `127.0.0.1` b
 
 ## Container image
 
-You need the converted shards and the tokenizer snapshot from [install.md](install.md) steps 0 and 3, and a free card.
+Prepare the converted shards and tokenizer using [install.md](install.md), and build the local image using the pinned tt-metal checkout. See [development.md](development.md#release-image).
 
 ```bash
 docker run -d --name inkling --privileged \
@@ -16,12 +16,12 @@ docker run -d --name inkling --privileged \
   -v "$INKLING_HF_SD":/models/hf_sd:ro \
   -v "$INKLING_SNAPSHOT":/models/Inkling-2-Mini:ro \
   -v "$INKLING_WORK/image-cache":/cache \
-  ghcr.io/stablefluffy/inkling-tt:0.1.0
+  inkling-2-mini-tt:0.1.1
 
 until curl -sf localhost:8000/health; do sleep 10; done
 ```
 
-The first start compiles every kernel into `/cache` and takes about four minutes; later starts take about a minute. Arguments after the image name go to the server, for example `--lmax 8192`. The image is about 2.4 GB to pull and 12 GB on disk.
+The first start compiles the kernels into `/cache`. Later starts reuse that cache. Docker passes arguments after the image name to the server.
 
 ## From a source checkout
 
@@ -74,24 +74,31 @@ A request may use at most `lmax` tokens in total and must leave room for one out
 
 ## Speculative decoding
 
-A source checkout can load the official `mtp.safetensors` from `INKLING_SNAPSHOT` and enable
-DSpark for greedy requests without penalties. With `--mtp` alone, the server chooses up to
-three proposals per round. It compares expected IDs per millisecond against B1 and can hand
-the rest of the request to B1. Set `"mtp": false` in a chat or completion request to select B1 for that
-request. The server uses B1 by default because the speedup depends on the prompt.
+The source and container servers load the 0.64 GB `mtp.safetensors` from the official snapshot
+when started with `--mtp`. Download it to the directory mounted at `/models/Inkling-2-Mini` in
+the container command above. See [install.md](install.md#3-download-and-convert-the-checkpoint).
 
 ```bash
-hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa615fc413cc9af3379f491b963f3b586a \
-  --include mtp.safetensors --local-dir "$INKLING_SNAPSHOT"
-PORT=8000 scripts/serve.sh --mtp 3 --lmax 8192
-INKLING_URL=http://localhost:8000 python3 tools/bench_server.py --compare-mtp
+docker run -d --name inkling-mtp --privileged \
+  --device /dev/tenstorrent -v /dev/hugepages-1G:/dev/hugepages-1G \
+  -e TT_VISIBLE_DEVICES=0 -e TT_METAL_VISIBLE_DEVICES=0 \
+  -p 127.0.0.1:8000:8000 \
+  -v "$INKLING_HF_SD":/models/hf_sd:ro \
+  -v "$INKLING_SNAPSHOT":/models/Inkling-2-Mini:ro \
+  -v "$INKLING_WORK/image-cache":/cache \
+  inkling-2-mini-tt:0.1.1 --mtp --lmax 8192
 ```
+
+From a source checkout, use `PORT=8000 scripts/serve.sh --mtp --lmax 8192`. The server enables
+DSpark for greedy requests without penalties. With `--mtp`, it chooses up to three proposals
+per round and can switch to B1 for the rest of the request. Set `"mtp": false` to use B1 for an
+individual request. Standalone B1 is the default.
 
 Both 128- and 2,048-row prefill buckets run with MTP at an 8,192-token context on the tested
 card. The runtime shares the head workspace and uses the same larger dispatch ring as
 standalone B1 for up to three proposals and 8,192 context slots. Larger contexts and fixed
-widths above three proposals use the standard ring. Wide expert lanes reserve one weight buffer each. Global attention retains up to 56 score tiles and
-recomputes scores past that range. See [speculative.md](speculative.md) and [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).
+widths above three proposals use the standard ring. Wide expert lanes reserve one weight buffer
+each. Global attention retains up to 56 score tiles and recomputes the earlier scores. See [speculative.md](speculative.md) and [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).
 
 ## vLLM
 

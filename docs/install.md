@@ -52,6 +52,13 @@ hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa615fc413cc9af3379
   --exclude '*.safetensors' --local-dir "$INKLING_SNAPSHOT"
 ```
 
+The tokenizer files are enough for ordinary decode. To enable greedy DSpark speculation, add the 0.64 GB drafter to the same directory. The server reads it from `$INKLING_SNAPSHOT/mtp.safetensors`.
+
+```bash
+hf download thinkingmachines/Inkling-2-Mini mtp.safetensors \
+  --revision b85c3cfa615fc413cc9af3379f491b963f3b586a --local-dir "$INKLING_SNAPSHOT"
+```
+
 The golden scripts in step 4 still need the full official checkpoint, so download it without `--exclude` if you want to run the parity tests.
 
 The converter needs a Transformers release that knows `inkling2_loop`, so it gets its own CPU environment:

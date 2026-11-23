@@ -25,18 +25,26 @@ hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa615fc413cc9af3379
 
 The converted weights are the official checkpoint dequantized to BF16 and split per layer. To make them yourself, see [docs/install.md](docs/install.md#3-download-and-convert-the-checkpoint).
 
-Then start the server from the container image:
+Build the release image with the pinned tt-metal tree. See [docs/development.md](docs/development.md#release-image).
 
 ```bash
 docker run -d --name inkling --privileged \
   --device /dev/tenstorrent -v /dev/hugepages-1G:/dev/hugepages-1G \
-  -e TT_VISIBLE_DEVICES=0 -p 127.0.0.1:8000:8000 \
+  -e TT_VISIBLE_DEVICES=0 -e TT_METAL_VISIBLE_DEVICES=0 -p 127.0.0.1:8000:8000 \
   -v "$PWD/hf_sd":/models/hf_sd:ro -v "$PWD/Inkling-2-Mini":/models/Inkling-2-Mini:ro \
   -v "$PWD/cache":/cache \
-  ghcr.io/stablefluffy/inkling-tt:0.1.0
+  inkling-2-mini-tt:0.1.1
 
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages": [{"role": "user", "content": "What is 2+3?"}], "temperature": 0, "max_tokens": 256}'
+```
+
+For greedy DSpark speculation, download the 0.64 GB drafter into the same snapshot directory and append
+`--mtp --lmax 8192` after the image name in the command above.
+
+```bash
+hf download thinkingmachines/Inkling-2-Mini mtp.safetensors \
+  --revision b85c3cfa615fc413cc9af3379f491b963f3b586a --local-dir ./Inkling-2-Mini
 ```
 
 The first start compiles the kernels and takes about four minutes. To run the tests and benchmarks, or to change the code, install from source: [docs/install.md](docs/install.md).

@@ -99,7 +99,7 @@ Custom programs use `ttnn.generic_op` with kernels under `inkling_tt/kernels/`. 
 
 ```bash
 export TT_METAL_HOME=/path/to/clean/tt-metal
-REF=v0.1.0 VERSION=0.1.0 TAG=inkling-2-mini-tt:0.1.0 serve/build_image.sh
+REF=HEAD VERSION=0.1.1 TAG=inkling-2-mini-tt:0.1.1 serve/build_image.sh
 ```
 
 `build_image.sh` packages `git archive $REF`, so uncommitted files never reach the image, and labels the image with that commit. It adds the built tt-metal tree without its git data, build objects or docs, and refuses a tt-metal tree at another commit, with local changes, or whose files contain the host build path. `scripts/publish_image.sh` checks the labels, the packaged code and the license files again before it pushes.
