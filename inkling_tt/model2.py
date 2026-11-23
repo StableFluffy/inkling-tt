@@ -1045,6 +1045,7 @@ class InklingTT2:
         self.dec_final_q, self.dec_norm = self.c.decode_query(self.final_q), self.c.decode_row(self.norm)
         self.dec_msg_q = [self.c.decode_query(q) for q in self.msg_q]
         self._prepare_head(g("lm_head.weight"), resident_scratch=capture_taps)
+        self.head_workspace = self._alloc_head_workspace() if capture_taps and hasattr(self, "head_logits") else None
         self.st = Step(self.c, lmax)
         if self.c.device_feedback and hasattr(self, "head_logits"):
             self._prepare_feedback()
@@ -1099,6 +1100,22 @@ class InklingTT2:
             # Persistent outputs of the fused head tail, allocated before capture.
             self.head_logits = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, 201024)), BF, RM, c.dev, DRAM)
             self.head_index = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, 1)), ttnn.uint32, RM, c.dev, L1)
+
+    def _alloc_head_workspace(self):
+        head = self.head
+        return tuple(
+            ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 32, width)), BF, TILE, self.c.dev, mem)
+            for width, mem in ((head.k, head.input_shards), (head.n, head.output_shards))
+        )
+
+    def _project_head_row(self, h):
+        if self.head_workspace is None:
+            return _linear_to_shards(h, self.head)
+        from inkling_tt.mtp_projection import _tile_row
+
+        activation, out = self.head_workspace
+        _tile_row(h, activation)
+        return _linear_to_shards(activation, self.head, out=out)
 
     def _init_attention_glue(self):
         init_attention_glue(self.c, self.lmax)
@@ -1238,7 +1255,7 @@ class InklingTT2:
             ttnn.copy(h, self.taps[3])
         if hasattr(self, "head_logits"):
             # One program copies the head's native shards into the row and reduces the masked argmax.
-            rowvm.head_tail(_linear_to_shards(h, self.head), self.head_logits, self.head_index, VOCAB)
+            rowvm.head_tail(self._project_head_row(h), self.head_logits, self.head_index, VOCAB)
             self.next_id = self.head_index
             if hasattr(self, "embed_table"):
                 st = self.st

@@ -7,6 +7,7 @@ import ttnn
 from inkling_tt import dense, paths, rowvm
 from inkling_tt.model import VOCAB, D, Weights
 from inkling_tt.model2 import BF, RM, TILE
+from inkling_tt.mtp_projection import _tile_row
 from inkling_tt.mtp_weights import PADDED_VOCAB
 from inkling_tt.prefill import _alloc
 from serve.runtime import DEVICE_PARAMS
@@ -17,7 +18,9 @@ def main():
     try:
         device.enable_program_cache()
         weight = Weights(paths.hf_sd()).get("lm_head.weight")
-        head = dense.prepare_weight(device, torch.nn.functional.pad(weight.T, (0, PADDED_VOCAB - VOCAB)))
+        head = dense.prepare_weight(
+            device, torch.nn.functional.pad(weight.T, (0, PADDED_VOCAB - VOCAB)), workers_per_bank=8
+        )
         generator = torch.Generator().manual_seed(869)
         cases = [torch.randn(1, 1, 32, D, generator=generator, dtype=torch.bfloat16) for _ in range(2)]
 
@@ -31,7 +34,8 @@ def main():
             )
 
         shared = workspace(32)
-        serial = [workspace(1) for _ in range(4)]
+        narrow_buffers = workspace(1)[1:]
+        serial = [(_alloc(device, (1, 1, 1, D)), *narrow_buffers) for _ in range(4)]
         outputs = [
             [
                 (_alloc(device, (1, 1, 1, PADDED_VOCAB), BF, RM), _alloc(device, (1, 1, 1, 1), ttnn.uint32, RM))
@@ -48,9 +52,10 @@ def main():
             for i, (x, _, _) in enumerate(serial):
                 stage(block[:, :, i : i + 1], x)
 
-        def project(tensors):
+        def project(tensors, *, load=True):
             x, shards, result = tensors
-            ttnn.interleaved_to_sharded(x, head.input_shards, preallocated_output=shards)
+            if load:
+                ttnn.interleaved_to_sharded(x, head.input_shards, preallocated_output=shards)
             ttnn.linear(
                 shards,
                 head.tensor,
@@ -79,6 +84,15 @@ def main():
         narrow()
         wide()
         check()
+        for case in cases:
+            prepare(case)
+            narrow()
+            wide()
+            _tile_row(serial[1][0], shared[1])
+            rowvm.head_tail(project(shared, load=False), *outputs[1][0], VOCAB)
+            for serial_t, shared_t in zip(outputs[0][1], outputs[1][0]):
+                assert torch.equal(ttnn.to_torch(serial_t), ttnn.to_torch(shared_t))
+        print("single live row in the shared head matches the narrow projection", flush=True)
         ttnn.synchronize_device(device)
         traces = []
         for graph in (narrow, wide):

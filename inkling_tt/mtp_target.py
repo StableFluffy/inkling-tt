@@ -108,11 +108,8 @@ class TargetVerify:
         self.logits = tuple(_alloc(device, (1, 1, 1, PADDED_VOCAB), BF, RM) for _ in range(self.rows))
         self.ids = tuple(_alloc(device, (1, 1, 1, 1), ttnn.uint32, RM) for _ in range(self.rows))
         self.taps = tuple(_alloc(device, (1, 1, 32, D)) for _ in range(4))
-        self.head_input = ttnn.allocate_tensor_on_device(
-            ttnn.Shape((1, 1, 32, D)), BF, TILE, device, model.head.input_shards
-        )
-        self.head_output = ttnn.allocate_tensor_on_device(
-            ttnn.Shape((1, 1, 32, PADDED_VOCAB)), BF, TILE, device, model.head.output_shards
+        self.head_input, self.head_output = (
+            model.head_workspace if model.head_workspace is not None else model._alloc_head_workspace()
         )
         self.outputs = {}
         for layer in model.layers:

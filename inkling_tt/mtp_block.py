@@ -156,6 +156,16 @@ class DraftBlock:
 
         self.weights = {}
         self.linear_work = {}
+        buffers = []
+
+        def sharded_rows(width, memory):
+            for buf in buffers:
+                if buf.shape[-1] == width and buf.memory_config() == memory:
+                    return buf
+            buf = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 32, width)), BF, TILE, device, memory)
+            buffers.append(buf)
+            return buf
+
         for name, weight in weights.items():
             if (name.startswith("layers.") and "ctx" not in name and "dflare" not in name) or name == "norm.weight":
                 sharded = (sharded_mlp and ".mlp." in name) or (
@@ -167,9 +177,9 @@ class DraftBlock:
                     shape = (handle.k, handle.n)
                     if handle.input_shards is not None and shape not in self.linear_work:
                         args = _head_copy_args(device, handle)
-                        bufs = tuple(
-                            ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 32, width)), BF, TILE, device, mem)
-                            for width, mem in ((handle.k, handle.input_shards), (handle.n, handle.output_shards))
+                        bufs = (
+                            sharded_rows(handle.k, handle.input_shards),
+                            sharded_rows(handle.n, handle.output_shards),
                         )
                         self.linear_work[shape] = (*bufs, args)
                 else:

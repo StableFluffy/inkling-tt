@@ -83,8 +83,8 @@ for the next round.
 ## Round replay
 
 The round allocates scratch and warms each width before capture. Draft, target verification
-and the accepted-context projection use separate traces on one command queue. The drafter and
-target share width-sharded head buffers across widths. Smaller rounds score a prefix of the
+and the accepted-context projection use separate traces on one command queue. Prefill, B1, the verifier and the drafter share one width-sharded head workspace when MTP is
+enabled. A narrow call copies its live row into that workspace. Smaller rounds score a prefix of the
 draft block and verify only those rows.
 
 The server selects one to four target rows using the startup replay times and a decaying

@@ -10,7 +10,7 @@ from threading import Lock
 import torch
 import ttnn
 
-from inkling_tt import dense, experts_stream
+from inkling_tt import dense, experts_stream, rowvm
 from inkling_tt.device import has_default_l1_budget
 from inkling_tt.model import (
     DR,
@@ -728,7 +728,7 @@ class Prefill:
         self._un16 = None
         self.attn_out = _alloc(self.dev, (1, 1, chunk, HQ * HD))
         self.last = _alloc(self.dev, (1, 1, 1, D))
-        self.logits = _alloc(self.dev, (1, 1, 1, m.head.n))
+        self.logits = _alloc(self.dev, (1, 1, 1, m.head.n), layout=RM if m.head_workspace is not None else TILE)
         self.rel_weights = {}
         self._fused_router_projection = os.environ.get("INK_PREFILL_ROUTER_PROJECT", "1") == "1"
         self.router_partials = (
@@ -1166,7 +1166,11 @@ class Prefill:
         )
 
     def _readout(self):
-        ttnn.copy(dense.linear(self.last, self.m.head), self.logits)
+        m = self.m
+        if m.head_workspace is not None:
+            rowvm.head_tail(m._project_head_row(self.last), self.logits, m.head_index, VOCAB)
+        else:
+            ttnn.copy(dense.linear(self.last, m.head), self.logits)
 
     def _stage(self, tokens, pos):
         valid = len(tokens)
