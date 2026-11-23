@@ -24,7 +24,7 @@ A stock p150a has two harvested Tensix columns and reports an 11x10 worker grid.
 
 - Row epilogues, the router, the head tail and the dense projections size their core grids from the reported width.
 - Fused attention runs all eight KV heads in one launch on 13x10 and in two launches of four heads on smaller grids. Each head keeps its split and reduction order.
-- The expert streamer and prefill projections ask tt-metal for the DRAM-bank-to-worker assignment instead of using fixed coordinates.
+- The expert streamer, paired K/V and prefill projections place their readers near each bank using tt-metal's DRAM-bank assignment.
 - Grids smaller than 11x10, or cards without eight DRAM banks, are rejected before the device opens.
 
 Changing the grid changes scheduling, not results. On the tested card, restricted to 11x10 and 12x10, every parity and evaluation fixture produced bit-identical logits to the 13x10 run. Decode was about 2.5 % slower at 11x10 and the 8k-token prefill about 8 % slower.
@@ -41,4 +41,4 @@ Set it before the process opens the device, and leave it unset on a stock card. 
 
 ## Memory
 
-At `lmax` 32768, with the decode trace, both prefill buckets and the on-device embedding table resident, tt-metal reports 31.05 GB of DRAM allocated out of 33.78 GB. A shorter `lmax` shrinks the KV caches of the eight global-attention visits; the 40 sliding-window visits keep fixed 1024-slot rings.
+At `lmax` 32768, with the decode trace, both prefill buckets and the on-device embedding table resident, tt-metal reports 31.27 GB of DRAM allocated out of 33.78 GB. A shorter `lmax` shrinks the KV caches of the eight global-attention visits. The 40 sliding-window visits use fixed 1024-slot rings.

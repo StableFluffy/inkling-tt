@@ -17,7 +17,7 @@ Device profile of one token on the tested card (13x10 workers, `lmax` 2048, BFP8
 | Q/relative/sink/gate and O projections | 96 | 4.6 |
 | LM head | 1 | 1.9 |
 | K/V and dynamic-tap projections | 64 | 1.3 |
-| Attention-residual mixes | 120 | 1.2 |
+| Attention-residual mixes | 120 | 1.3 |
 | Message-gate projections | 96 | 1.2 |
 | Router | 48 | 0.5 |
 | Fused attention | 48 | 0.4 |
@@ -25,7 +25,7 @@ Device profile of one token on the tested card (13x10 workers, `lmax` 2048, BFP8
 | Readout, layout and small epilogues | 38 | 0.1 |
 | **Total** | **655** | **18.5** |
 
-The first four rows stream weights. The firmware span includes about 1 ms between programs. Unprofiled greedy decode runs at about 19.5 ms per token ([benchmarks.md](benchmarks.md)).
+The first four rows stream weights. The firmware span includes about 1.1 ms between programs. Unprofiled greedy decode runs at about 19.5 ms per token ([benchmarks.md](benchmarks.md)).
 
 ## From the first port to this release
 
@@ -71,4 +71,4 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 
 ## Remaining budget
 
-About 4 ms of kernel time and 1 ms of gaps sit outside weight streaming. The largest items are the 120 attention-residual mixes (1.4 ms), attention preparation and fused attention (0.8 ms), the message-gate up projections (0.7 ms, partly FP32 weight reads) and the router (0.5 ms). Shaving single programs has small returns now. The next real gain needs overlap across programs, for example prefetching the next visit's weights on a sub-device while the epilogues run, or a persistent decode kernel.
+About 4 ms of kernel time and 1 ms of gaps sit outside weight streaming. The largest items are the 120 attention-residual mixes (1.3 ms), attention preparation and fused attention (0.8 ms), the message-gate up projections (0.7 ms, partly FP32 weight reads) and the router (0.5 ms). Shaving single programs has small returns now. The next real gain needs overlap across programs, for example prefetching the next visit's weights on a sub-device while the epilogues run, or a persistent decode kernel.
