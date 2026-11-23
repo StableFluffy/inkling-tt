@@ -102,7 +102,7 @@ class DraftContextProjection:
         self.normalized = row(D)
         self.k, self.v, self.k_norm = (row(HKV * HD) for _ in range(3))
         self.k_heads, self.v_heads, self.k_rot = (_alloc(device, (1, HKV, chunk, HD)) for _ in range(3))
-        self.rope = _Rope(device, HKV, chunk)
+        self.rope = _Rope(device, HKV, chunk, fused=block.rope_k.fused)
 
     def _mix(self, features, i):
         ttnn.mul(features[0], self.alpha[i][0], dtype=FP, output_tensor=self.acc)

@@ -12,7 +12,7 @@ from inkling_tt.model2 import BF, DRAM, FP, TILE
 from inkling_tt.mtp_markov import _cast
 from inkling_tt.mtp_projection import _tile_row
 from inkling_tt.mtp_weights import MLP_WIDTH, PADDED_VOCAB, RANK
-from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
+from inkling_tt.prefill import _alloc, _compute, _grid, _launch, _program, _tasks, _tile_cb
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
 
@@ -100,14 +100,51 @@ def _norm_heads(x, weight, out, rows, heads):
         )
 
 
+@lru_cache(maxsize=16)
+def _rope_program(tasks, row_tiles, specs):
+    grid, rt = _grid(tasks)
+    io = str(_KERNELS / "rope_io.cpp")
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=io,
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=[row_tiles, *sum(specs[0], ())],
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "rope_compute.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            config=_compute((1,), full_sync=True),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=io,
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=[row_tiles, *specs[2][0]],
+            defines=[("DRAFT_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    return _program(kernels, [_tile_cb(grid, i, dtype, 2) for i, dtype in ((0, BF), (1, FP), (16, BF))])
+
+
 class _Rope:
-    def __init__(self, device, heads, rows=32):
+    def __init__(self, device, heads, rows=32, *, fused=True):
         self.heads, self.rows = heads, rows
+        self.fused = fused
+        if fused:
+            self.tasks = _tasks(device, heads * (rows // 32) * (HD // 64))
+            return
         shape = (1, heads, rows, HD // 2)
         self.a, self.b, self.left, self.right = (_alloc(device, shape) for _ in range(4))
         self.x, self.y, self.u, self.v, self.result = (_alloc(device, shape, FP) for _ in range(5))
 
     def apply(self, src, cos, sin, out):
+        if self.fused:
+            _launch(_rope_program, (self.tasks, self.rows // 32), (src, cos, sin), (), (out,))
+            return
         start = [0, 0, 0, 0]
         middle = [1, self.heads, self.rows, HD // 2]
         ttnn.slice(src, start, middle, output_tensor=self.a)
@@ -141,6 +178,7 @@ class DraftBlock:
         sharded_attention=True,
         short_prefix=False,
         pack_queries=True,
+        fused_rope=True,
     ):
         if not 2 <= rows <= 8 or prefix_capacity < 32 or prefix_capacity % 32:
             raise ValueError("DSpark needs 2-8 rows and a positive, tile-aligned prefix capacity")
@@ -204,8 +242,8 @@ class DraftBlock:
             self.q_group = _tile_view(self.q_rot, (1, HKV, HQ // HKV * 32, HD))
             self.attn = self.attn_heads = _alloc(device, self.q_group.shape)
         self.attn_flat = _tile_view(self.attn_heads, (1, 1, 32, HQ * HD))
-        self.rope_q = _Rope(device, HQ)
-        self.rope_k = _Rope(device, HKV)
+        self.rope_q = _Rope(device, HQ, fused=fused_rope)
+        self.rope_k = _Rope(device, HKV, fused=fused_rope)
         self.gate, self.up, self.silu = (row(MLP_WIDTH) for _ in range(3))
         self.gate_fp, self.sigmoid, self.silu_fp = (row(MLP_WIDTH, FP) for _ in range(3))
 

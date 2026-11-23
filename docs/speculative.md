@@ -26,7 +26,8 @@ committed input.
 
 The draft block starts at the first uncommitted position. It embeds the pending target ID in row 0
 and fills subsequent rows with the checkpoint mask embedding. Each query attends to its layer's
-committed context and the entire transient block. RoPE uses the block's absolute positions. The
+committed context and the entire transient block. One RoPE program rotates each batch of
+heads at their absolute positions. It keeps the products and sums in FP32 and rounds to BF16. The
 transient self-projected K/V occupy separate slots from the feature-projected prefix. The
 three query heads in each KV group pack their live rows into one tile. This cuts score and
 probability storage to one-third for the draft's attention products.
@@ -105,7 +106,7 @@ reduces p95 from 20.89 to 20.55 ms per ID.
 The component tests run through the pinned dev image.
 
 ```sh
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-projections"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-rope"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_router.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
@@ -118,7 +119,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 6.90 ms median, 6.91 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 6.52 ms median, 6.55 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
 | Four expert rows, union of 20 | 0.460 ms median, 0.464 ms p95 |

@@ -60,7 +60,7 @@ def check_context(ctx, block, last):
     assert error < 0.01, f"Markov tap mixture relative L2={error:.5f}"
 
 
-def main(compare_queries=False, compare_scores=False, compare_projections=False):
+def main(compare_queries=False, compare_scores=False, compare_projections=False, compare_rope=False):
     count = 3
     weights = load_drafter(paths.snapshot())
     target = Weights(paths.hf_sd())
@@ -80,15 +80,18 @@ def main(compare_queries=False, compare_scores=False, compare_projections=False)
             labels = ("ordinary scores", "fused scores")
         if compare_projections:
             labels = ("ordinary projections", "sharded projections")
+        if compare_rope:
+            labels = ("ordinary RoPE", "fused RoPE")
         blocks = [
             DraftBlock(
                 device,
                 weights,
                 count + 1,
                 1088,
-                sharded_mlp=True if compare_queries or compare_scores or compare_projections else mode,
+                sharded_mlp=True if compare_queries or compare_scores or compare_projections or compare_rope else mode,
                 pack_queries=mode if compare_queries else True,
                 sharded_attention=mode if compare_projections else True,
+                fused_rope=mode if compare_rope else True,
             )
             for mode in (False, True)
         ]
@@ -146,6 +149,8 @@ def main(compare_queries=False, compare_scores=False, compare_projections=False)
             delta = (actual[2].float() - logits.float()).norm() / logits.float().norm()
             print(f"{labels[1]}: {actual[0]} vs {ids}, relative L2 {delta:.5f}", flush=True)
             assert actual[0] == ids and delta < 0.01
+            if compare_rope:
+                assert torch.equal(actual[1], hidden) and torch.equal(actual[2], logits)
             hidden_error = (hidden.float() - case[3]).norm() / case[3].float().norm()
             expected_ids, expected_logits = case[4]
             logit_error = (logits.float() - expected_logits).norm() / expected_logits.float().norm()
@@ -214,5 +219,11 @@ if __name__ == "__main__":
     comparisons.add_argument("--compare-queries", action="store_true")
     comparisons.add_argument("--compare-scores", action="store_true")
     comparisons.add_argument("--compare-projections", action="store_true")
+    comparisons.add_argument("--compare-rope", action="store_true")
     options = parser.parse_args()
-    main(options.compare_queries, options.compare_scores, options.compare_projections)
+    main(
+        options.compare_queries,
+        options.compare_scores,
+        options.compare_projections,
+        options.compare_rope,
+    )
