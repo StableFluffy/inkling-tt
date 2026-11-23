@@ -13,7 +13,7 @@ from inkling_tt.mtp_context import DraftContextProjection, DraftPositions
 from inkling_tt.mtp_markov import MarkovDraftHead
 from inkling_tt.mtp_target import TargetVerify
 from inkling_tt.mtp_weights import fold_head, load_drafter
-from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tile_cb
+from inkling_tt.prefill import _alloc, _grid, _launch, _prefill_bucket, _program, _tile_cb
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
 _SHORT_PREFIX = 1024
@@ -89,6 +89,7 @@ class SpeculativeRound:
         self.adaptive = adaptive
         self.widths = tuple(range(2, min(self.rows, 4) + 1)) if adaptive else (self.rows,)
         self.costs = {}
+        self.prefill_costs = {}
         self.start_request()
         weights = load_drafter(snapshot)
         fold, bias = fold_head(model.wts.get("lm_head.weight"), weights)
@@ -144,6 +145,14 @@ class SpeculativeRound:
             return next(widths, 1)
         return max((1, *widths), key=lambda r: sum(acceptance**i for i in range(r)) / self.costs[short, r])
 
+    def _prefill_context_cost(self, tokens):
+        elapsed = 0.0
+        while tokens > 0:
+            bucket = _prefill_bucket(self.prefill_costs, tokens)
+            elapsed += self.prefill_costs[bucket]
+            tokens -= bucket.chunk
+        return elapsed
+
     def pick(self, position, limit):
         if self.plain:
             return 1
@@ -156,9 +165,9 @@ class SpeculativeRound:
                 short = self._short(position)
                 baseline = self.costs[short, 1]
                 probe = self.costs[short, 2]
-                width = (
-                    2 if probe < (1 + acceptance) * baseline and probe - baseline <= _PROBE_COST_PER_ID * limit else 1
-                )
+                budget = _PROBE_COST_PER_ID * limit
+                pays = probe < (1 + acceptance) * baseline
+                width = 2 if pays and max(probe - baseline, self._prefill_context_cost(position)) <= budget else 1
         self.plain = width == 1
         return width
 
@@ -278,6 +287,14 @@ class SpeculativeRound:
         self.draft_ready = False
 
     def _measure_costs(self):
+        ttnn.synchronize_device(self.device)
+        for bucket, trace in self.prefill_traces.items():
+            samples = []
+            for _ in range(3):
+                start = perf_counter()
+                ttnn.execute_trace(self.device, trace, cq_id=0, blocking=True)
+                samples.append(perf_counter() - start)
+            self.prefill_costs[bucket] = median(samples)
         for short in self._draft_widths():
             position = min(
                 29 if short or self.block.short_attention is None else self.model.lmax - 32,

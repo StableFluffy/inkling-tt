@@ -1220,6 +1220,10 @@ class Prefill:
 _CHUNK_OVERHEAD_ROWS = 352
 
 
+def _prefill_bucket(buckets, remaining):
+    return min(buckets, key=lambda p: (-(-remaining // p.chunk) * (p.chunk + _CHUNK_OVERHEAD_ROWS), -p.chunk))
+
+
 def prefill_buckets(buckets, tokens, *, on_chunk=None):
     """Run a prompt from position zero, choosing for each chunk the bucket with
     the lowest estimated cost for the remaining tokens. Returns (logits, position)."""
@@ -1227,7 +1231,7 @@ def prefill_buckets(buckets, tokens, *, on_chunk=None):
     lg, pos, total = None, 0, len(tokens)
     while pos < total:
         rest = total - pos
-        pf = min(buckets, key=lambda p: (-(-rest // p.chunk) * (p.chunk + _CHUNK_OVERHEAD_ROWS), -p.chunk))
+        pf = _prefill_bucket(buckets, rest)
         n = min(pf.chunk, rest)
         lg = pf.run_chunk(tokens[pos : pos + n], pos, return_logits=pos + n >= total)
         if on_chunk is not None:

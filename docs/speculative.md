@@ -60,7 +60,7 @@ decode paths share the per-visit rings.
 
 The verifier groups independent input mixes on disjoint cores and batches the Q/K/V message
 controllers across rows. Each controller retains its B1 reduction order. Grouping cuts the
-four-row verifier replay from 38.86 to 38.23 ms at a short prefix.
+four-row verifier replay from 39.03 to 38.56 ms at a short prefix.
 
 The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dynamic taps and
 O each use one sweep of their B1 weights. Head preparation and attention read
@@ -96,8 +96,9 @@ The target publishes the next anchor, absolute position and adaptive width. It s
 using replay costs measured at startup and a decaying estimate of proposal acceptance. With
 estimated conditional acceptance `a`, a width `R` yields an expected `1 + a + ... + a^(R-1)` IDs.
 
-An adaptive request starts with two rows if its projected overhead fits 0.3 ms per allowed
-decode ID. Each round charges its estimated replay time and credits the B1 time of its emitted
+An adaptive request starts with two rows if both its probe overhead and the cost of building
+draft context fit 0.3 ms per allowed decode ID. The prefill bucket schedule and startup
+measurements of each bucket's context trace give the context cost. Each round charges its estimated replay time and credits the B1 time of its emitted
 IDs. A wider round must fit the remaining budget even if every proposal is rejected. The
 budget allows one two-row probe. Width one switches the request to B1.
 
@@ -128,13 +129,13 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Three proposals, 1,088-slot draft global prefix | 6.52 ms median, 6.55 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
-| Four expert rows, union of 20 | 0.460 ms median, 0.464 ms p95 |
+| Four expert rows, union of 20 | 0.463 ms median, 0.466 ms p95 |
 | Four BF16 target head rows, serial | 7.708 ms median, 7.742 ms p95 |
 | Four BF16 target head rows, shared | 2.030 ms median, 2.058 ms p95 |
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
 | Batched attention against serial B1 | 88/88 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 39.04 ms median, 39.17 ms p95 |
+| Four-row target verify at `lmax=1120` | 38.56 ms median, 38.58 ms p95 |
 | B1 greedy in the same job | 19.08 ms median, 19.09 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure

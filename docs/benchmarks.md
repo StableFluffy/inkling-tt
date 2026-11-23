@@ -52,17 +52,22 @@ choices and usage. Values are median/p95.
 
 | Prompt | B1 decode, ms/ID | MTP decode, ms/ID | B1 TTFT, ms | MTP TTFT, ms |
 |---|---:|---:|---:|---:|
-| Chat | 19.37/19.39 | 19.44/19.49 | 137.00/137.09 | 137.30/137.39 |
-| Python | 19.36/19.43 | 16.20/16.21 | 147.90/148.08 | 148.20/148.29 |
-| Korean | 19.35/19.37 | 19.46/19.47 | 156.40/156.40 | 156.40/156.58 |
-| 1,580 tokens | 19.95/19.97 | 18.75/20.23 | 1041.20/1045.61 | 1040.90/1041.80 |
-| 7,820 tokens | 20.62/20.63 | 20.80/20.81 | 4695.40/4697.02 | 4738.60/4741.30 |
-| Long Python | 19.43/19.44 | 18.62/18.67 | 305.10/305.91 | 305.00/305.18 |
-| Math | 19.34/19.35 | 17.04/17.05 | 167.00/167.18 | 166.90/167.35 |
+| Chat | 19.36/19.39 | 19.46/19.49 | 137.10/137.28 | 137.30/137.48 |
+| Python | 19.40/19.43 | 17.06/17.09 | 148.40/148.67 | 148.20/148.29 |
+| Korean | 19.35/19.41 | 19.49/19.52 | 156.70/156.79 | 156.70/156.70 |
+| 1,580 tokens | 19.93/19.94 | 18.73/18.73 | 1044.60/1046.67 | 1042.50/1045.74 |
+| 7,820 tokens | 20.61/20.71 | 20.61/20.65 | 4692.30/4692.93 | 4695.30/4696.56 |
+| Long Python | 19.41/19.46 | 18.54/18.56 | 305.50/305.68 | 305.30/305.48 |
+| Math | 19.38/19.41 | 16.76/16.77 | 167.20/167.29 | 167.60/167.69 |
 
-The mean of the seven decode medians is 19.63 ms/ID in B1 mode and 18.62 ms/ID with MTP.
-At 7,820 tokens, building draft context adds about 43 ms to first-token latency. B1 is the
-server default.
+The mean of the seven decode medians is 19.63 ms/ID in B1 mode and 18.66 ms/ID with MTP.
+The largest increase in a decode median is 0.14 ms/ID. At 7,820 tokens, the decode medians
+are both 20.61 ms/ID and first-token latency differs by 3 ms.
+
+The same job starts a standalone B1 server with the larger dispatch ring for two short
+probes. It matches the resident MTP streams and decodes chat at 18.43/18.48 ms per ID and
+Korean at 18.45/18.46 ms per ID. The resident MTP median is 19.45 ms per ID for both.
+B1 is the server default.
 
 ## Accuracy
 
