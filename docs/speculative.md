@@ -59,9 +59,12 @@ The component tests run through the pinned dev image.
 
 ```sh
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_block.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
+INK_LMAX=2048 scripts/bench_decode.sh
 ```
 
 | Check | Result |
@@ -69,11 +72,18 @@ scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
 | Three proposals, 1,088-slot draft global prefix | 9.99 ms median, 10.03 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four expert rows, union of 20 | 0.485 ms median, 0.493 ms p95 |
+| Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
+| Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Staged local and global attention | 128/128 bitwise-equal rows |
 | Traced target state commits | 56/56 equal to sequential updates |
+| B1 greedy at `lmax=2048` | 20.16 ms median, 20.38 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
+
+The device drafter with serial B1 verification delivers 3.048 and 3.368 IDs per round on the
+33-token explanation and 35-token Python fixtures respectively. Both runs reproduce all 64
+generated IDs. These measurements cover draft acceptance with the serial B1 oracle.
 
 With the CPU study's estimated 2.307 emitted tokens per three-proposal round, a 20.0 ms B1
 baseline allows about 46.1 ms per round. At a 20-expert union, extrapolating the isolated
