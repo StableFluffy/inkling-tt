@@ -53,16 +53,16 @@ void kernel_main() {
             cb_push_back(0, block);
         }
 #ifdef PREFILL_WEIGHT
-        if (task == start) {
-            constexpr auto weight_args = TensorAccessorArgs<args.next_compile_time_args_offset()>();
-            const auto weight = TensorAccessor(weight_args, get_common_arg_val<uint32_t>(1), 4096);
-            cb_reserve_back(6, cols);
+        constexpr auto weight_args = TensorAccessorArgs<args.next_compile_time_args_offset()>();
+        const auto weight = TensorAccessor(weight_args, get_common_arg_val<uint32_t>(1), 4096);
+        for (uint32_t col = 0; col < cols; col += block) {
+            cb_reserve_back(6, block);
             const uint32_t data = get_write_ptr(6);
-            for (uint32_t col = 0; col < cols; ++col) {
-                noc_async_read<4096>(weight.get_noc_addr(col), data + col * 4096, 4096);
+            for (uint32_t c = 0; c < block; ++c) {
+                noc_async_read<4096>(weight.get_noc_addr(col + c), data + c * 4096, 4096);
             }
             noc_async_read_barrier();
-            cb_push_back(6, cols);
+            cb_push_back(6, block);
         }
 #endif
     }

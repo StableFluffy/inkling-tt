@@ -78,7 +78,7 @@ another 0.28 s on a 32k-token prompt.
 - On each repeat pass, the message reads share one normalized copy of the previous pass's final row state. Two packed query matrices cover all 12 layers. Each layer reads its four probability columns from the packed softmax output as it mixes the bank.
 - The message-gate kernel (`gate_compute.cpp`) reads the BF16 down-projection result directly. It evaluates `u * (1 - tanh(h W_f)) + m * tanh(h W_g)` in FP32 for each output tile.
 
-The 2048-row bucket uses `norm_compute.cpp` to normalize 32 rows at a time and write BF16 directly. The same program writes the two normalized halves of the controller down input into one buffer. The K and V controllers reuse the first half from Q when all three use the same sliding-window input. The kernel preserves TTNN's reduction order and BF16 rounding. It saves about 27 ms on a full 2048-row chunk.
+The 2048-row bucket uses `norm_compute.cpp` to normalize 32 rows at a time and write BF16 directly. The same program writes the two normalized halves of the controller down input into one buffer. The K and V controllers reuse the first half from Q when all three use the same sliding-window input. The kernel preserves TTNN's reduction order and BF16 rounding. It streams weights through an eight-tile buffer, which saves 256 KiB of L1 per worker compared with retaining all 72 weight tiles.
 
 ## Handoff to decode
 

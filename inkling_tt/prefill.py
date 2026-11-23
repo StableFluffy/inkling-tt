@@ -436,7 +436,7 @@ def _norm_program(tasks, cols, input_dtype, output_dtype, weighted, stride, offs
         _tile_cb(grid, 16, output_dtype, 8),
     ]
     if weighted:
-        cbs.append(_tile_cb(grid, 6, FP, cols))
+        cbs.append(_tile_cb(grid, 6, FP, 8))
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "norm_io.cpp"),

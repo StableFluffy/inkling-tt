@@ -88,9 +88,6 @@ void kernel_main() {
         cb_pop_front(4, 1);
 
         cb_wait_front(5, 1);
-        if constexpr (weighted) {
-            cb_wait_front(6, cols);
-        }
         pack_reconfig_data_format(16);
         for (uint32_t col = 0; col < cols; col += block) {
             cb_reserve_back(16, block);
@@ -101,15 +98,17 @@ void kernel_main() {
                 mul_tiles_bcast_cols(0, 5, col + c, 0, c);
             }
             if constexpr (weighted) {
+                cb_wait_front(6, block);
                 reconfig_data_format_srca(6);
                 copy_init(6);
                 for (uint32_t c = 0; c < block; ++c) {
-                    copy_tile(6, col + c, block + c);
+                    copy_tile(6, c, block + c);
                 }
                 sfpu_mul_bcast_row_init();
                 for (uint32_t c = 0; c < block; ++c) {
                     sfpu_mul_bcast_row(c, block + c);
                 }
+                cb_pop_front(6, block);
             }
             if constexpr (bf16) {
                 for (uint32_t c = 0; c < block; ++c) {
@@ -129,7 +128,4 @@ void kernel_main() {
     }
     cb_pop_front(1, 1);
     cb_pop_front(2, 1);
-    if constexpr (weighted) {
-        cb_pop_front(6, cols);
-    }
 }
