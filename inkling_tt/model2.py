@@ -86,6 +86,7 @@ class Ctx:
             self.dev.enable_program_cache()
         self.group_gates = self.shard_fusion and os.environ.get("INK_GROUP_GATES", "1") != "0"
         self.join_attention_prep = self.layout_fusion and os.environ.get("INK_JOIN_ATTN_PREP", "1") != "0"
+        self.paired_kv = single_stream and self.join_attention_prep and os.environ.get("INK_PAIR_KV", "1") != "0"
         # Decode-only rowvm rows (constants, bank, residual scratch) as row-major DRAM pages: one read per stripe.
         self.row_major_state = (
             self.visit_fusion and device.get_num_devices() == 1 and os.environ.get("INK_RM_STATE", "1") != "0"
@@ -499,8 +500,10 @@ class Layer:
         table[:W, :DR] = g(a + "relative_position_bias.proj").float().T * math.sqrt(HD)
         self.rel_table = c.up(table, BF, RM)
         self.wo = P(g(a + "o_proj.linear.weight"))
-        self.wk = P(g(a + "k_proj.linear.weight"))
-        self.wv = P(g(a + "v_proj.linear.weight"))
+        wk, wv = (KN(g(a + s + "_proj.linear.weight")) for s in "kv")
+        self.wk, self.wv = (dense.prepare_weight(dev, w, dd) for w in (wk, wv))
+        if c.paired_kv:
+            self.decode_kv = dense.prepare_decode_kv(dev, wk, wv)
         if self.is_global:
             self.k_taps = self._dyn_taps(g(a + "k_proj.sconv.static_weight"))
             self.v_taps = self._dyn_taps(g(a + "v_proj.sconv.static_weight"))
@@ -578,7 +581,8 @@ class Layer:
         c = self.c
         if c.shard_fusion and c.group_gates and c.message_fusion:
             gates = [self.gates[s] for s in "qkv"]
-            output_layouts = (self.dq.weight.input_shards, None, None) if c.join_attention_prep else (None,) * 3
+            kv_mem = L1 if c.paired_kv else None
+            output_layouts = (self.dq.weight.input_shards, kv_mem, kv_mem) if c.join_attention_prep else (None,) * 3
             if c.fused_message_down:
                 downs = [self.gate_down[s] for s in "qkv"]
                 if c.message_down_inputs and _message_down_ready(rows, messages):
@@ -634,7 +638,11 @@ class Layer:
             )
             rowvm.sink_tile(qrsg, col_offset=sink_col, out=sinkt)
 
-        kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
+        if c.paired_kv and xk.memory_config() == xv.memory_config():
+            kr, vr = c.kv_rows
+            rowvm.project_kv(xk, xv, self.decode_kv, kr, vr)
+        else:
+            kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
         if c.layout_fusion:
             k_dyn = dense.linear(xk, self.k_wproj) if self.is_global else None
             v_dyn = dense.linear(xv, self.v_wproj) if self.is_global else None
@@ -836,7 +844,7 @@ class Layer:
                 dtype=BF if weight is not None else FP,
                 convolution=(vs.conv[3], d.pm_taps, z, y),
                 round_residual=True,
-                memory_config=DRAM,
+                memory_config=L1 if self.c.paired_kv and weight is not None else DRAM,
             )[0]
             return y, bank, h
 
@@ -914,6 +922,10 @@ class InklingTT2:
             for p in range(NPASS if LOOP0 <= i < LOOP1 else 1):
                 self.visits[visit_slot(i, p)] = self._visit_type(self.c, i in GLOBAL_LAYERS, lmax)
         self._init_attention_glue()
+        if self.c.paired_kv:
+            self.c.kv_rows = tuple(
+                ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, HKV * HD)), BF, TILE, device, L1) for _ in range(2)
+            )
         if self.c.visit_fusion:
             rm = self.c.row_major_state
             self.c.visit_scratch = tuple(

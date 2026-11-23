@@ -10,7 +10,7 @@ small ones are bound by launch cost, not bandwidth.
 
 `prepare_weight(device, w, dtype)` looks up `(K, N, dtype)` in `_CONFIGS`, uploads the `[K, N]`
 weight and returns a `DenseWeight` handle with the program config, compute config and shard layouts.
-Shapes without an entry are rejected. There are two kinds of configuration:
+Shapes without an entry are rejected. The stock matmuls use two kinds of configuration:
 
 - **DRAM-sharded pipeline** (`pipe`). The weight is width-sharded across the eight DRAM banks, `32 *
   ceil(N / 256)` columns per bank. The activation is width-sharded in L1, and the output is
@@ -28,7 +28,7 @@ The decode graph uses these shapes, all with BF16 weights at HiFi4 and FP32 accu
 | Q, relative, sink, gate (fused) | 2304 x 6560 | pipe | 4 | 2 | 4 / 4 |
 | O | 3072 x 2304 | pipe | 4 | 2 | 4 / 2 |
 | LM head | 2304 x 201024 | pipe | 4 | 2 | 4 / 61 |
-| K, V | 2304 x 1024 | 1d | | 8 | |
+| K and V, one program | 2304 x 1024 each | bank-local | 8 | 8 | |
 | Dynamic conv taps (global) | 2304 x 32 | 1d | | 24 | |
 | Router | 2304 x 128 | 1d | | 36 | |
 | Message-gate down | 4608 x 64 | pipe | 8 | 6 | 4 / 1 |
@@ -62,20 +62,29 @@ read the four parts as column windows at offsets 0, 3072, 3456 and 3488 of the 6
 
 One fused matmul reads the activation once and is one launch instead of four. With the input shard
 conversion shared in both cases, the fused projection measured about 1.09x faster than four separate
-ones. K and V are not packed this way: on global layers and on repeat passes of the loop they have
-different inputs, and where the input is shared the packed version measured no faster.
+ones.
+
+## Paired K and V
+
+Decode runs K and V together with their own BF16 inputs. Each of 64 workers owns one output tile
+and streams its column of weights from one bank. The compute kernel keeps the same eight-tile
+K blocks and FP32 accumulation order as the 1D projections. The resulting rows stay in two
+persistent L1 buffers for convolution, normalization and the cache write.
+
+The pair takes about 25 µs in isolation, compared with 27 µs for the two 1D matmuls. It saves
+48 launches per token. The model keeps the original interleaved weights for prefill and uses
+about 226 MB of additional DRAM for the bank-local decode copies.
 
 ## Bandwidth
 
-Measured in isolation on the tested card, BF16 weights, HiFi4, weight bytes divided by matmul kernel
-time:
+Measured in isolation on the tested card, BF16 weights, HiFi4, weight bytes divided by warmed matmul time:
 
 | Projection | GB/s | Share of 512 GB/s |
 |---|---:|---:|
 | Q, relative, sink, gate (fused) | 470 | 92 % |
 | LM head | 489 | 95 % |
 | O | 451 | 88 % |
-| K or V | 358 | 70 % |
+| Paired K and V | 384 | 75 % |
 | Router | 74 | 15 % |
 | Dynamic conv taps | 26 | 5 % |
 
@@ -111,4 +120,4 @@ On the tested card restricted with `INK_GRID`, the parity fixtures produce ident
 
 Prefill reuses the decode weights. `linear_prefill_resident` runs a custom program that reads each
 DRAM-sharded weight tile once per chunk and keeps it in L1 for all rows of the chunk, with the same
-bank-adjacent worker assignment.
+bank-adjacent worker assignment and two-tile K blocks for Q and O.

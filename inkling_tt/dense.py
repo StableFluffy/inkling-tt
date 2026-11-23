@@ -442,6 +442,19 @@ def linear(
     return y
 
 
+def prepare_decode_kv(device, k, v):
+    """Pack each output column's K tiles together in bank-local DRAM."""
+    packed = torch.cat((k, v), dim=-1).reshape(72, 32, 64, 32).permute(1, 2, 0, 3).reshape(1, 1, 32, -1)
+    banks = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(7, 0))])
+    return ttnn.from_torch(
+        packed.contiguous(),
+        device=device,
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=_width_shards(banks, 32, 8 * 72 * 32, ttnn.BufferType.DRAM),
+    )
+
+
 def prepare_fused_weight(
     device,
     weights: tuple[torch.Tensor, ...],

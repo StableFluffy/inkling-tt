@@ -417,6 +417,73 @@ def _group_program(keys):
     return desc, programs
 
 
+@lru_cache(maxsize=8)
+def _kv_placement(device):
+    grid = device.compute_with_storage_grid_size()
+    preferred = device.get_optimal_dram_bank_to_logical_worker_assignment(ttnn.NOC.NOC_0, ttnn.MeshCoordinate(0, 0))
+    available = {(i % grid.x, i // grid.x) for i in range(grid.x * grid.y)}
+    tasks = []
+    for bank in range(8):
+        near = preferred[bank]
+        for lane in range(8):
+            col = bank * 8 + lane
+            x, y = min(available, key=lambda c: (abs(c[0] - near.x) + abs(c[1] - near.y), c))
+            available.remove((x, y))
+            tasks.append((x, y, col))
+    return tuple(tasks)
+
+
+@lru_cache(maxsize=8)
+def _kv_program(tasks, specs):
+    grid = _rects(tuple((x, y) for x, y, *_ in tasks))
+    rt = [(ttnn.CoreCoord(x, y), [col]) for x, y, col in tasks]
+    compute = ttnn.ComputeConfigDescriptor(
+        math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, math_approx_mode=False
+    )
+    unpack = [ttnn.UnpackToDestMode.Default] * 64
+    unpack[2] = ttnn.UnpackToDestMode.UnpackToDestFp32
+    compute.unpack_to_dest_mode = unpack
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "kv_io.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=[8],
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "kv_io.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=[8, *specs],
+            defines=[("KV_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "kv_compute.cpp"),
+            core_ranges=grid,
+            compile_time_args=[8],
+            config=compute,
+        ),
+    ]
+    cbs = [_cb(grid, 0, 2, 16), _cb(grid, 1, 2, 16), _cb(grid, 2, 4), _cb(grid, 16, 2)]
+    desc = ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs)
+    desc.custom_program_hash = ttnn.compute_program_descriptor_hash(desc)
+    return desc, kernels
+
+
+def project_kv(xk, xv, packed, k, v):
+    """Project two BF16 rows into preallocated K and V outputs."""
+    specs = tuple(a for t in (xk, k) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args())
+    tasks = _kv_placement(xk.device())
+    with _launch_lock:
+        desc, kernels = _kv_program(tasks, specs)
+        kernels[0].common_runtime_args = [packed.buffer_address()]
+        kernels[1].common_runtime_args = [t.buffer_address() for t in (xk, xv, k, v)]
+        desc.kernels = kernels
+        ttnn.generic_op([xk, xv, packed, k, v], desc)
+
+
 class _Group:
     """One generic launch for independent kernels on disjoint workers."""
 

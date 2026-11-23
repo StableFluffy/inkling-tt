@@ -1,6 +1,6 @@
 # Decode design
 
-A decode step is one trace replay: 703 device programs that run the 48 layer visits of one token and the LM head. The weight-streaming programs take about 15 ms of the 19 ms of kernel time per token. That is close to what reading the weights costs at the bandwidth the tested p150a sustains. A contiguous, bank-local read benchmark reaches 490 GB/s.
+A decode step is one trace replay: 655 device programs that run the 48 layer visits of one token and the LM head. The weight-streaming programs take about 15 ms of the 19 ms of kernel time per token. That is close to what reading the weights costs at the bandwidth the tested p150a sustains. A contiguous, bank-local read benchmark reaches 490 GB/s.
 
 Two rules shaped the design:
 
@@ -15,17 +15,17 @@ Device profile of one token on the tested card (13x10 workers, `lmax` 2048, BFP8
 |---|---:|---:|
 | Routed experts (gate/up, down) | 96 | 6.9 |
 | Q/relative/sink/gate and O projections | 96 | 4.6 |
-| LM head | 1 | 2.1 |
-| K/V and dynamic-tap projections | 112 | 1.5 |
-| Attention-residual mixes | 120 | 1.4 |
+| LM head | 1 | 1.9 |
+| K/V and dynamic-tap projections | 64 | 1.3 |
+| Attention-residual mixes | 120 | 1.2 |
 | Message-gate projections | 96 | 1.2 |
 | Router | 48 | 0.5 |
 | Fused attention | 48 | 0.4 |
 | Attention preparation (norms, conv, cache write) | 48 | 0.3 |
 | Readout, layout and small epilogues | 38 | 0.1 |
-| **Total** | **703** | **19.1** |
+| **Total** | **655** | **18.5** |
 
-The first four rows stream weights. The firmware span includes about 1 ms between programs. Unprofiled greedy decode runs at about 19.9 ms per token ([benchmarks.md](benchmarks.md)).
+The first four rows stream weights. The firmware span includes about 1 ms between programs. Unprofiled greedy decode runs at about 19.5 ms per token ([benchmarks.md](benchmarks.md)).
 
 ## From the first port to this release
 
@@ -48,7 +48,7 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 
 **Trace with persistent inputs.** `InklingTT2` (`inkling_tt/model2.py`) allocates every intermediate once and captures the whole step with `ttnn.begin_trace_capture`. Per-step data (token embedding row, positions, cache slots, masks) lives in device tensors that the host overwrites before each replay. Anything allocated or compiled after capture starts can alias trace memory, so the model and both prefill buckets run once eagerly before `capture()` is called.
 
-**Dense projections.** Batch-1 projections are matrix-vector products, bound by weight bandwidth. `inkling_tt/dense.py` picks a DRAM-sharded matmul configuration per shape, so each DRAM bank feeds the workers next to it. The four attention projections of a visit (Q, relative-bias query, sink, output gate) share one fused weight and one program. See [dense.md](dense.md).
+**Dense projections.** Batch-1 projections are matrix-vector products, bound by weight bandwidth. `inkling_tt/dense.py` picks a DRAM-sharded matmul configuration per shape, so each DRAM bank feeds the workers next to it. The four attention projections of a visit (Q, relative-bias query, sink, output gate) share one fused weight and one program. A second program streams both K and V matrices, each with its own input. See [dense.md](dense.md).
 
 **Routed experts.** Each visit routes to 8 of 128 experts. The stock indexed `sparse_matmul` reads only the routed experts too, but from tiles interleaved across all DRAM banks and in six programs. `inkling_tt/experts_stream.py` stores each expert as contiguous bank-local BFP8_B runs and reads the eight selected experts in two programs, about 146 µs per visit instead of 234 µs. Routing stays on device: the router writes expert IDs and weights to a buffer the expert kernels read. See [experts.md](experts.md).
 

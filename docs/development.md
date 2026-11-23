@@ -23,6 +23,7 @@ Model switches, read at model construction:
 |---|---|---|
 | `INKLING_EXPERTS` | `stream` | `stock`: TTNN `sparse_matmul` experts, without visit fusion |
 | `INK_ATTN_DECODE` | `1` | `0` runs decode attention through TTNN SDPA decode |
+| `INK_PAIR_KV` | `1` | `0` runs separate K and V projections during decode |
 | `INK_GRID` | unset | Restrict scheduling to `11x10` or `12x10` ([hardware.md](hardware.md)) |
 | `INK_LMAX` | test-specific | Context length used by the tests and benchmarks |
 

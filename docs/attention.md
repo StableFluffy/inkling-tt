@@ -33,8 +33,9 @@ The equations and rounding points are in [model.md](model.md).
 ## Before the kernel
 
 One matmul computes Q, R, the sink logits and the gate logits from the attention input
-([dense.md](dense.md)). The learned Q and R scales are folded into those weights at load time. Two
-more matmuls compute K and V; on global visits two small ones compute the dynamic taps.
+([dense.md](dense.md)). The model folds the learned Q and R scales into those weights at load time.
+A second program computes K and V from their respective inputs. Two small matmuls compute the
+dynamic taps on global visits.
 
 `rowvm.prepare_attention` then runs in one launch ([rowvm.md](rowvm.md)):
 

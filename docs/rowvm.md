@@ -86,7 +86,7 @@ visit:
 
 ```
 attention input row (usually written by the previous visit's last program)
-  -> Q/relative/sink/gate matmul, K matmul, V matmul
+  -> Q/relative/sink/gate matmul, paired K and V matmul
   -> prepare_attention      Q, R, sink; K/V conv, clip/RMS, cache write
   -> attention decode       (inkling_tt/attn_decode.py)
   -> O matmul
