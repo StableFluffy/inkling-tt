@@ -45,6 +45,7 @@ from inkling_tt.model import (
 
 BF, FP, RM, TILE = ttnn.bfloat16, ttnn.float32, ttnn.ROW_MAJOR_LAYOUT, ttnn.TILE_LAYOUT
 DRAM, L1 = ttnn.DRAM_MEMORY_CONFIG, ttnn.L1_MEMORY_CONFIG
+MTP_TAP_VISITS = {(5, 0): 0, (11, 1): 1, (17, 2): 2}
 
 
 class _DecodeBank(NamedTuple):
@@ -899,7 +900,10 @@ class InklingTT2:
     _layer_type = Layer
     _visit_type = Visit
 
-    def __init__(self, device, wpath, prec: Precision, lmax=2048, layers=None, log=print):
+    def __init__(self, device, wpath, prec: Precision, lmax=2048, layers=None, log=print, *, capture_taps=False):
+        n = 24 if layers is None else layers
+        if capture_taps and n != 24:
+            raise ValueError("MTP feature capture requires all 24 layers")
         self.c = self._ctx_type(device, prec)
         self.ops = Ops(self.c)
         self.ops.dummy = self.c.up(torch.zeros(1, 1, 1, E), BF, RM, L1)
@@ -908,7 +912,6 @@ class InklingTT2:
         self.embed = g("embed_tokens.weight")
         self.embed_norm = g("embed_tokens.embed_norm.weight").float()
         self.lmax = lmax
-        n = 24 if layers is None else layers
         self.layers = []
         for i in range(n):
             self.layers.append(self._layer_type(self.c, self.ops, self.wts, i))
@@ -951,6 +954,11 @@ class InklingTT2:
             )
         self.trace_id = None
         self.logits = None
+        self.taps = (
+            tuple(ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, D)), BF, TILE, device, DRAM) for _ in range(4))
+            if capture_taps
+            else None
+        )
         self._shift_cache = {}
 
     def _prepare_head(self, head):
@@ -1018,6 +1026,8 @@ class InklingTT2:
         x, bank = self.st.x, ops.bank0
 
         def run(layer, x, bank, p, messages=None):
+            if self.taps is not None and (tap := MTP_TAP_VISITS.get((layer.i, p))) is not None:
+                ttnn.copy(x, self.taps[tap])
             visit = self.visits[visit_slot(layer.i, p)]
             y = layer.forward(x, bank, visit, self.st, messages)
             if layer.block_boundary:
@@ -1047,6 +1057,8 @@ class InklingTT2:
         def run_range(start, stop, p, *, previous=None):
             nonlocal x, bank, attention_input
             for layer in layers[start:stop]:
+                if self.taps is not None and (tap := MTP_TAP_VISITS.get((layer.i, p))) is not None:
+                    ttnn.copy(x, self.taps[tap])
                 messages = None
                 if previous is not None:
                     prev_x, prev_bank = previous
@@ -1096,6 +1108,8 @@ class InklingTT2:
     def _readout(self, h):
         """Logits leave the graph row-major (host untilize of the tiled 201k row costs ~9 ms; device ~0.04 ms).
         Padded vocab columns are masked so the device argmax can never pick them."""
+        if self.taps is not None:
+            ttnn.copy(h, self.taps[3])
         if hasattr(self, "head_logits"):
             # One program copies the head's native shards into the row and reduces the masked argmax.
             rowvm.head_tail(_linear_to_shards(h, self.head), self.head_logits, self.head_index, VOCAB)

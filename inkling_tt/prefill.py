@@ -31,7 +31,7 @@ from inkling_tt.model import (
     W,
     visit_slot,
 )
-from inkling_tt.model2 import BF, DRAM, FP, RM, TILE, act, bf16, f32
+from inkling_tt.model2 import BF, DRAM, FP, MTP_TAP_VISITS, RM, TILE, act, bf16, f32
 
 ISQ = 1.0 / math.sqrt(HD)
 _ROUTER_K_BLOCK = 96
@@ -694,6 +694,7 @@ class Prefill:
         self._warmed = False
         self.dev.enable_program_cache()
         self.rows = _alloc(self.dev, (1, 1, chunk, D))
+        self.taps = tuple(_alloc(self.dev, self.rows.shape) for _ in range(4)) if m.taps is not None else None
         self.meta = _alloc(self.dev, (1, 8), ttnn.uint32, RM)
         self.tau = _alloc(self.dev, (1, chunk, 1, 1), FP)
         self.tau_col = _alloc(self.dev, (1, 1, chunk, 32), FP)
@@ -1127,6 +1128,8 @@ class Prefill:
                 entries = (*prev_bank, self.ops.rms(prev_x))
                 weights = tuple(self._depth_probabilities(entries, q) for q in self._message_queries)
             for layer in layers[start:stop]:
+                if self.taps is not None and (tap := MTP_TAP_VISITS.get((layer.i, p))) is not None:
+                    ttnn.copy(x, self.taps[tap])
                 messages = None
                 if previous is not None:
                     j = layer.i - LOOP0
@@ -1150,6 +1153,8 @@ class Prefill:
         run_range(LOOP1, len(layers), 0)
 
         h = self._input_norm(self.mix(bank, x, m.final_q, 1)[0], m.norm)
+        if self.taps is not None:
+            ttnn.copy(h, self.taps[3])
         _launch(
             _state_program, (_tasks(self.dev, D // 32), self.chunk // 32, 0, D // 32, True), (self.meta, h, self.last)
         )

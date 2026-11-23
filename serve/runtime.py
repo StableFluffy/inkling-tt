@@ -4,8 +4,11 @@ import torch
 import ttnn
 
 from inkling_tt import paths
+from inkling_tt.device import L1_SMALL_SIZE, TRACE_REGION_SIZE
 from inkling_tt.model import VOCAB, Precision
 from inkling_tt.model2 import InklingTT2
+
+DEVICE_PARAMS = {"l1_small_size": L1_SMALL_SIZE, "trace_region_size": TRACE_REGION_SIZE}
 
 
 def default_precision():
