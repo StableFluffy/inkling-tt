@@ -483,13 +483,17 @@ class Prefill:
         self.m, self.c, self.ops = m, m.c, m.ops
         self.chunk = chunk
         self.dev = m.c.dev
-        self._kv_program = _kv_projection_program(self.dev.compute_with_storage_grid_size(), chunk)
+        grid = self.dev.compute_with_storage_grid_size()
+        self._kv_program = _kv_projection_program(grid, chunk)
         self.body_trace = self.head_trace = None
         self._trace_enabled = trace
         self._message_dense = os.environ.get("INK_PREFILL_MESSAGE_DENSE", "1") == "1"
         self._broadcast_dense = os.environ.get("INK_PREFILL_DENSE", "broadcast") == "broadcast"
         self._retain_scores = os.environ.get("INK_PREFILL_KEEP_SCORES", "1") == "1"
-        score_tiles = int(os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", "160" if chunk > 1024 else "97"))
+        wide_score_tiles = 188 if grid.x * grid.y >= 130 else 160
+        score_tiles = int(
+            os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", str(wide_score_tiles if chunk > 1024 else 97))
+        )
         self._global_score_tiles = min(m.lmax // 32, max(0, score_tiles))
         self._warmed = False
         self.dev.enable_program_cache()
