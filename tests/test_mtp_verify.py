@@ -1,3 +1,7 @@
+import argparse
+import statistics
+import time
+
 import torch
 import ttnn
 
@@ -9,7 +13,7 @@ from inkling_tt.prefill import Prefill
 from serve.runtime import DEVICE_PARAMS, default_precision
 
 
-def main():
+def main(trace_only):
     dev = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
     try:
         lmax = 1056
@@ -42,14 +46,17 @@ def main():
             taps = torch.stack([ttnn.to_torch(t)[0, 0, : len(block)] for t in verifier.taps], dim=1)
             assert torch.equal(taps, expected_taps)
 
+        references = {}
         for pos in (len(prompt), 1023, 1024, lmax - len(block)):
             seed(pos)
-            expected = serial(pos)
+            expected = references[pos] = serial(pos)
             seed(pos)
             verifier.stage(block, pos)
             verifier.verify()
             check_outputs(expected)
             print(f"position {pos}: four rows match serial B1 logits and taps", flush=True)
+            if trace_only:
+                continue
             for rows in range(1, len(block) + 1):
                 seed(pos)
                 for r in range(rows):
@@ -75,10 +82,45 @@ def main():
         else:
             raise AssertionError("verify accepted a block that crosses lmax")
 
-        pf.close()
+        model.capture()
+        trace = ttnn.begin_trace_capture(dev, cq_id=0)
+        verifier.verify()
+        ttnn.end_trace_capture(dev, trace, cq_id=0)
+        try:
+            for pos, expected in references.items():
+                seed(pos)
+                verifier.stage(block, pos)
+                ttnn.execute_trace(dev, trace, cq_id=0, blocking=True)
+                check_outputs(expected)
+            print("four verify replays match the serial B1 logits and taps", flush=True)
+            pos = len(prompt)
+            times = [[], []]
+            for trial in range(12):
+                for kind in (0, 1) if trial % 2 == 0 else (1, 0):
+                    seed(pos)
+                    if kind:
+                        verifier.stage(block, pos)
+                    else:
+                        model.st.write(model.embed_row(block[0]), pos)
+                    ttnn.synchronize_device(dev)
+                    start = time.perf_counter()
+                    ttnn.execute_trace(dev, trace if kind else model.trace_id, cq_id=0, blocking=True)
+                    times[kind].append(1000 * (time.perf_counter() - start))
+            for name, samples in zip(("B1", "verify four rows"), times):
+                warm = samples[2:]
+                print(
+                    f"{name}: {statistics.median(warm):.2f} ms median, "
+                    f"{statistics.quantiles(warm, n=20, method='inclusive')[-1]:.2f} ms p95",
+                    flush=True,
+                )
+        finally:
+            ttnn.release_trace(dev, trace)
+            pf.close()
     finally:
         ttnn.close_device(dev)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--trace-only", action="store_true")
+    main(parser.parse_args().trace_only)

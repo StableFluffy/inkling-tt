@@ -1159,10 +1159,13 @@ def qkv_message_inputs(operands):
     return rows
 
 
-def qkv_message_projections(operands):
+def qkv_message_projections(operands, *, out=None):
     """Run the three independent controller epilogues in one dispatch."""
     group = _Group()
-    rows = tuple(message_project(*args, memory_config=mem, _group=group) for args, mem in operands)
+    rows = tuple(
+        message_project(*args, memory_config=mem, out=None if out is None else out[i], _group=group)
+        for i, (args, mem) in enumerate(operands)
+    )
     group.launch()
     return rows
 
@@ -1689,7 +1692,7 @@ def _message_down_program(accessors, groups, grid_width):
     return desc, kernels
 
 
-def message_down(operands):
+def message_down(operands, *, out=None):
     """BF16 h = round(RMSNorm(u) | RMSNorm(m) as BF16 @ W) for independent gates in one launch.
 
     Each operand is (u, m, W) with FP32 TILE [1,1,1,2304] rows and an interleaved BF16 TILE [4608,64]
@@ -1702,15 +1705,26 @@ def message_down(operands):
     workers = _MESSAGE_DOWN_STRIPES * len(operands)
     if workers > grid.x * grid.y:
         raise ValueError("message_down requires one worker per stripe per projection")
-    hs = []
-    for u, m, w in operands:
+    hs = (
+        out
+        if out is not None
+        else tuple(
+            ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, 64)), BF, TILE, device, ttnn.L1_MEMORY_CONFIG)
+            for _ in operands
+        )
+    )
+    if len(hs) != len(operands):
+        raise ValueError("message_down requires one destination per controller")
+    for (u, m, w), h in zip(operands, hs):
         for t in (u, m):
             _validate(t, (1, 1, 1, 2304))
             if t.dtype != FP or t.layout != TILE or t.is_sharded():
                 raise ValueError("message_down requires interleaved FP32 TILE rows")
         if w.dtype != BF or w.layout != TILE or w.is_sharded() or tuple(w.shape)[-2:] != (4608, 64):
             raise ValueError("message_down requires an interleaved BF16 TILE [4608,64] weight")
-        hs.append(ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, 64)), BF, TILE, device, ttnn.L1_MEMORY_CONFIG))
+        _validate(h, (1, 1, 1, 64))
+        if h.dtype != BF or h.layout != TILE or h.memory_config() != ttnn.L1_MEMORY_CONFIG:
+            raise ValueError("message_down requires interleaved L1 BF16 TILE outputs")
     spec = lambda t: tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args())
     accessors = (spec(operands[0][0]), spec(operands[0][1]), spec(operands[0][2]), spec(hs[0]))
     for (u, m, w), h in zip(operands, hs):
@@ -1724,5 +1738,5 @@ def message_down(operands):
         kernels[0].common_runtime_args = common
         kernels[1].common_runtime_args = common
         desc.kernels = kernels
-        ttnn.generic_op([t for u, m, w in operands for t in (u, m, w)] + hs[::-1], desc)
+        ttnn.generic_op([t for u, m, w in operands for t in (u, m, w)] + list(reversed(hs)), desc)
     return tuple(hs)

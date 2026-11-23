@@ -3,7 +3,7 @@
 The Inkling-2-Mini checkpoint ships a three-layer DSpark drafter in `mtp.safetensors`. The device
 drafter uses target features to propose several tokens for one pending token. A lossless round
 requires the target to reproduce B1 logits and state for each proposed input before committing the
-matching prefix. The eager verifier processes each visit in layer order across the block. It
+matching prefix. The verifier processes each visit in layer order across the block. It
 shares the LM head and the routed-expert weights across the verify rows.
 
 ## Draft context
@@ -78,7 +78,8 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Staged local and global attention | 128/128 bitwise-equal rows |
 | Traced target state commits | 56/56 equal to sequential updates |
-| B1 greedy at `lmax=2048` | 20.16 ms median, 20.38 ms p95 |
+| Four-row target verify at `lmax=1056` | 68.18 ms median, 68.25 ms p95 |
+| B1 greedy in the same job | 20.01 ms median, 20.06 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
@@ -87,8 +88,8 @@ The device drafter with serial B1 verification delivers 3.048 and 3.368 IDs per 
 33-token explanation and 35-token Python fixtures respectively. Both runs reproduce all 64
 generated IDs. These measurements cover draft acceptance with the serial B1 oracle.
 
-The eager verifier matches four serial B1 rows bitwise for logits and taps at four starting
-positions. Committing any prefix length reproduces serial B1 KV and convolution histories,
+The verifier replays four serial B1 rows bitwise for logits and taps at four starting
+positions after warming the graph and allocating its scratch. Committing any prefix length reproduces serial B1 KV and convolution histories,
 including a block that spans the local ring wrap and one that ends at the global cache limit.
 
 The OpenAI server uses the B1 decode path. The verifier shares the target LM head and experts

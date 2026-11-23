@@ -205,10 +205,14 @@ def _message_down_ready(rows, messages):
     )
 
 
-def _linear_to_shards(x, weight):
+def _linear_to_shards(x, weight, *, activation=None, out=None):
     """Use the tuned dense program and keep its native output shards."""
     if x.memory_config() != weight.input_shards:
-        x = ttnn.to_memory_config(x, weight.input_shards)
+        x = (
+            ttnn.to_memory_config(x, weight.input_shards)
+            if activation is None
+            else ttnn.interleaved_to_sharded(x, weight.input_shards, preallocated_output=activation)
+        )
     return ttnn.linear(
         x,
         weight.tensor,
@@ -216,6 +220,7 @@ def _linear_to_shards(x, weight):
         compute_kernel_config=weight.compute,
         memory_config=weight.output_shards,
         dtype=BF,
+        optional_output_tensor=out,
     )
 
 
@@ -303,7 +308,7 @@ class Ops:
         S, J = bank
         return (ttnn.add(S, self.c.mm(self.rowsel[J], self.rms(v))), J + 1)
 
-    def mix(self, bank, partial, qmat, nq, weight=None, dtype=FP):
+    def mix(self, bank, partial, qmat, nq, weight=None, dtype=FP, *, out=None):
         """AttnRes depth mixing: softmax over the J bank rows plus rms(partial), one column per query.
         With weight [1,1,nq,D], each output is additionally RMS-normalised with it (and cast to dtype)."""
         if isinstance(bank, _DecodeBank):
@@ -317,10 +322,11 @@ class Ops:
                     shared_prefix=True,
                     weight=weight,
                     dtype=dtype,
+                    out=out,
                 )
             )
         S, J = bank
-        return list(rowvm.attnres_mix(S, partial, qmat[2], J, weight=weight, dtype=dtype))
+        return list(rowvm.attnres_mix(S, partial, qmat[2], J, weight=weight, dtype=dtype, out=out))
         S = ttnn.add(S, self.c.mm(self.rowsel[J], self.rms(partial)))
         if nq == 1:
             lg = ttnn.add(ttnn.sum(ttnn.multiply(S, qmat[1]), dim=-1, keepdim=True), self.rowmask[J])
@@ -550,14 +556,14 @@ class Layer:
     def dsconv(self, x, xin, taps, wproj, S, dtype=BF):
         return rowvm.depthwise_conv(S, x, taps, dyn=dense.linear(xin, wproj), dtype=dtype)
 
-    def gate_msg(self, s, u, m, un=None, weight=None, *, out=None):
+    def gate_msg(self, s, u, m, un=None, weight=None, *, out=None, controller_out=None):
         dn, wf, wg = self.gates[s]
         ops, c = self.ops, self.c
         if u.shape[-2] == 1:
             project = c.visit_fusion and c.message_fusion and weight is not None
             if c.fused_message_down and project:
                 if c.message_down_inputs and un is None and _message_down_ready((u,), (m,)):
-                    h = rowvm.message_down([(u, m, self.gate_down[s])])[0]
+                    h = rowvm.message_down([(u, m, self.gate_down[s])], out=controller_out)[0]
                 else:
                     hin = rowvm.message_input(u, m, normalized_u=un, memory_config=L1)
                     h = rowvm.matvec_group([(hin, self.gate_down[s])])[0]
@@ -581,7 +587,7 @@ class Layer:
         a1 = ttnn.multiply(u, c.mm(h, wf), input_tensor_b_activations=[act("TANH"), act("RSUB", 1.0)])
         return ttnn.add(a1, ttnn.multiply(m, c.mm(h, wg), input_tensor_b_activations=[act("TANH")]))
 
-    def _gate_attention(self, rows, messages, norms, *, shared=False):
+    def _gate_attention(self, rows, messages, norms, *, shared=False, scratch=None):
         c = self.c
         if c.shard_fusion and c.group_gates and c.message_fusion:
             gates = [self.gates[s] for s in "qkv"]
@@ -590,13 +596,18 @@ class Layer:
             if c.fused_message_down:
                 downs = [self.gate_down[s] for s in "qkv"]
                 if c.message_down_inputs and _message_down_ready(rows, messages):
-                    hs = rowvm.message_down(zip(rows, messages, downs))
+                    hs = rowvm.message_down(
+                        zip(rows, messages, downs), out=None if scratch is None else scratch.qkv_down
+                    )
                 else:
                     controller_inputs = rowvm.qkv_message_inputs((u, m, L1) for u, m in zip(rows, messages))
                     hs = rowvm.matvec_group(zip(controller_inputs, downs))
                 return rowvm.qkv_message_projections(
-                    ((u, m, h, wf, wg, norm), mem)
-                    for u, m, h, (dn, wf, wg), norm, mem in zip(rows, messages, hs, gates, norms, output_layouts)
+                    (
+                        ((u, m, h, wf, wg, norm), mem)
+                        for u, m, h, (dn, wf, wg), norm, mem in zip(rows, messages, hs, gates, norms, output_layouts)
+                    ),
+                    out=None if scratch is None else scratch.qkv_blend,
                 )
             controller_inputs = rowvm.qkv_message_inputs(
                 (u, m, gate[0].input_shards) for u, m, gate in zip(rows, messages, gates)
@@ -610,9 +621,12 @@ class Layer:
         hn = self.ops.rms(rows[0]) if shared else None
         return tuple(self.gate_msg(s, u, m, hn, weight=norm) for s, u, m, norm in zip("qkv", rows, messages, norms))
 
-    def attention(self, xq, xk, xv, vs: Visit, st: Step, *, staging=None):
+    def attention(self, xq, xk, xv, vs: Visit, st: Step, *, staging=None, scratch=None):
         c = self.c
-        qrsg = _linear_to_shards(xq, self.dq.weight) if c.shard_fusion else dense.linear(xq, self.dq.weight)
+        if scratch is not None:
+            qrsg = _linear_to_shards(xq, self.dq.weight, activation=scratch.sharded_q, out=scratch.qrsg)
+        else:
+            qrsg = _linear_to_shards(xq, self.dq.weight) if c.shard_fusion else dense.linear(xq, self.dq.weight)
         r_col = HQ * HD
         sink_col = r_col + HQ * DR
         gate_col = sink_col + 32
@@ -642,23 +656,40 @@ class Layer:
             )
             rowvm.sink_tile(qrsg, col_offset=sink_col, out=sinkt)
 
+        def project(x, weight, dest):
+            return ttnn.linear(
+                x,
+                weight.tensor,
+                program_config=weight.program,
+                compute_kernel_config=weight.compute,
+                memory_config=dest.memory_config(),
+                optional_output_tensor=dest,
+            )
+
         kv_projection = None
-        if c.paired_kv and xk.memory_config() == xv.memory_config():
+        if scratch is None and c.paired_kv and xk.memory_config() == xv.memory_config():
             kr, vr = c.kv_rows
             if c.fused_kv_prep:
                 kv_projection = (xk, xv, self.decode_kv)
             else:
                 rowvm.project_kv(xk, xv, self.decode_kv, kr, vr)
-        else:
+        elif scratch is None:
             kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
+        else:
+            kr, vr = project(xk, self.wk, scratch.k), project(xv, self.wv, scratch.v)
         if c.layout_fusion:
             if staging is None:
                 caches, cache_pos, wrap = (vs.k, vs.v), st.pos_g, not self.is_global
             else:
                 staged_k, staged_v, _, cache_pos = staging
                 caches, wrap = (staged_k, staged_v), False
-            k_dyn = dense.linear(xk, self.k_wproj) if self.is_global else None
-            v_dyn = dense.linear(xv, self.v_wproj) if self.is_global else None
+            k_dyn = v_dyn = None
+            if self.is_global:
+                if scratch is None:
+                    k_dyn, v_dyn = dense.linear(xk, self.k_wproj), dense.linear(xv, self.v_wproj)
+                else:
+                    k_dyn = project(xk, self.k_wproj, scratch.k_dyn)
+                    v_dyn = project(xv, self.v_wproj, scratch.v_dyn)
             if c.join_attention_prep:
                 rowvm.prepare_attention(
                     qrsg,
@@ -725,7 +756,7 @@ class Layer:
                 out=c.gated_shards,
                 staged=None if staging is None else staging[:3],
             )
-            return _linear_to_shards(c.gated_shards, self.wo)
+            return _linear_to_shards(c.gated_shards, self.wo, out=None if scratch is None else scratch.attended)
         if c.position_fusion:
             bias = rowvm.relative_bias_from_position(
                 rp,
@@ -786,34 +817,60 @@ class Layer:
         return self._forward(x, bank, vs, st, messages)[0]
 
     def _forward(
-        self, x, bank, vs, st, messages=None, *, attention_input=None, next_mix=None, staging=None, defer_experts=False
+        self,
+        x,
+        bank,
+        vs,
+        st,
+        messages=None,
+        *,
+        attention_input=None,
+        next_mix=None,
+        staging=None,
+        defer_experts=False,
+        scratch=None,
     ):
         ops, d = self.ops, self.dec
         block_residual = x
+        fp_inputs = None if scratch is None else scratch.inputs_fp
+        bf_inputs = None if scratch is None else scratch.inputs_bf
+
+        def mix_attention(weight=None, dtype=FP, nq=1):
+            buffers = fp_inputs if dtype == FP else bf_inputs
+            return ops.mix(
+                bank, x, d.q_attn, nq, weight=weight, dtype=dtype, out=None if buffers is None else buffers[:nq]
+            )
+
         if self.is_global:
             if d.q_attn is None:
                 xq = xk = xv = f32(x)
             elif messages is None:
-                xq, xk, xv = ops.mix(bank, x, d.q_attn, 3, weight=d.norm_qkv, dtype=BF)
+                xq, xk, xv = mix_attention(d.norm_qkv, BF, 3)
             else:
-                xq, xk, xv = ops.mix(bank, x, d.q_attn, 3)
+                xq, xk, xv = mix_attention(nq=3)
             if messages is not None:
-                xq, xk, xv = self._gate_attention((xq, xk, xv), messages, (d.norm_q, d.norm_k, d.norm_v))
+                xq, xk, xv = self._gate_attention(
+                    (xq, xk, xv), messages, (d.norm_q, d.norm_k, d.norm_v), scratch=scratch
+                )
         else:
             if d.q_attn is None:
-                xq = xk = xv = ops.rms(x, d.norm_in, BF)
+                xq = xk = xv = (
+                    ops.rms(x, d.norm_in, BF)
+                    if scratch is None
+                    else rowvm.rms_norm(x, d.norm_in, dtype=BF, out=bf_inputs[0])
+                )
             elif messages is None:
                 xq = xk = xv = attention_input
                 if xq is None:
-                    xq = xk = xv = ops.mix(bank, x, d.q_attn, 1, weight=d.norm_in, dtype=BF)[0]
+                    xq = xk = xv = mix_attention(d.norm_in, BF)[0]
             else:
-                h = attention_input if attention_input is not None else ops.mix(bank, x, d.q_attn, 1)[0]
-                xq, xk, xv = self._gate_attention((h,) * 3, messages, (d.norm_in,) * 3, shared=True)
-        a = self.attention(xq, xk, xv, vs, st, staging=staging)
+                h = attention_input if attention_input is not None else mix_attention()[0]
+                xq, xk, xv = self._gate_attention((h,) * 3, messages, (d.norm_in,) * 3, shared=True, scratch=scratch)
+        a = self.attention(xq, xk, xv, vs, st, staging=staging, scratch=scratch)
         if self.block_boundary and not isinstance(bank, _DecodeBank):
             bank = ops.bank_append(bank, block_residual)
         if self.c.visit_fusion:
-            z_bf, z_fp, xm = self.c.visit_scratch
+            z_bf, z_fp, xm = self.c.visit_scratch if scratch is None else scratch.visit
             z = z_bf if self.block_boundary else z_fp
             residual = None if self.block_boundary else block_residual
             append = None
@@ -832,7 +889,7 @@ class Layer:
                 J,
                 weight=d.norm_post if messages is None else None,
                 dtype=BF if messages is None else FP,
-                out=(xm,) if messages is None else None,
+                out=(xm,) if messages is None else None if scratch is None else (scratch.mixed_fp,),
                 memory_config=L1 if messages is None else DRAM,
                 convolution=(vs.conv[2], d.pa_taps, residual, z),
                 bank_start=start,
@@ -840,7 +897,14 @@ class Layer:
                 append=append,
             )[0]
             if messages is not None:
-                mixed = self.gate_msg("mlp", mixed, messages[3], weight=d.norm_post, out=xm)
+                mixed = self.gate_msg(
+                    "mlp",
+                    mixed,
+                    messages[3],
+                    weight=d.norm_post,
+                    out=xm,
+                    controller_out=None if scratch is None else scratch.mlp_down,
+                )
             if defer_experts:
                 return mixed, bank, z
             branch = self._visit_moe(mixed, vs)

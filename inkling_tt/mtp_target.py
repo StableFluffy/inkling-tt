@@ -103,7 +103,17 @@ class TargetVerify:
         if (
             model.trace_id is not None
             or len(model.layers) != 24
-            or not (c.visit_fusion and c.fused_attn_decode and c.fused_router and c.fused_head_tail)
+            or model.lmax % 32
+            or not 32 <= model.lmax <= 32768
+            or not (
+                c.fused_attn_decode
+                and c.join_attention_prep
+                and c.fused_router
+                and c.fused_head_tail
+                and c.fused_message_down
+                and c.message_down_inputs
+                and c.message_fusion
+            )
         ):
             raise ValueError("Create verify before capture with the full fused B1 target")
         self.model, self.rows = model, proposals + 1
@@ -114,10 +124,31 @@ class TargetVerify:
         self.slots = tuple(c.up(torch.tensor([r], dtype=torch.int32), ttnn.int32, RM) for r in range(self.rows))
         bank_layout = RM if c.row_major_state else TILE
         self.banks = tuple(c.up(torch.zeros(1, 1, 32, D), FP, bank_layout, L1) for _ in range(self.rows))
+        row = lambda size, dtype=BF, mem=DRAM: ttnn.allocate_tensor_on_device(
+            ttnn.Shape((1, 1, 1, size)), dtype, TILE, device, mem
+        )
+        layer = model.layers[0]
+        q_weight, o_weight = layer.dq.weight, layer.wo
         self.scratch = tuple(
-            tuple(
-                ttnn.allocate_tensor_on_device(t.shape, t.dtype, t.layout, device, t.memory_config())
-                for t in c.visit_scratch
+            SimpleNamespace(
+                visit=tuple(
+                    ttnn.allocate_tensor_on_device(t.shape, t.dtype, t.layout, device, t.memory_config())
+                    for t in c.visit_scratch
+                ),
+                inputs_fp=tuple(row(D, FP) for _ in range(3)),
+                inputs_bf=tuple(row(D) for _ in range(3)),
+                qkv_down=tuple(row(64, mem=L1) for _ in range(3)),
+                qkv_blend=(row(D, mem=q_weight.input_shards), row(D), row(D)),
+                mixed_fp=row(D, FP),
+                mlp_down=(row(64, mem=L1),),
+                messages=tuple(row(D, FP) for _ in range(4)),
+                sharded_q=row(D, mem=q_weight.input_shards),
+                qrsg=row(q_weight.n, mem=q_weight.output_shards),
+                k=row(HKV * HD),
+                v=row(HKV * HD),
+                k_dyn=row(32),
+                v_dyn=row(32),
+                attended=row(o_weight.n, mem=o_weight.output_shards),
             )
             for _ in range(self.rows)
         )
@@ -162,35 +193,28 @@ class TargetVerify:
 
     def verify(self):
         m = self.model
-        c = m.c
         states = [(step.x, _DecodeBank(bank, 0, 1), None) for step, bank in zip(self.steps, self.banks)]
-        scratch = c.visit_scratch
-        try:
-            states = self._range(0, LOOP0, 0, states)
-            prefix = states
-            states = self._range(LOOP0, LOOP1, 0, states)
-            for p in range(1, NPASS):
-                reenter = [
-                    (x, bank._replace(tail_start=1 + p * ((LOOP1 - LOOP0) // NB)), None) for x, bank, _ in prefix
-                ]
-                states = self._range(LOOP0, LOOP1, p, reenter, states)
-            states = self._range(LOOP1, len(m.layers), 0, states)
-            for i, (_, _, hidden) in enumerate(states):
-                _tile_row(hidden, self.taps[3], target=i)
-            head = m.head
-            ttnn.interleaved_to_sharded(self.taps[3], head.input_shards, preallocated_output=self.head_input)
-            ttnn.linear(
-                self.head_input,
-                head.tensor,
-                program_config=head.program,
-                compute_kernel_config=head.compute,
-                memory_config=head.output_shards,
-                optional_output_tensor=self.head_output,
-            )
-            for i, (logits, index) in enumerate(zip(self.logits, self.ids)):
-                rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
-        finally:
-            c.visit_scratch = scratch
+        states = self._range(0, LOOP0, 0, states)
+        prefix = states
+        states = self._range(LOOP0, LOOP1, 0, states)
+        for p in range(1, NPASS):
+            reenter = [(x, bank._replace(tail_start=1 + p * ((LOOP1 - LOOP0) // NB)), None) for x, bank, _ in prefix]
+            states = self._range(LOOP0, LOOP1, p, reenter, states)
+        states = self._range(LOOP1, len(m.layers), 0, states)
+        for i, (_, _, hidden) in enumerate(states):
+            _tile_row(hidden, self.taps[3], target=i)
+        head = m.head
+        ttnn.interleaved_to_sharded(self.taps[3], head.input_shards, preallocated_output=self.head_input)
+        ttnn.linear(
+            self.head_input,
+            head.tensor,
+            program_config=head.program,
+            compute_kernel_config=head.compute,
+            memory_config=head.output_shards,
+            optional_output_tensor=self.head_output,
+        )
+        for i, (logits, index) in enumerate(zip(self.logits, self.ids)):
+            rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
         return self.logits, self.ids
 
     def _range(self, first, stop, pass_id, states, previous=None):
@@ -215,8 +239,8 @@ class TargetVerify:
                         m.dec_msg_q[layer.i - LOOP0][2],
                         prev_bank.count - 2,
                         bank_start=prev_bank.tail_start + 1,
+                        out=self.scratch[i].messages,
                     )
-                m.c.visit_scratch = self.scratch[i]
                 mixed, bank, residual = layer._forward(
                     x,
                     bank,
@@ -226,6 +250,7 @@ class TargetVerify:
                     attention_input=attention_input,
                     staging=(staged.k, staged.v, self.steps[0].pos_g, row_slot),
                     defer_experts=True,
+                    scratch=self.scratch[i],
                 )
                 ids, gamma = self.routes[i]
                 rowvm.fused_router(mixed, layer.router_w.tensor, layer.dec.router_b, ids_out=ids, gamma_out=gamma)
