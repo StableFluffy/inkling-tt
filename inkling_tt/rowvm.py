@@ -14,6 +14,7 @@ BF = ttnn.bfloat16
 TILE = ttnn.TILE_LAYOUT
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "rowvm"
 _RECT = os.environ.get("INK_ROWVM_RECT", "1") != "0"
+CONV_RING_ROWS = 32
 _MIX_CHUNK = int(os.environ.get("INK_MIX_CHUNK", "128"))
 _ZONES = [("ROWVM_ZONES", "1")] if os.environ.get("INK_ROWVM_ZONES") == "1" else []
 
@@ -226,9 +227,12 @@ def _program(
         ]
     )
     defines = list(task_defines)
+    position_index = 0
     if compute_args[0] in _COLLECTIVES:
         op, _, flags, _, _, stripes = compute_args
         is_mix = op in _MIX_OPS
+        output_count = len(cores) // stripes if is_mix else 0
+        position_index = output_count + len(cores)
         pages = (stripes + 15) // 16 if is_mix else 1
         for index, num_pages in ((8, pages), (9, 1), (18, 1), (19, 1)):
             cbs.append(_cb(grid, index, 4, num_pages))
@@ -242,7 +246,7 @@ def _program(
             ("ROWVM_COLLECTIVE", "1"),
             ("ROWVM_STRIPES", str(stripes)),
             ("ROWVM_AGG_PAGES", str(pages)),
-            ("ROWVM_OUTPUTS", str(len(cores) // stripes if is_mix else 0)),
+            ("ROWVM_OUTPUTS", str(output_count)),
             ("ROWVM_SECOND_PASS", str(int(second_pass))),
             ("ROWVM_RMS_ONLY", str(int(not is_mix))),
             ("ROWVM_APPEND_BANK", str(int(append_bank))),
@@ -262,7 +266,11 @@ def _program(
     if wait_for_kv:
         semaphores.append(ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, grid, 0))
         defines.append(("ROWVM_WAIT_KV", "1"))
+    read_args = _io_args(readers, task_cols)
     write_args = _io_args(writers, task_cols)
+    history_ring = any(s[1] == 4 and s[13] for s in readers)
+    if history_ring:
+        defines.append(("ROWVM_POSITION_INDEX", str(position_index)))
     write_defines = [*defines, ("ROWVM_WRITE", "1")]
     if compute_args[0] in (_RMS, _L2) and writers[0][5] > compute_args[1]:
         write_defines.append(("ROWVM_PAD_HEAD", "1"))
@@ -271,14 +279,18 @@ def _program(
         write_defines.extend([("ROWVM_ROUTER", "1"), ("ROWVM_INDEX_ARGS", str(len(write_args)))])
         write_args.extend(index_args)
     if position_args:
-        cbs.extend((_cb(grid, 10, 2), _cb(grid, 30, 4, page_size=64)))
-        write_defines.extend(
-            [
-                ("ROWVM_CACHE_POSITION_ARGS", str(len(write_args))),
-                ("ROWVM_CACHE_WRAP", str(compute_args[4])),
-            ]
-        )
+        cbs.append(_cb(grid, 30, 4, page_size=128 if history_ring else 64))
+        if history_ring:
+            defines.append(("ROWVM_POSITION_ARGS", str(len(read_args))))
+            write_defines.append(("ROWVM_POSITION_WRITER_OFFSET", "64"))
+            read_args.extend(position_args)
+        write_defines.append(("ROWVM_POSITION_ARGS", str(len(write_args))))
         write_args.extend(position_args)
+        if compute_args[0] in _KV_OPS:
+            cbs.append(_cb(grid, 10, 2))
+            write_defines.append(("ROWVM_CACHE_WRAP", str(compute_args[4])))
+    if history_ring:
+        task_defines = [*task_defines, ("ROWVM_INDEXED_CONV", "1")]
     rt_args = [(c, [task]) for task, c in enumerate(cores)] if base is None else []
     compute = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4,
@@ -304,7 +316,7 @@ def _program(
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "io.cpp"),
             core_ranges=grid,
-            compile_time_args=_io_args(readers, task_cols),
+            compile_time_args=read_args,
             runtime_args=rt_args,
             defines=defines,
             config=ttnn.ReaderConfigDescriptor(),
@@ -729,17 +741,15 @@ def update_kv(
         (_CONV_V, v, v_cache, v_history, v_taps, v_dyn),
     ):
         _row_window(x, 1024, 0, row=row)
-        _validate(history, (1, 1, 4, 1024))
-        _validate(taps, history.shape)
+        ring = _conv_history(history, taps, 1024, position)
+        state_rows = 1 if ring else 4
         length = cache.shape[-2]
         _validate(cache, (1, 8, length, 128))
-        if length < 32 or length % 32 or (wrap and length & (length - 1)) or cache.dtype != BF:
+        if length < 32 or length % 32 or cache.dtype != BF:
             raise ValueError("invalid BF16 cache shape or ring length")
-        if history.dtype != FP:
-            raise ValueError("rowvm cache convolution history must use float32")
         readers = [
             _stripe(x, 128, 1024, row=row),
-            _stripe(history, 128, 1024, rows=3),
+            _stripe(history, 128, 1024, rows=3, cache_length=ring),
             _stripe(taps, 128, 1024, rows=4),
         ]
         if dyn is not None:
@@ -748,7 +758,7 @@ def update_kv(
         _run(
             (op, 128, 2 | (4 if dyn is not None else 0), _bits(threshold), int(wrap)),
             readers,
-            [_Region(cache, 128, cache_length=length), _stripe(history, 128, 1024, rows=4)],
+            [_Region(cache, 128, cache_length=length), _stripe(history, 128, 1024, rows=state_rows, cache_length=ring)],
             8,
             position=position,
             group=group,
@@ -1003,13 +1013,20 @@ def sigmoid_gate(x, logits, *, dtype=BF, out=None, memory_config=None):
     return _elementwise(_GATE, x, logits, dtype=dtype, out=out, memory_config=memory_config)
 
 
-def depthwise_conv(history, x, taps, *, dyn=None, dtype=FP, out=None, memory_config=None):
-    """Shift FP32 history in place and apply four pre-scaled taps."""
-    width = _width(x)
-    _validate(history, (1, 1, 4, width))
-    _validate(taps, history.shape)
+def _conv_history(history, taps, width, position):
+    ring = CONV_RING_ROWS if position is not None and history.shape[-2] == CONV_RING_ROWS else 0
+    _validate(history, (1, 1, ring or 4, width))
+    _validate(taps, (1, 1, 4, width))
     if history.dtype != FP:
         raise ValueError("rowvm convolution history must use float32")
+    return ring
+
+
+def depthwise_conv(history, x, taps, *, dyn=None, dtype=FP, out=None, memory_config=None, position=None):
+    """Apply four pre-scaled taps and update the FP32 history."""
+    width = _width(x)
+    ring = _conv_history(history, taps, width, position)
+    state_rows = 1 if ring else 4
     if history.buffer_unique_id() in (x.buffer_unique_id(), taps.buffer_unique_id()):
         raise ValueError("rowvm convolution history cannot alias input or taps")
     limit = 128
@@ -1021,7 +1038,7 @@ def depthwise_conv(history, x, taps, *, dyn=None, dtype=FP, out=None, memory_con
     chunk, tasks = _stripes(width, limit)
     readers = [
         _stripe(x, chunk, width),
-        _stripe(history, chunk, width, rows=3),
+        _stripe(history, chunk, width, rows=3, cache_length=ring),
         _stripe(taps, chunk, width, rows=4),
     ]
     if dyn is not None:
@@ -1030,26 +1047,31 @@ def depthwise_conv(history, x, taps, *, dyn=None, dtype=FP, out=None, memory_con
     return _run(
         (_CONV, chunk, (2 if dtype == BF else 0) | (4 if dyn is not None else 0)),
         readers,
-        [_stripe(y, chunk, width), _stripe(history, chunk, width, rows=4)],
+        [_stripe(y, chunk, width), _stripe(history, chunk, width, rows=state_rows, cache_length=ring)],
         tasks,
+        position=position if ring else None,
     )
 
 
-def conv_residual(history, x, taps, residual, *, out=None):
-    """Shift convolution history, round the convolution, and add the residual in BF16."""
+def conv_residual(history, x, taps, residual, *, out=None, position=None):
+    """Update the convolution history, round the convolution, and add the residual in BF16."""
     width = _width(x)
     _validate(residual, x.shape)
-    _validate(history, (1, 1, 4, width))
-    _validate(taps, history.shape)
-    if history.dtype != FP:
-        raise ValueError("rowvm convolution history must use float32")
+    ring = _conv_history(history, taps, width, position)
+    state_rows = 1 if ring else 4
     chunk, stripes = _stripes(width, 128)
     y = _output(x, x.shape, BF, out, None)
     return _run(
         (_CONV_ADD, chunk, 2 | 16),
-        [_stripe(t, chunk, width, rows=n) for t, n in ((x, 1), (history, 3), (taps, 4), (residual, 1))],
-        [_stripe(y, chunk, width), _stripe(history, chunk, width, rows=4)],
+        [
+            _stripe(x, chunk, width),
+            _stripe(history, chunk, width, rows=3, cache_length=ring),
+            _stripe(taps, chunk, width, rows=4),
+            _stripe(residual, chunk, width),
+        ],
+        [_stripe(y, chunk, width), _stripe(history, chunk, width, rows=state_rows, cache_length=ring)],
         stripes,
+        position=position if ring else None,
     )
 
 
@@ -1200,6 +1222,7 @@ def attnres_mix(
     append=None,
     round_residual=False,
     partial_row=0,
+    position=None,
 ):
     """Read a normalized bank with up to four pre-scaled queries.
 
@@ -1259,10 +1282,10 @@ def attnres_mix(
         if nq != 1:
             raise ValueError("a convolution feeding a mix requires a single query")
         history, taps, residual, z = convolution
-        _validate(history, (1, 1, 4, width))
-        _validate(taps, history.shape)
+        ring = _conv_history(history, taps, width, position)
+        state_rows = 1 if ring else 4
         _validate(z, row_shape)
-        if history.dtype != FP or z.dtype != (BF if residual is None or round_residual else FP):
+        if z.dtype != (BF if residual is None or round_residual else FP):
             raise ValueError("invalid convolution history or residual output precision")
         if residual is not None:
             _validate(residual, row_shape)
@@ -1275,13 +1298,13 @@ def attnres_mix(
         readers.extend(
             (
                 _stripe(partial, chunk, width, row=partial_row),
-                _stripe(history, chunk, width, rows=3),
+                _stripe(history, chunk, width, rows=3, cache_length=ring),
                 _stripe(taps, chunk, width, rows=4),
             )
         )
         if residual is not None:
             readers.append(_stripe(residual, chunk, width))
-        writers.extend((_stripe(history, chunk, width, rows=4), _stripe(z, chunk, width)))
+        writers.extend((_stripe(history, chunk, width, rows=state_rows, cache_length=ring), _stripe(z, chunk, width)))
         op = _CONV_MIX
     if append is not None:
         entry, row = append
@@ -1299,6 +1322,7 @@ def attnres_mix(
         nq * stripes,
         task_cols=stripes,
         query_outputs=ys,
+        position=position if convolution is not None and ring else None,
     )
     return ys
 

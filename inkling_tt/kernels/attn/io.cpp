@@ -17,16 +17,12 @@ constexpr bool streaming = split_tiles > chunk_tiles;
 constexpr uint32_t gate_tile = get_compile_time_arg_val(2);
 constexpr uint32_t grid_width = get_compile_time_arg_val(3);
 constexpr uint32_t first_head = get_compile_time_arg_val(4);
-#ifdef ATTN_STAGED
-constexpr uint32_t operand_count = 12;
-#ifdef ATTN_WRITER
-constexpr uint32_t staged_scratch = 23;
+#ifdef ATTN_RING_TILES
+constexpr uint32_t ring_tiles = ATTN_RING_TILES;
 #else
-constexpr uint32_t staged_scratch = 22;
+constexpr uint32_t ring_tiles = cache_tiles;
 #endif
-#else
 constexpr uint32_t operand_count = 9;
-#endif
 
 uint64_t peer_addr(uint32_t head, uint32_t split, uint32_t addr) {
     const uint32_t xy = get_common_arg_val<uint32_t>(operand_count + (head - first_head) * splits + split);
@@ -45,10 +41,10 @@ auto operand(uint32_t bytes) {
     return TensorAccessor(args, get_common_arg_val<uint32_t>(I), bytes);
 }
 
-template <bool Values, class Accessor>
-void read_cache(const Accessor& cache, uint32_t head, const Work& work, uint32_t cb, uint32_t pos, uint32_t start) {
+template <class Accessor>
+void read_cache(const Accessor& cache, uint32_t head, const Work& work, uint32_t cb, [[maybe_unused]] uint32_t pos) {
     const uint32_t count = work.tile_count * dim_tiles;
-    const uint32_t first = (head * cache_tiles + work.first_tile) * dim_tiles;
+    const uint32_t first = head * ring_tiles * dim_tiles;
     const uint32_t dst = get_write_ptr(cb);
     // Interleaved pages start at the same bank for many workers. Rotate the
     // issue order to use more banks while preserving the CB's tile order.
@@ -57,57 +53,48 @@ void read_cache(const Accessor& cache, uint32_t head, const Work& work, uint32_t
         tile -= count;
     }
     for (uint32_t i = 0; i < count; ++i) {
-        noc_async_read<bf_tile>(cache.get_noc_addr(first + tile), dst + tile * bf_tile, bf_tile);
-        tile = tile + 1 == count ? 0 : tile + 1;
-    }
-#ifdef ATTN_STAGED
-    const auto staged = operand<Values ? 10 : 9>(bf_tile);
-    const uint32_t tmp = get_write_ptr(staged_scratch);
-    for (uint32_t col = 0; col < dim_tiles; ++col) {
-        bool loaded = false;
-        for (uint32_t p = start; p <= pos && p - start < 8; ++p) {
-            const uint32_t slot = p % (cache_tiles * 32);
-            const uint32_t key_tile = slot / 32;
-            if (key_tile < work.first_tile || key_tile >= work.first_tile + work.tile_count) {
+        const uint32_t virtual_tile = work.first_tile + tile / dim_tiles;
+        const uint32_t col = tile % dim_tiles;
+        uint32_t physical_tile = virtual_tile;
+#ifdef ATTN_RING_TILES
+        const uint32_t current = pos / 32;
+        if (current >= cache_tiles) {
+            const uint32_t absolute = current - ((current - virtual_tile) & (cache_tiles - 1));
+            physical_tile = absolute % ring_tiles;
+            if (absolute == current && pos % 32 != 31) {
+                // Rebuild the original B1 tile using both ends of the live window.
+                const uint32_t older = (absolute - cache_tiles) % ring_tiles;
+                const uint32_t boundary = pos % 32 + 1;
+                for (uint32_t face = 0; face < 4; ++face) {
+                    const uint32_t row = face / 2 * 16;
+                    const uint32_t newer_rows = boundary <= row ? 0 : boundary - row < 16 ? boundary - row : 16;
+                    const uint32_t offset = face * 512;
+                    const uint32_t to = dst + tile * bf_tile + offset;
+                    const uint32_t bytes = newer_rows * bf_row;
+                    if (bytes) {
+                        noc_async_read(cache.get_noc_addr(first + physical_tile * dim_tiles + col, offset), to, bytes);
+                    }
+                    if (bytes < 512) {
+                        noc_async_read(cache.get_noc_addr(first + older * dim_tiles + col, offset + bytes),
+                                       to + bytes, 512 - bytes);
+                    }
+                }
+                tile = tile + 1 == count ? 0 : tile + 1;
                 continue;
             }
-            if (!loaded) {
-                noc_async_read<bf_tile>(staged.get_noc_addr(head * dim_tiles + col), tmp, bf_tile);
-                noc_async_read_barrier();
-                loaded = true;
-            }
-            const uint32_t target = dst + ((key_tile - work.first_tile) * dim_tiles + col) * bf_tile;
-            const uint32_t row = slot % 32;
-            for (uint32_t f = 0; f < 2; ++f) {
-                const uint32_t from = tmp + f * 512 + (p - start) * bf_row;
-                const uint32_t to = target + (row / 16 * 2 + f) * 512 + (row % 16) * bf_row;
-                noc_async_read<bf_row>(get_noc_addr(from), to, bf_row);
-            }
         }
-        if (loaded) {
-            noc_async_read_barrier();
-        }
+#endif
+        const uint32_t page = first + physical_tile * dim_tiles + col;
+        noc_async_read<bf_tile>(cache.get_noc_addr(page), dst + tile * bf_tile, bf_tile);
+        tile = tile + 1 == count ? 0 : tile + 1;
     }
-#endif
 }
 
-uint32_t start_position() {
-#ifdef ATTN_STAGED
-    const auto start = operand<11>(4);
-    const uint32_t scratch = get_write_ptr(staged_scratch);
-    noc_async_read<4>(start.get_noc_addr(0), scratch, 4);
-    noc_async_read_barrier();
-    return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch);
-#else
-    return 0;
-#endif
-}
-
-void read_values(uint32_t head, const Work& work, uint32_t pos, uint32_t start) {
+void read_values(uint32_t head, const Work& work, uint32_t pos) {
     const auto v = operand<2>(bf_tile);
     const uint32_t kv_tiles = work.tile_count * dim_tiles;
     cb_reserve_back(v_cb, kv_tiles);
-    read_cache<true>(v, head, work, v_cb, pos, start);
+    read_cache(v, head, work, v_cb, pos);
     noc_async_read_barrier();
     cb_push_back(v_cb, kv_tiles);
 }
@@ -127,7 +114,7 @@ uint32_t read_position() {
     return pos;
 }
 
-void read_inputs(uint32_t head, uint32_t split, uint32_t pos, uint32_t start, const Work& work, bool first_chunk = true) {
+void read_inputs(uint32_t head, uint32_t split, uint32_t pos, const Work& work, bool first_chunk = true) {
     DeviceZoneScopedN("INK_ATTN_READ");
     const auto q = operand<0>(bf_tile);
     const auto k = operand<1>(bf_tile);
@@ -195,7 +182,7 @@ void read_inputs(uint32_t head, uint32_t split, uint32_t pos, uint32_t start, co
         }
     }
     if (active) {
-        read_cache<false>(k, head, work, k_cb, pos, start);
+        read_cache(k, head, work, k_cb, pos);
     }
     noc_async_read_barrier();
     if (output_worker) {
@@ -322,20 +309,19 @@ void kernel_main() {
     const uint32_t worker = get_absolute_logical_y() * grid_width + get_absolute_logical_x();
     const uint32_t head = first_head + worker / splits;
     const uint32_t split = worker % splits;
-    const uint32_t start = start_position();
 #ifndef ATTN_WRITER
     const uint32_t pos = read_position();
     const Work work(pos, cache_tiles, split);
     if (work.tile_count || split < dim_tiles) {
         if constexpr (streaming) {
             if (!work.tile_count) {
-                read_inputs(head, split, pos, start, work);
+                read_inputs(head, split, pos, work);
             }
             for (uint32_t offset = 0; offset < work.tile_count; offset += chunk_tiles) {
-                read_inputs(head, split, pos, start, work.chunk(offset, chunk_tiles), offset == 0);
+                read_inputs(head, split, pos, work.chunk(offset, chunk_tiles), offset == 0);
             }
         } else {
-            read_inputs(head, split, pos, start, work);
+            read_inputs(head, split, pos, work);
         }
     }
     if (split == 0) {
@@ -358,7 +344,7 @@ void kernel_main() {
     const Work work(pos, cache_tiles, split);
     if (work.tile_count) {
         if constexpr (!streaming) {
-            read_values(head, work, pos, start);
+            read_values(head, work, pos);
         }
         send_stats(head, split);
         if (split == 0) {
@@ -366,7 +352,7 @@ void kernel_main() {
         }
         if constexpr (streaming) {
             for (uint32_t offset = 0; offset < work.tile_count; offset += chunk_tiles) {
-                read_values(head, work.chunk(offset, chunk_tiles), pos, start);
+                read_values(head, work.chunk(offset, chunk_tiles), pos);
             }
         }
         send_partials(head, split);

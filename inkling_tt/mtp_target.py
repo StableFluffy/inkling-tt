@@ -1,7 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple
 
 import torch
 import ttnn
@@ -15,66 +14,6 @@ from inkling_tt.mtp_weights import PADDED_VOCAB
 from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
-
-
-class StagedVisit(NamedTuple):
-    k: ttnn.Tensor
-    v: ttnn.Tensor
-    conv: tuple[ttnn.Tensor, ...]
-
-
-@lru_cache(maxsize=16)
-def _commit_program(tasks, rows, accessors):
-    grid, rt = _grid(tasks)
-    kernel = ttnn.KernelDescriptor(
-        kernel_source=str(_KERNELS / "target_commit.cpp"),
-        core_ranges=grid,
-        runtime_args=rt,
-        compile_time_args=[rows, *sum(accessors, ())],
-        config=ttnn.ReaderConfigDescriptor(),
-    )
-    return _program([kernel], [_tile_cb(grid, 0, BF, size=64 + 2048)])
-
-
-class TargetCommit:
-    """Commit the accepted prefix from staged BF16 KV and FP32 pre-convolution rows."""
-
-    def __init__(self, device, visits, rows):
-        if not 2 <= rows <= 8 or not visits:
-            raise ValueError("Target commit requires visits and a verify capacity of 2-8 rows")
-        shape = (1, HKV, 32, HD)
-        self.staged = {
-            slot: StagedVisit(
-                _alloc(device, shape),
-                _alloc(device, shape),
-                tuple(_alloc(device, (1, 1, 32, width), FP) for width in (HKV * HD, HKV * HD, D, D)),
-            )
-            for slot in visits
-        }
-        self.tensors = []
-        table = []
-        for slot, live in visits.items():
-            scratch = self.staged[slot]
-            visit = (live.k, live.v, scratch.k, scratch.v, *live.conv, *scratch.conv)
-            self.tensors.extend(visit)
-            table.append([*[t.buffer_address() for t in visit], live.klen, 0, 0, 0])
-        self.addresses = ttnn.from_torch(
-            torch.tensor(table, dtype=torch.int64), dtype=ttnn.uint32, layout=RM, device=device, memory_config=DRAM
-        )
-        self.meta = _alloc(device, (1, 8), ttnn.uint32, RM)
-        tiles_per_visit = (2 * HKV * HD + 2 * (HKV * HD + D)) // 32
-        tasks = _tasks(device, len(visits) * tiles_per_visit)
-        accessors = tuple(
-            tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args())
-            for t in (self.meta, self.addresses, self.tensors[0], self.tensors[4])
-        )
-        self.program, kernels = _commit_program(tasks, rows, accessors)
-        self.kernel = kernels[0]
-
-    def commit(self):
-        self.kernel.common_runtime_args = [self.meta.buffer_address(), self.addresses.buffer_address()]
-        self.program.kernels = [self.kernel]
-        ttnn.generic_op([self.meta, self.addresses, *self.tensors], self.program)
 
 
 @lru_cache(maxsize=8)
@@ -93,7 +32,7 @@ def _verify_stage_program(lmax, tasks, specs):
 
 
 class TargetVerify:
-    """Run a layer-major block with B1 row arithmetic and read-only committed state."""
+    """Run a layer-major block with B1 row arithmetic and position-indexed state."""
 
     def __init__(self, model, proposals, *, streaming=False, compare_serial=False):
         c = model.c
@@ -103,7 +42,7 @@ class TargetVerify:
             or model.lmax % 32
             or not 32 <= model.lmax <= 32768
             or not (
-                c.fused_attn_decode
+                c.indexed_state
                 and c.join_attention_prep
                 and c.fused_router
                 and c.fused_head_tail
@@ -115,10 +54,8 @@ class TargetVerify:
             raise ValueError("Create verify before capture with the full fused B1 target")
         self.model, self.rows = model, proposals + 1
         device = c.dev
-        self.commit = TargetCommit(device, model.visits, self.rows)
         self.experts = VerifyExperts(device, self.rows, streaming=streaming)
         self.steps = tuple(Step(c, model.lmax) for _ in range(self.rows))
-        self.slots = tuple(c.up(torch.tensor([r], dtype=torch.int32), ttnn.int32, RM) for r in range(self.rows))
         bank_layout = RM if c.row_major_state else TILE
         self.banks = tuple(c.up(torch.zeros(1, 1, 32, D), FP, bank_layout, L1) for _ in range(self.rows))
         row = lambda size, dtype=BF, mem=DRAM: ttnn.allocate_tensor_on_device(
@@ -155,7 +92,6 @@ class TargetVerify:
                 scratch.k, scratch.v = (row(HKV * HD) for _ in range(2))
                 scratch.k_dyn, scratch.v_dyn = (row(32) for _ in range(2))
                 scratch.attended = row(o_weight.n, mem=o_weight.output_shards)
-        self.histories = tuple(_alloc(device, (1, 1, 4, width), FP) for width in (HKV * HD, HKV * HD, D, D))
         self.mlp = _alloc(device, (1, 1, 32, D))
         self.mlp_tasks = _tasks(device, D // 32)
         self.branch = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, D)), BF, TILE, device, L1)
@@ -233,11 +169,7 @@ class TargetVerify:
         m = self.model
         for layer in m.layers[first:stop]:
             slot = visit_slot(layer.i, pass_id if layer.is_loop else 0)
-            live = m.visits[slot]
-            staged = self.commit.staged[slot]
-            visit = SimpleNamespace(klen=live.klen, k=live.k, v=live.v, conv=self.histories)
-            for source, dest in zip(live.conv, self.histories):
-                ttnn.copy(source, dest)
+            visit = m.visits[slot]
             messages_by_row = []
             for i, (x, _, _) in enumerate(states):
                 if (tap := MTP_TAP_VISITS.get((layer.i, pass_id))) is not None:
@@ -268,21 +200,18 @@ class TargetVerify:
                 vd = self.v_dyn.project(layer.v_wproj, xv) if layer.is_global else None
                 projections = (q, k, v, kd, vd)
             attention = []
-            for i, (xqkv, step, row_slot, scratch) in enumerate(zip(inputs, self.steps, self.slots, self.scratch)):
+            for i, (xqkv, step, scratch) in enumerate(zip(inputs, self.steps, self.scratch)):
                 attention.append(
                     layer.attention(
                         *xqkv,
                         visit,
                         step,
-                        staging=(staged.k, staged.v, self.steps[0].pos_g, row_slot),
                         scratch=scratch,
                         projections=projections,
                         output=self.o.input if self.shared else None,
                         row=i if self.shared else 0,
                     )
                 )
-                for h in range(2):
-                    _tile_row(self.histories[h], staged.conv[h], target=i)
             if self.shared:
                 projected = self.o.project(layer.wo)
                 attention = [projected] * self.rows
@@ -294,9 +223,10 @@ class TargetVerify:
                 mixed, bank, residual = layer._finish_attention(
                     x,
                     bank,
-                    self.histories[2],
+                    visit.conv[2],
                     a,
                     messages,
+                    position=self.steps[i].pos_g,
                     scratch=scratch,
                     row=i if self.shared else 0,
                 )
@@ -306,7 +236,6 @@ class TargetVerify:
                     ids, gamma = self.routes[i]
                     rowvm.fused_router(mixed, layer.router_w.tensor, layer.dec.router_b, ids_out=ids, gamma_out=gamma)
                     _tile_row(mixed, self.mlp, target=i)
-                _tile_row(self.histories[2], staged.conv[2], target=i)
                 pending.append((bank, residual))
             if self.shared:
                 _pack_rows(self.mlp, mixed_rows, self.mlp_tasks)
@@ -321,11 +250,11 @@ class TargetVerify:
                         self.branch,
                         bank,
                         residual,
-                        self.histories[3],
+                        visit.conv[3],
                         m._next_mix(layer, pass_id),
+                        position=self.steps[i].pos_g,
                         out=out,
                         mixed_out=mixed_out,
                     )
                 )
-                _tile_row(self.histories[3], staged.conv[3], target=i)
         return states

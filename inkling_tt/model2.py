@@ -2,7 +2,7 @@
 
 Differences from model.py (M1): logical row count 1; per-step positional data lives in persistent device tensors
 written before each replay; routing (fp32-accumulated BF16 router, sigmoid, biased top-8, unbiased renormalised
-gamma) runs on device and feeds indexed sparse matmuls; conv histories are 4-row matrices updated in place; the
+gamma) runs on device and feeds indexed sparse matmuls; conv histories are updated in place; the
 attention sink seeds the softmax instead of being concatenated.
 """
 
@@ -83,6 +83,7 @@ class Ctx:
             and device.arch() == ttnn.Arch.BLACKHOLE
             and os.environ.get("INK_ATTN_DECODE", "1") == "1"
         )
+        self.indexed_state = self.fused_attn_decode and device.get_num_devices() == 1
         if self.fused_attn_decode:
             self.dev.enable_program_cache()
         self.group_gates = self.shard_fusion and os.environ.get("INK_GROUP_GATES", "1") != "0"
@@ -410,11 +411,13 @@ class Visit:
     """Per-(layer, pass) caches: K/V and four conv histories."""
 
     def __init__(self, c: Ctx, is_global, lmax):
-        self.klen = lmax if is_global else W
+        ring = attn_decode.RING_SLOTS if c.indexed_state else W
+        self.klen = lmax if is_global else ring
         z = torch.zeros(1, HKV, self.klen, HD)
         self.k = c.up(z)
         self.v = c.up(z)
-        self.conv = [c.up(torch.zeros(1, 1, 4, n), FP) for n in (HKV * HD, HKV * HD, D, D)]
+        rows = rowvm.CONV_RING_ROWS if c.indexed_state else 4
+        self.conv = [c.up(torch.zeros(1, 1, rows, n), FP) for n in (HKV * HD, HKV * HD, D, D)]
 
 
 class Layer:
@@ -593,6 +596,8 @@ class Layer:
             gates = [self.gates[s] for s in "qkv"]
             kv_mem = L1 if c.paired_kv else None
             output_layouts = (self.dq.weight.input_shards, kv_mem, kv_mem) if c.join_attention_prep else (None,) * 3
+            if scratch is not None:
+                output_layouts = tuple(t.memory_config() for t in scratch.qkv_blend)
             if c.fused_message_down:
                 downs = [self.gate_down[s] for s in "qkv"]
                 if c.message_down_inputs and _message_down_ready(rows, messages):
@@ -621,9 +626,7 @@ class Layer:
         hn = self.ops.rms(rows[0]) if shared else None
         return tuple(self.gate_msg(s, u, m, hn, weight=norm) for s, u, m, norm in zip("qkv", rows, messages, norms))
 
-    def attention(
-        self, xq, xk, xv, vs: Visit, st: Step, *, staging=None, scratch=None, projections=None, output=None, row=0
-    ):
+    def attention(self, xq, xk, xv, vs: Visit, st: Step, *, scratch=None, projections=None, output=None, row=0):
         c = self.c
         if projections is not None:
             qrsg, kr, vr, k_dyn, v_dyn = projections
@@ -636,7 +639,7 @@ class Layer:
         gate_col = sink_col + 32
         tau = st.tau if self.is_global else None
         q, rp, sinkt, k_shard, v_shard, gated = c.attention_glue
-        fused_decode = c.fused_attn_decode and (vs.klen == W or (vs.klen % 32 == 0 and vs.klen <= 32768))
+        fused_decode = c.fused_attn_decode and (not self.is_global or (vs.klen % 32 == 0 and vs.klen <= 32768))
         if fused_decode:
             # The eager graph in capture() allocates this scratch before tracing.
             if not hasattr(c, "_fused_attention_heads"):
@@ -683,11 +686,7 @@ class Layer:
             else:
                 kr, vr = project(xk, self.wk, scratch.k), project(xv, self.wv, scratch.v)
         if c.layout_fusion:
-            if staging is None:
-                caches, cache_pos, wrap = (vs.k, vs.v), st.pos_g, not self.is_global
-            else:
-                staged_k, staged_v, _, cache_pos = staging
-                caches, wrap = (staged_k, staged_v), False
+            caches, cache_pos, wrap = (vs.k, vs.v), st.pos_g, not self.is_global
             if projections is None:
                 k_dyn = v_dyn = None
             if self.is_global and projections is None:
@@ -762,7 +761,6 @@ class Layer:
                 global_cache=self.is_global,
                 gate_col=gate_col,
                 out=c.gated_shards if output is None else output,
-                staged=None if staging is None else staging[:3],
                 row=row,
             )
             if output is not None:
@@ -873,9 +871,9 @@ class Layer:
         if self.block_boundary and not isinstance(bank, _DecodeBank):
             bank = ops.bank_append(bank, block_residual)
         if self.c.visit_fusion:
-            mixed, bank, z = self._finish_attention(x, bank, vs.conv[2], a, messages)
+            mixed, bank, z = self._finish_attention(x, bank, vs.conv[2], a, messages, position=st.pos_g)
             branch = self._visit_moe(mixed, vs)
-            return self._finish_visit(branch, bank, z, vs.conv[3], next_mix)
+            return self._finish_visit(branch, bank, z, vs.conv[3], next_mix, position=st.pos_g)
 
         a = self.sconv(a, self.pa_taps, vs.conv[2])
         z = a if self.block_boundary else rowvm.add(block_residual, a, dtype=FP)
@@ -886,7 +884,7 @@ class Layer:
         y = self.sconv(self._visit_moe(xm, vs), self.pm_taps, vs.conv[3])
         return rowvm.add(z if z.dtype == FP else f32(z), f32(y), dtype=BF), bank, None
 
-    def _finish_attention(self, x, bank, history, a, messages, *, scratch=None, row=0):
+    def _finish_attention(self, x, bank, history, a, messages, *, position, scratch=None, row=0):
         d = self.dec
         z_bf, z_fp, xm = self.c.visit_scratch if scratch is None else scratch.visit
         z = z_bf if self.block_boundary else z_fp
@@ -914,6 +912,7 @@ class Layer:
             shared_prefix=bool(start),
             append=append,
             partial_row=row,
+            position=position,
         )[0]
         if messages is not None:
             mixed = self.gate_msg(
@@ -926,10 +925,10 @@ class Layer:
             )
         return mixed, bank, z
 
-    def _finish_visit(self, branch, bank, residual, history, next_mix, *, out=None, mixed_out=None):
+    def _finish_visit(self, branch, bank, residual, history, next_mix, *, position, out=None, mixed_out=None):
         taps = self.dec.pm_taps
         if next_mix is None:
-            return rowvm.conv_residual(history, branch, taps, residual, out=out), bank, None
+            return rowvm.conv_residual(history, branch, taps, residual, out=out, position=position), bank, None
         query, weight = next_mix
         rm = self.c.row_major_state
         y = out
@@ -949,7 +948,10 @@ class Layer:
             out=(mixed_out,) if mixed_out is not None else None,
             convolution=(history, taps, residual, y),
             round_residual=True,
-            memory_config=L1 if self.c.paired_kv and weight is not None else DRAM,
+            position=position,
+            memory_config=(L1 if self.c.paired_kv and weight is not None else DRAM)
+            if mixed_out is None
+            else mixed_out.memory_config(),
         )[0]
         return y, bank, mix
 
@@ -1009,7 +1011,7 @@ class InklingTT2:
         self.norm = self.c.row(g("norm.weight"))
         self.dec_final_q, self.dec_norm = self.c.decode_query(self.final_q), self.c.decode_row(self.norm)
         self.dec_msg_q = [self.c.decode_query(q) for q in self.msg_q]
-        self._prepare_head(g("lm_head.weight"))
+        self._prepare_head(g("lm_head.weight"), resident_scratch=capture_taps)
         self.st = Step(self.c, lmax)
         if self.c.device_feedback and hasattr(self, "head_logits"):
             self._prepare_feedback()
@@ -1048,11 +1050,14 @@ class InklingTT2:
         )
         self._shift_cache = {}
 
-    def _prepare_head(self, head):
+    def _prepare_head(self, head, *, resident_scratch=False):
         c = self.c
         head = torch.cat([head, torch.zeros(201024 - head.shape[0], D, dtype=head.dtype)], 0)
         self.head = dense.prepare_weight(
-            c.dev, head.T.contiguous(), getattr(c.prec, "head_dtype", None) or c.prec.dense_dtype
+            c.dev,
+            head.T.contiguous(),
+            getattr(c.prec, "head_dtype", None) or c.prec.dense_dtype,
+            workers_per_bank=8 if resident_scratch else None,
         )
         vm = torch.zeros(1, 1, 1, 201024)
         vm[..., VOCAB:] = -1e4

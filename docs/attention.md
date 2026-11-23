@@ -48,9 +48,12 @@ The preparation kernels perform three operations ([rowvm.md](rowvm.md)).
 - K and V: convolve with the FP32 history (updated in place), clip K or normalize V per head, and
   write the BF16 row into the cache at the current position.
 
-The caches are BF16 `[1, 8, L, 128]` tensors in DRAM. Sliding-window caches are rings of 1024 slots,
-written at `position mod 1024`. Global caches have `L = lmax` slots; the fused kernel takes any
-multiple of 32 up to 32768 and the model falls back to the stock path beyond that.
+The caches are BF16 `[1, 8, L, 128]` tensors in DRAM. Fused single-card sliding attention writes
+at `position mod 1088`, leaving 64 slots beyond the 1,024-key window for speculative writes. The
+reader maps physical tiles to the original 1,024-slot order for scoring. The tile at the window
+edge can contain rows from two physical tiles, one at each end of the live window. Global caches
+have `L = lmax` slots. The fused kernel takes multiples of 32 up to 32768, and the model uses stock
+SDPA beyond that.
 
 ## The fused kernel
 
@@ -58,7 +61,7 @@ multiple of 32 up to 32768 and the model falls back to the stock path beyond tha
 them, and the workers split the live key tiles into contiguous ranges.
 
 **Position-bounded reads.** Every worker reads the position tensor on device and computes `valid =
-min(position + 1, L)` and the number of live 32-key tiles. Only those tiles are read and only the
+min(position + 1, window or global capacity)` and the number of live 32-key tiles. Only those tiles are read and only the
 splits that have tiles do score work, so a short sequence in a 32k-slot global cache reads a few
 tiles. K and V reads rotate their starting DRAM bank across workers so the requests spread over the
 eight banks.

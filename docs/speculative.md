@@ -2,8 +2,8 @@
 
 The Inkling-2-Mini checkpoint ships a three-layer DSpark drafter in `mtp.safetensors`. The device
 drafter uses target features to propose several tokens for one pending token. A lossless round
-requires the target to reproduce B1 logits and state for each proposed input before committing the
-matching prefix. The verifier processes each visit in layer order across the block. It
+requires the target to reproduce B1 logits and state for each proposed input. Only the matching
+prefix advances the target position. The verifier processes each visit in layer order across the block. It
 shares the attention projections, LM head and routed-expert weights across the verify rows.
 
 ## Draft context
@@ -46,13 +46,18 @@ capturing them.
 
 ## Target state
 
-The attention overlay reads committed KV in its ordinary B1 slot order. It substitutes staged
-BF16 rows through the current query's position. Future staged rows remain invisible, including at
-the point where the local ring wraps. The attention partitions and FP32 reductions are the same
-as for a normal B1 step.
+Target K/V and convolution inputs are indexed by absolute position. Global K/V uses one slot per
+position. Sliding K/V uses a 1,088-slot ring for a 1,024-key window, so writes for future verify rows
+leave earlier queries' keys intact. The reader reconstructs B1's 1,024-slot tile order before
+scoring. At the window edge it reads faces from two physical tiles to retain B1's FP32 split and
+reduction order.
+
+Each four-tap convolution reads its three earlier inputs from a 32-row FP32 ring and writes
+its current input to that ring. Prefill writes its final four inputs into the same slots. Both
+decode paths share the per-visit rings.
 
 The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dynamic taps and
-O each use one sweep of their B1 weights. Head preparation and the causal attention overlay read
+O each use one sweep of their B1 weights. Head preparation and attention read
 the query's row directly from the packed projections. The output gate writes into that same row
 of the O projection's input shards.
 
@@ -61,15 +66,15 @@ B1's K-stripe sum and tie-breaking order. The grouped expert path reads one gate
 B1's eight routes and FP32 weights per row, streams the existing BFP8_B weight pack at HiFi4 and
 combines the results in the original routing-slot order.
 
-The commit kernel copies the accepted rows' KV into the local rings and global slots. Each
-convolution history takes its newest inputs from the accepted prefix and its remaining lags from
-the previous history. The continuation ID remains pending for the next round.
+A round accepts a prefix by advancing the position. Later rounds or B1 overwrite rejected
+positions before those positions can enter a live window. The continuation ID remains pending
+for the next round.
 
 ## Round replay
 
 The round allocates scratch and warms the device programs before capture. The draft and target
 traces replay on the same command queue. The target stages the pending token and draft IDs,
-verifies them, and commits the longest matching prefix.
+verifies them, and advances past the longest matching prefix.
 The drafter and target reuse the same width-sharded head input and output buffers.
 
 The round extends the draft cache from accepted target taps, then publishes the next pending ID
@@ -86,7 +91,7 @@ scripts/dev_run.sh "OMP_NUM_THREADS=4 INK_PREFILL_EXPERT_DOUT_L1=480 python -u t
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_router.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_decision.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_verify.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_round.py"
@@ -101,10 +106,10 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
 | Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
-| Staged local and global attention | 128/128 bitwise-equal rows |
-| Traced target state commits | 56/56 equal to sequential updates |
-| Four-row target verify at `lmax=1056` | 48.62 ms median, 48.66 ms p95 |
-| B1 greedy in the same job | 20.02 ms median, 20.06 ms p95 |
+| Indexed attention with future writes | 208/208 bitwise-equal rows |
+| Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
+| Four-row target verify at `lmax=1120` | 45.11 ms median, 45.33 ms p95 |
+| B1 greedy in the same job | 19.42 ms median, 19.45 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
@@ -122,12 +127,9 @@ prefix slots for K=3 and 2,048 for K=4.
 The 7,825-token fixture uses an 8,192-slot draft global prefix and takes 9.20 ms median and
 9.29 ms p95 for three proposals.
 
-The traced verifier matches serial B1 logits and taps bitwise at four starting positions.
-Committing any prefix length reproduces serial B1 KV and convolution histories, including at
-the local ring wrap and global cache limit.
-
-The shared projections and router cut four-row verification from 68.06 to 48.62 ms in the
-same job. Attention and row epilogues still run once per verify row.
+The serial verifier check compares logits and taps at the local window boundary, the physical
+ring wrap and the global cache limit. It also runs B1 with alternate continuations after each
+possible rejection and compares with a serial run of the same accepted prefix.
 
 The three-proposal round reproduces the B1 IDs on 32-token continuations, including a prompt
 that reaches the 1,024-slot ring wrap. Times exclude prefill and draft context priming.

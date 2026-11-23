@@ -36,6 +36,11 @@ constexpr uint32_t state_cb = 17;
 constexpr uint32_t mix_rows = get_compile_time_arg_val(3);
 constexpr uint32_t mix_width = get_compile_time_arg_val(4);
 constexpr uint32_t stripes = get_compile_time_arg_val(5);
+#ifdef ROWVM_INDEXED_CONV
+constexpr uint32_t state_rows = 1;
+#else
+constexpr uint32_t state_rows = 4;
+#endif
 constexpr bool conv_mix = op == CONV_MIX;
 constexpr bool conv_kv = op == CONV_K || op == CONV_V;
 constexpr bool clip = op == L2 || op == CONV_K;
@@ -517,7 +522,7 @@ void run_conv() {
         cb_wait_front(first + 3, 1);
     }
     cb_reserve_back(target, 1);
-    cb_reserve_back(state_cb, 4);
+    cb_reserve_back(state_cb, state_rows);
     if constexpr (conv_mix) {
         cb_reserve_back(conv_partial_cb, 1);
     }
@@ -547,12 +552,12 @@ void run_conv() {
         cb_push_back(conv_partial_cb, 1);
     }
     pack_reconfig_data_format(state_cb);
-    for (uint32_t lag = 0; lag < 4; ++lag) {
+    for (uint32_t lag = 0; lag < state_rows; ++lag) {
         pack_tile(lag, state_cb);
     }
     tile_regs_release();
     cb_push_back(target, 1);
-    cb_push_back(state_cb, 4);
+    cb_push_back(state_cb, state_rows);
     cb_pop_front(first, 1);
     cb_pop_front(first + 1, 3);
     cb_pop_front(first + 2, 4);

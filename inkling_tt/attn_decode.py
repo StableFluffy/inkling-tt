@@ -13,12 +13,13 @@ _KERNELS = Path(__file__).resolve().parent / "kernels" / "attn"
 _SPLITS = 16
 _KV_HEADS = 8
 _WINDOW = 1024
+RING_SLOTS = _WINDOW + 64
 _MAX_LENGTH = 32768
 _LAUNCH_LOCK = Lock()
 
 
 @lru_cache(maxsize=24)
-def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head, heads, row):
+def _program(accessors, length, physical_length, global_cache, gate_tile, cols, rows, first_head, heads, row):
     grid = ttnn.num_cores_to_corerangeset(heads * _SPLITS, ttnn.CoreCoord(cols, rows), row_wise=True)
     split_tiles = (length // 32 + _SPLITS - 1) // _SPLITS
     tiles = min(split_tiles, 4)
@@ -42,8 +43,9 @@ def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head,
     if split_tiles > 4:
         unpack[20] = unpack[21] = ttnn.UnpackToDestMode.UnpackToDestFp32
     config.unpack_to_dest_mode = unpack
-    staged = len(accessors) > 9
-    defines = [("ATTN_STAGED", "1")] if staged else []
+    defines = []
+    if length != physical_length:
+        defines.append(("ATTN_RING_TILES", str(physical_length // 32)))
     if row:
         defines.append(("ATTN_QUERY_ROW", str(row)))
     kernels = [
@@ -95,8 +97,6 @@ def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head,
     )
     if split_tiles > 4:
         buffers += ((20, fp, 1, 4096), (21, fp, 4, 4096))
-    if staged:
-        buffers += ((22, bf, 1, 2048), (23, bf, 1, 2048))
     cbs = [
         ttnn.CBDescriptor(
             total_size=pages * size,
@@ -160,11 +160,11 @@ def prepare_table(table, *, global_cache, device=None):
     )
 
 
-def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out, staged=None, row=0):
+def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out, row=0):
     """Apply position-derived attention and write the gated row into preallocated O shards."""
     length = k.shape[-2]
-    if length < 32 or length > _MAX_LENGTH or length % 32 or (not global_cache and length != _WINDOW):
-        raise ValueError("fused attention needs a 1024-slot ring or a tile-aligned global cache up to 32768 slots")
+    if length < 32 or length > _MAX_LENGTH or length % 32 or (not global_cache and length not in (_WINDOW, RING_SLOTS)):
+        raise ValueError("fused attention requires a supported sliding ring or a tile-aligned global cache")
     kv_heads = k.shape[1]
     if kv_heads not in (4, _KV_HEADS):
         raise ValueError("fused attention decode supports four or eight KV heads per rank")
@@ -210,32 +210,22 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
     if out.buffer_unique_id() in {t.buffer_unique_id() for t in inputs}:
         raise ValueError("fused attention decode requires independent output storage")
 
-    if staged is not None:
-        staged_k, staged_v, start = staged
-        for state in (staged_k, staged_v):
-            if (
-                tuple(state.shape) != (1, kv_heads, 32, 128)
-                or state.dtype != ttnn.bfloat16
-                or state.layout != ttnn.TILE_LAYOUT
-                or state.is_sharded()
-                or state.device() != device
-            ):
-                raise ValueError("staged attention K/V must be interleaved BF16 tiles for the current block")
-        if (
-            tuple(start.shape) != (1,)
-            or start.dtype != ttnn.int32
-            or start.layout != ttnn.ROW_MAJOR_LAYOUT
-            or start.device() != device
-        ):
-            raise ValueError("staged attention requires the block start position on device")
-        operands = (*operands, *staged)
     accessors = tuple(tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args()) for t in operands)
     cols, rows, heads, peers = _placement(device, kv_heads)
     addresses = [t.buffer_address() for t in operands]
     with _LAUNCH_LOCK:
         for first_head in range(0, kv_heads, heads):
             desc, kernels = _program(
-                accessors, length, global_cache, gate_col // 32, cols, rows, first_head, heads, row
+                accessors,
+                length if global_cache else _WINDOW,
+                length,
+                global_cache,
+                gate_col // 32,
+                cols,
+                rows,
+                first_head,
+                heads,
+                row,
             )
             kernels[0].common_runtime_args = [*addresses, *peers]
             kernels[1].common_runtime_args = [*addresses, *peers]

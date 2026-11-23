@@ -84,8 +84,26 @@ void exchange(uint32_t task, bool rms_pass) {
 }
 #endif
 
+#ifdef ROWVM_POSITION_ARGS
+uint32_t position() {
+#ifndef ROWVM_POSITION_INDEX
+#define ROWVM_POSITION_INDEX 0
+#endif
+    const auto tensor = TensorAccessor(
+        TensorAccessorArgs<ROWVM_POSITION_ARGS>(), get_common_arg_val<uint32_t>(count * 3 + ROWVM_POSITION_INDEX), 4);
+    const uint32_t addr = get_write_ptr(30)
+#ifdef ROWVM_POSITION_WRITER_OFFSET
+        + ROWVM_POSITION_WRITER_OFFSET
+#endif
+        ;
+    noc_async_read<4>(tensor.get_noc_addr(0), addr, 4);
+    noc_async_read_barrier();
+    return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(addr);
+}
+#endif
+
 template <uint32_t I, bool Batch = false, bool Commit = false>
-void transfer(uint32_t task) {
+void transfer(uint32_t task, [[maybe_unused]] uint32_t pos) {
 #if defined(ROWVM_CONV_MIX) && !defined(ROWVM_WRITE)
     if constexpr (I == 0) {
         return;  // The convolution produces the partial on this core.
@@ -169,16 +187,10 @@ void transfer(uint32_t task) {
 #ifdef ROWVM_WRITE
     cb_wait_front(cb, rows * dense_tiles);
     const uint32_t dense = get_read_ptr(cb);
-#ifdef ROWVM_CACHE_POSITION_ARGS
-    if constexpr (cache_length != 0) {
-        const auto position = TensorAccessor(
-            TensorAccessorArgs<ROWVM_CACHE_POSITION_ARGS>(), get_common_arg_val<uint32_t>(count * 3), 4);
-        const uint32_t addr = get_write_ptr(30);
-        noc_async_read<4>(position.get_noc_addr(0), addr, 4);
-        noc_async_read_barrier();
-        uint32_t pos = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(addr);
+#ifdef ROWVM_CACHE_WRAP
+    if constexpr (cache_length != 0 && bytes == 2) {
         if constexpr (ROWVM_CACHE_WRAP) {
-            pos &= cache_length - 1;
+            pos %= cache_length;
         }
         if (pos < cache_length) {
             const uint32_t page = (task * (cache_length / 32) + pos / 32) * tile_cols;
@@ -239,8 +251,15 @@ void transfer(uint32_t task) {
     }
     const uint32_t faces = valid_cols / 16;
     for (uint32_t r = 0; r < rows; ++r) {
-        const uint32_t row = shared_prefix ? (r == 0 ? 0 : start_row + r - 1)
-                                           : start_row + (concat_rows ? 0 : r);
+        uint32_t row = shared_prefix ? (r == 0 ? 0 : start_row + r - 1)
+                                     : start_row + (concat_rows ? 0 : r);
+        if constexpr (cache_length && bytes == 4) {
+#ifdef ROWVM_WRITE
+            row = pos % cache_length;
+#else
+            row = (pos - r - 1) % cache_length;
+#endif
+        }
         const uint32_t tile_row = batched_rows ? row : row / 32;
         const uint32_t inner_row = batched_rows ? 0 : row % 32;
         const uint32_t local = dense + r * dense_tiles * tile_bytes;
@@ -371,16 +390,16 @@ void select_experts() {
 #endif
 
 template <uint32_t... I>
-void transfer_all(uint32_t task, std::integer_sequence<uint32_t, I...>) {
-    (transfer<I>(task), ...);
+void transfer_all(uint32_t task, uint32_t pos, std::integer_sequence<uint32_t, I...>) {
+    (transfer<I>(task, pos), ...);
 }
 
 #if defined(ROWVM_CONV_MIX) && !defined(ROWVM_WRITE)
 template <uint32_t Offset, uint32_t... I>
-void read_batch(uint32_t task, std::integer_sequence<uint32_t, I...>) {
-    (transfer<I + Offset, true, false>(task), ...);
+void read_batch(uint32_t task, uint32_t pos, std::integer_sequence<uint32_t, I...>) {
+    (transfer<I + Offset, true, false>(task, pos), ...);
     noc_async_read_barrier();
-    (transfer<I + Offset, true, true>(task), ...);
+    (transfer<I + Offset, true, true>(task, pos), ...);
 }
 #endif
 
@@ -393,8 +412,8 @@ constexpr bool early_output(uint32_t) { return false; }
 #endif
 
 template <uint32_t... I>
-void transfer_late(uint32_t task, std::integer_sequence<uint32_t, I...>) {
-    ((early_output(I) ? void() : transfer<I>(task)), ...);
+void transfer_late(uint32_t task, uint32_t pos, std::integer_sequence<uint32_t, I...>) {
+    ((early_output(I) ? void() : transfer<I>(task, pos)), ...);
 }
 
 }  // namespace
@@ -402,30 +421,35 @@ void transfer_late(uint32_t task, std::integer_sequence<uint32_t, I...>) {
 void kernel_main() {
     select_read_vc();
     const uint32_t task = rowvm_task();
+#ifdef ROWVM_POSITION_ARGS
+    const uint32_t pos = position();
+#else
+    const uint32_t pos = 0;
+#endif
 #ifndef ROWVM_WRITE
     {
     RV_ZONE("RV_READ");
 #if defined(ROWVM_WAIT_KV)
-    transfer<1>(task);
-    transfer<2>(task);
+    transfer<1>(task, pos);
+    transfer<2>(task, pos);
     if constexpr (count == 4) {
-        transfer<3>(task);
+        transfer<3>(task, pos);
     }
     auto ready = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(2));
     noc_semaphore_wait(ready, 4);
     noc_semaphore_set(ready, 0);
-    transfer<0>(task);
+    transfer<0>(task, pos);
 #elif defined(ROWVM_CONV_MIX)
-    read_batch<4>(task, std::make_integer_sequence<uint32_t, count - 4>{});
-    read_batch<0>(task, std::make_integer_sequence<uint32_t, 4>{});
+    read_batch<4>(task, pos, std::make_integer_sequence<uint32_t, count - 4>{});
+    read_batch<0>(task, pos, std::make_integer_sequence<uint32_t, 4>{});
 #else
-    transfer_all(task, std::make_integer_sequence<uint32_t, count>{});
+    transfer_all(task, pos, std::make_integer_sequence<uint32_t, count>{});
 #endif
     }
 #endif
 #if defined(ROWVM_CONV_MIX) && defined(ROWVM_WRITE)
-    transfer<1>(task);
-    transfer<2>(task);
+    transfer<1>(task, pos);
+    transfer<2>(task, pos);
 #endif
 #if defined(ROWVM_MESSAGE_UP) && defined(ROWVM_WRITE)
     gather_logit_rows();
@@ -444,6 +468,6 @@ void kernel_main() {
     select_experts();
 #endif
     RV_ZONE("RV_WRITE");
-    transfer_late(task, std::make_integer_sequence<uint32_t, count>{});
+    transfer_late(task, pos, std::make_integer_sequence<uint32_t, count>{});
 #endif
 }

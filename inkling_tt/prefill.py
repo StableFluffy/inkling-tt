@@ -242,12 +242,17 @@ def _state_program(tasks, tiles, capacity, cols, last, specs):
 
 
 @lru_cache(maxsize=16)
-def _conv_program(tasks, cols, dynamic, tiles, x_dtype, out_dtype, residual_dtype, specs):
+def _conv_program(tasks, cols, dynamic, tiles, x_dtype, out_dtype, residual_dtype, indexed, specs):
     grid, rt = _grid(tasks)
     residual_bytes = 0 if residual_dtype is None else (2048 if residual_dtype == BF else 4096)
     args = [cols, int(dynamic), tiles, int(x_dtype == BF), int(out_dtype == BF), residual_bytes]
     defines = [("PREFILL_RESIDUAL", "1")] if residual_dtype is not None else []
     reader, writer = tuple(sum(group, ()) for group in specs)
+    reader_defines = list(defines)
+    if dynamic:
+        reader_defines.append(("PREFILL_DYN", "1"))
+    if indexed:
+        reader_defines.append(("PREFILL_INDEXED_CONV", "1"))
     cbs = [
         _tile_cb(grid, i, dt, pages, size)
         for i, dt, pages, size in (
@@ -268,7 +273,7 @@ def _conv_program(tasks, cols, dynamic, tiles, x_dtype, out_dtype, residual_dtyp
             core_ranges=grid,
             compile_time_args=[*args, *reader],
             runtime_args=rt,
-            defines=defines + ([("PREFILL_DYN", "1")] if dynamic else []),
+            defines=reader_defines,
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
@@ -635,6 +640,7 @@ def _stencil(x, taps, history, meta, dyn=None, *, residual=None, dtype=BF):
             x.dtype,
             dtype,
             None if residual is None else residual.dtype,
+            history.shape[-2] == 32,
         ),
         inputs,
         (meta, out),

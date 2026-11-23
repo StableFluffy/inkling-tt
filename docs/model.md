@@ -107,7 +107,7 @@ P is a learned [16, 1024] table; the bias is zero for delta >= 1024
 
 Sliding layers see `0 <= delta < 1024`, global layers every earlier key. The sink logit joins the softmax denominator per query and head, and its probability is dropped; equivalently, ordinary attention output times `sigmoid(logsumexp(scores) - sink)`. The 24 head outputs are multiplied by `sigmoid(gate)`, projected by `W_o` and passed through the post-attention convolution.
 
-Each visit keeps four convolution histories of three rows: the K and V projections (1024 wide each), the attention output and the MoE output (2304 wide each).
+Each visit keeps four convolution histories for the K and V projections (1024 wide each), the attention output and the MoE output (2304 wide each). A convolution reads the three preceding inputs. The fused decode layout indexes the histories by position as described in [rowvm.md](rowvm.md).
 
 ## MoE
 

@@ -95,7 +95,11 @@ void kernel_main() {
         for (uint32_t lag = 0; lag < 4; ++lag) {
             for (uint32_t half = 0; half < 2; ++half) {
                 local_copy(coeff + row_offset(lag, half), static_taps + lag * fp_bytes + row_offset(0, half), 64);
+#ifdef PREFILL_INDEXED_CONV
+                const uint32_t src = saved + row_offset(31 - lag, half);
+#else
                 const uint32_t src = saved + row_offset(lag, half);
+#endif
                 const uint32_t dst = prev + row_offset(31 - lag, half) * x_row / 64;
                 if constexpr (bf_input) {
                     const auto from = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(src);
@@ -159,10 +163,19 @@ void kernel_main() {
                 const int32_t last = (valid - 1) % 32;
                 for (int32_t lag = 0; lag < 4; ++lag) {
                     const int32_t row = last - lag;
+#ifdef PREFILL_INDEXED_CONV
+                    if (row < 0 && t == 0) {
+                        continue;
+                    }
+#endif
                     for (uint32_t half = 0; half < 2; ++half) {
                         const uint32_t src = (row < 0 ? prev : curr) +
                                              row_offset((row + 32) % 32, half) * x_row / 64;
+#ifdef PREFILL_INDEXED_CONV
+                        const uint32_t dst = saved + row_offset((row + 32) % 32, half);
+#else
                         const uint32_t dst = saved + row_offset(lag, half);
+#endif
                         if constexpr (bf_input) {
                             const auto from = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(src);
                             auto to = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst);

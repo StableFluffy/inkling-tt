@@ -16,7 +16,7 @@ from serve.runtime import DEVICE_PARAMS, default_precision
 def main(trace_only):
     dev = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
     try:
-        lmax = 1056
+        lmax = 1120
         model = InklingTT2(dev, paths.hf_sd(), default_precision(), lmax=lmax, capture_taps=True)
         pf = Prefill(model, 128)
         verifier = TargetVerify(model, 3, streaming=True, compare_serial=True)
@@ -29,9 +29,9 @@ def main(trace_only):
             prefix = (prompt * ((position + len(prompt) - 1) // len(prompt)))[:position]
             pf.prefill(prefix)
 
-        def serial(start):
+        def serial(start, tokens):
             rows, taps, ids = [], [], []
-            for i, token in enumerate(block):
+            for i, token in enumerate(tokens):
                 model.run(token, start + i)
                 rows.append(ttnn.to_torch(model.logits).flatten()[:VOCAB])
                 taps.append(torch.stack([ttnn.to_torch(t).flatten() for t in model.taps]))
@@ -47,38 +47,21 @@ def main(trace_only):
             assert torch.equal(taps, expected_taps)
 
         references = {}
-        for pos in (len(prompt), 1023, 1024, lmax - len(block)):
+        for pos in (len(prompt), 1023, 1024, 1087, 1088, lmax - len(block)):
             seed(pos)
-            expected = references[pos] = serial(pos)
+            expected = references[pos] = serial(pos, block)
             seed(pos)
             verifier.stage(block, pos)
             verifier.verify()
             check_outputs(expected)
             print(f"position {pos}: four rows match serial B1 logits and taps", flush=True)
             if pos == len(prompt):
+                seed(pos)
+                verifier.stage(block, pos)
                 verifier.shared = False
                 verifier.verify()
                 check_outputs(expected)
                 verifier.shared = True
-            if trace_only:
-                continue
-            for rows in range(1, len(block) + 1):
-                seed(pos)
-                for r in range(rows):
-                    model.run(block[r], pos + r)
-                states = [
-                    [ttnn.to_torch(t) for t in (visit.k, visit.v, *visit.conv)] for visit in model.visits.values()
-                ]
-                seed(pos)
-                meta = torch.tensor([[pos, rows, 0, 0, 0, 0, 0, 0]], dtype=torch.int32)
-                host = ttnn.from_torch(meta, dtype=ttnn.uint32)
-                ttnn.copy_host_to_device_tensor(host, verifier.commit.meta)
-                verifier.commit.commit()
-                for (slot, visit), expected_state in zip(model.visits.items(), states):
-                    for i, (t, ref) in enumerate(zip((visit.k, visit.v, *visit.conv), expected_state)):
-                        actual = ttnn.to_torch(t)
-                        assert torch.equal(actual, ref), (pos, rows, slot, i, (actual != ref).sum().item())
-            print(f"position {pos}: all committed prefixes match serial B1 state", flush=True)
 
         try:
             verifier.stage(block, lmax - len(block) + 1)
@@ -88,9 +71,13 @@ def main(trace_only):
             raise AssertionError("verify accepted a block that crosses lmax")
 
         model.capture()
+        seed(len(prompt))
+        verifier.stage(block, len(prompt))
         trace = ttnn.begin_trace_capture(dev, cq_id=0)
         verifier.verify()
         ttnn.end_trace_capture(dev, trace, cq_id=0)
+        seed(len(prompt))
+        verifier.stage(block, len(prompt))
         verifier.shared = False
         baseline_trace = ttnn.begin_trace_capture(dev, cq_id=0)
         verifier.verify()
@@ -102,7 +89,23 @@ def main(trace_only):
                 verifier.stage(block, pos)
                 ttnn.execute_trace(dev, trace, cq_id=0, blocking=True)
                 check_outputs(expected)
-            print("four verify replays match the serial B1 logits and taps", flush=True)
+                if trace_only:
+                    continue
+                for rows in range(1, len(block)):
+                    alternative = prompt[: len(block) - rows]
+                    if alternative[0] == block[rows]:
+                        alternative = [(alternative[0] + 1) % VOCAB, *alternative[1:]]
+                    seed(pos)
+                    serial(pos, block[:rows])
+                    oracle = serial(pos + rows, alternative)
+                    seed(pos)
+                    verifier.stage(block, pos)
+                    ttnn.execute_trace(dev, trace, cq_id=0, blocking=True)
+                    actual = serial(pos + rows, alternative)
+                    assert all(torch.equal(a, b) for a, b in zip(actual[:2], oracle[:2])), (pos, rows)
+                    assert actual[2] == oracle[2], (pos, rows)
+                print(f"position {pos}: every rejected suffix can be overwritten by B1", flush=True)
+            print(f"{len(references)} verify replays match the serial B1 logits and taps", flush=True)
             pos = len(prompt)
             times = [[], [], []]
             traces = (model.trace_id, baseline_trace, trace)

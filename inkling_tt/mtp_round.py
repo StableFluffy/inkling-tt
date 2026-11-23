@@ -50,7 +50,7 @@ class RoundDecision:
         self.result = _alloc(device, (1, 16), ttnn.uint32, RM)
 
     def accept(self, position, target, drafts, meta):
-        """Write the commit descriptor and the accepted prefix followed by the B1 continuation."""
+        """Write the accepted range and its IDs, including the B1 continuation."""
         if len(target) != self.rows or len(drafts) != self.rows - 1:
             raise ValueError("Target and draft decisions must match the configured round width")
         _launch(_accept_program, (self.rows,), (position, *target, *drafts, meta, self.result))
@@ -90,7 +90,7 @@ class SpeculativeRound:
             bucket: DraftContextProjection(self.block, weights, bucket.chunk, self.last, meta=bucket.meta)
             for bucket in buckets
         }
-        self.verify_context = DraftContextProjection(self.block, weights, 32, self.last, meta=self.target.commit.meta)
+        self.verify_context = DraftContextProjection(self.block, weights, 32, self.last)
         self.prefill_traces = {}
         self.draft_traces = {}
         self.trace = None
@@ -118,9 +118,7 @@ class SpeculativeRound:
         drafts = self.markov.ids
         self.target.stage_device(self.anchor, drafts, self.position)
         _, target_ids = self.target.verify()
-        commit = self.target.commit
-        self.decision.accept(self.position, target_ids, drafts, commit.meta)
-        commit.commit()
+        self.decision.accept(self.position, target_ids, drafts, self.verify_context.meta)
         self._extend(self.verify_context, self.target.taps)
         self.decision.publish(self.anchor, self.position)
 

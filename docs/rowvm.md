@@ -68,7 +68,7 @@ They follow the same conventions (FP32 math, one launch, addresses as runtime ar
 | `rms_norm` | `io`, `compute` | RMSNorm of a row, optional weight |
 | `attnres_mix` | `io`, `compute` | Depth softmax over the block bank, 1-4 queries, optional weighted RMSNorm |
 | `attnres_mix(convolution=...)` | `io`, `compute` | Branch conv, residual, bank append and the next mix |
-| `depthwise_conv`, `conv_residual` | `io`, `compute` | Four-tap conv with in-place FP32 history |
+| `depthwise_conv`, `conv_residual` | `io`, `compute` | Four-tap conv with FP32 history |
 | `head_norm`, `head_norm_from_row`, `kv_norm_to_shard` | `io`, `compute` | Per-head L2 clip or RMSNorm, optional `tau` |
 | `attention_heads`, `update_kv`, `prepare_attention` | `io`, `compute`, `sink_tile` | Q, R and sink from the packed projection; K/V conv, norm and cache write |
 | `gate_from_heads`, `sigmoid_gate`, `add` | `io`, `compute` | Elementwise gate and residual |
@@ -117,7 +117,9 @@ different buffers.
 A trace records those addresses. Allocate every rowvm output and persistent input before capture,
 keep them alive for the life of the trace, and run each distinct chain once eagerly so its binary is
 compiled. The convolution and K/V programs update their histories and caches in place;
-`InklingTT2.capture` resets them after warmup and capture.
+`InklingTT2.capture` resets them after warmup and capture. On the fused single-card path, each
+convolution reads its three earlier inputs from a 32-row FP32 ring and writes the unfiltered
+input at its absolute position modulo 32.
 
 ## Constraints
 

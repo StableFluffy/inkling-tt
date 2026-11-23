@@ -429,7 +429,7 @@ void kernel_main() {
                         read_head_tile(v, tile, 2);
                     }
                 } else {
-                    const uint32_t tile = head / 3 * cache_tiles + (global ? key : key % window_tiles);
+                    const uint32_t tile = head / 3 * cache_tiles + (global ? key : key % cache_tiles);
                     if (need_score) {
                         read_head_tile(old_k, tile, 1);
                     }

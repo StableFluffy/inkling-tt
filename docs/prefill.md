@@ -57,7 +57,7 @@ The combine sums each token's eight expert outputs, weighted by `gamma`, in FP32
 
 Prefill attention is a custom kernel (`attention_io.cpp`, `attention_compute.cpp`). Stock SDPA prefill accepts one constant sink per head, while Inkling's sink varies per query, and it would need the relative bias materialized as a full mask.
 
-The single-query schedule assigns one query head and one 32-row query tile to each task. Tasks alternate early and late tiles so that contiguous task ranges have similar causal spans. The reader walks key tiles in causal order. Keys from earlier chunks come from the visit's global cache or its 1024-row ring; keys of the current chunk come from the freshly projected K and V. For the relative bias, the compute kernel multiplies the padded relative query by the layer's reversed `[32, 1024]` distance table, giving FP32 logits for distances 0-1023. The reader and writer then shear those into each score tile, even and odd lags split between them. Global keys farther than 1023 positions get no bias.
+The single-query schedule assigns one query head and one 32-row query tile to each task. Tasks alternate early and late tiles so that contiguous task ranges have similar causal spans. The reader walks key tiles in causal order. Keys from earlier chunks come from the visit's global cache or its sliding KV ring; keys of the current chunk come from the freshly projected K and V. For the relative bias, the compute kernel multiplies the padded relative query by the layer's reversed `[32, 1024]` distance table, giving FP32 logits for distances 0-1023. The reader and writer then shear those into each score tile, even and odd lags split between them. Global keys farther than 1023 positions get no bias.
 
 The softmax takes two sweeps over the keys. The first tracks the running maximum and sum in FP32, starting from the row's sink logit. The second forms probabilities, rounds them to BF16 (round to nearest even), and accumulates their product with V in FP32. Scores from the first sweep stay in L1 where they fit: a 33-tile buffer covering the window on sliding visits, and the most recent 176 tiles on global visits at 2048 rows on the tested grid. Smaller worker grids retain 148 tiles at that chunk size, and chunks up to 1024 rows retain up to 97. With the standard tt-metal dispatch ring, the 2048-row bucket retains 188 tiles on the tested grid and 160 on smaller grids. The second sweep recomputes scores beyond the retained range. The output is written token-major, ready for the gate and O projection.
 
@@ -68,7 +68,7 @@ issues pairs of historical key tiles between read barriers. Each pair stays with
 buffers, one saved-score range and one group of eight keys for the value product. This saves
 another 0.28 s on a 32k-token prompt.
 
-`state.cpp` commits the chunk's K and V after all attention reads of the visit. Global visits write absolute positions; sliding visits write the ring at `position mod 1024`. A 2048-row chunk covers the ring twice, so only the newest tile writes each slot, and a partial newest tile takes the rows past its end from the tile one ring length earlier in the same chunk.
+`state.cpp` commits the chunk's K and V after all attention reads of the visit. Global visits write absolute positions. Fused single-card sliding visits write the ring at `position mod 1088`. When a chunk wraps, only the newest tile writes each slot, and a partial newest tile takes the rows past its end from the tile one ring length earlier in the same chunk.
 
 ## Convolution, depth mixing, message gates
 
@@ -99,7 +99,7 @@ Each `Prefill` constructor refuses to run after capture. It allocates its buffer
 
 ## Sequence length
 
-`lmax`, a multiple of 32, sizes the eight global caches when the model is built; the 40 sliding visits keep fixed 1024-slot rings. Prompt plus output must fit in `lmax`. The server default and the tested maximum is 32768. Fused attention decode supports global caches up to 32768 slots (`inkling_tt/attn_decode.py`); above that, decode falls back to stock SDPA, which this release does not test. At 32768, the decode trace, both buckets and the on-device embedding table use about 31 GB of the card's 33.8 GB of allocatable DRAM ([hardware.md](hardware.md#memory)).
+`lmax`, a multiple of 32, sizes the eight global caches when the model is built; the 40 fused single-card sliding visits keep fixed 1,088-slot rings. Prompt plus output must fit in `lmax`. The server default and the tested maximum is 32768. Fused attention decode supports global caches up to 32768 slots (`inkling_tt/attn_decode.py`); above that, decode falls back to stock SDPA, which this release does not test. At 32768, the decode trace, both buckets and the on-device embedding table use about 31 GB of the card's 33.8 GB of allocatable DRAM ([hardware.md](hardware.md#memory)).
 
 ## Throughput
 

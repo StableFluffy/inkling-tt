@@ -326,7 +326,9 @@ def message_prefill_up(x, weight):
     )
 
 
-def prepare_weight(device, w_torch: torch.Tensor, dtype: ttnn.DataType = ttnn.bfloat16) -> DenseWeight:
+def prepare_weight(
+    device, w_torch: torch.Tensor, dtype: ttnn.DataType = ttnn.bfloat16, *, workers_per_bank=None
+) -> DenseWeight:
     """Upload one projection in the storage layout selected for its shape and dtype."""
     if w_torch.ndim != 2 or w_torch.device.type != "cpu" or not w_torch.is_floating_point():
         raise ValueError("Expected a floating-point CPU weight tensor with shape [K, N]")
@@ -354,7 +356,7 @@ def prepare_weight(device, w_torch: torch.Tensor, dtype: ttnn.DataType = ttnn.bf
             per_core_M=1,
             per_core_N=config.output_shard_tiles,
             fused_activation=None,
-            num_workers_per_dram_bank=config.workers,
+            num_workers_per_dram_bank=config.workers if workers_per_bank is None else workers_per_bank,
             use_multicore_pipeline=config.path == "pipe",
         )
     elif config.path == "1d":
