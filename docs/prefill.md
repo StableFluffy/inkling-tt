@@ -62,7 +62,10 @@ One task covers one query head and one 32-row query tile; tasks alternate early 
 The softmax takes two sweeps over the keys. The first tracks the running maximum and sum in FP32, starting from the row's sink logit. The second forms probabilities, rounds them to BF16 (round to nearest even), and accumulates their product with V in FP32. Scores from the first sweep stay in L1 where they fit: a 33-tile buffer covering the window on sliding visits, and the most recent 188 tiles on global visits at 2048 rows on the tested grid. Smaller worker grids retain 160 tiles at that chunk size, and chunks up to 1024 rows retain up to 97. The second sweep recomputes scores beyond the retained range. The output is written token-major, ready for the gate and O projection.
 
 With both buckets resident, retaining 188 tiles cuts 32k-token prefill time by about 0.15 s and
-uses an extra 112 KiB of L1 per attention worker.
+uses an extra 112 KiB of L1 per attention worker. The wide bucket's global attention reader also
+issues pairs of historical key tiles between read barriers. Each pair stays within the circular
+buffers, one saved-score range and one group of eight keys for the value product. This saves
+another 0.28 s on a 32k-token prompt.
 
 `state.cpp` commits the chunk's K and V after all attention reads of the visit. Global visits write absolute positions; sliding visits write the ring at `position mod 1024`. A 2048-row chunk covers the ring twice, so only the newest tile writes each slot, and a partial newest tile takes the rows past its end from the tile one ring length earlier in the same chunk.
 

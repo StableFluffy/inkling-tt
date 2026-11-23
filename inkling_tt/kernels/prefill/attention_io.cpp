@@ -4,6 +4,7 @@ constexpr uint32_t bf_bytes = 2048;
 constexpr uint32_t fp_bytes = 4096;
 constexpr uint32_t width_tiles = 4;
 constexpr uint32_t window_tiles = 32;
+constexpr uint32_t value_group_keys = 8;
 constexpr uint32_t q_tiles = get_compile_time_arg_val(0);
 constexpr uint32_t cache_tiles = get_compile_time_arg_val(1);
 constexpr bool global = get_compile_time_arg_val(2);
@@ -26,12 +27,16 @@ auto words(uint32_t addr) {
 }
 
 template <typename Acc>
-void read_head_tile(const Acc& tensor, uint32_t tile, uint32_t cb) {
-    cb_reserve_back(cb, width_tiles);
-    const uint32_t dest = get_write_ptr(cb);
+void issue_head_tile(const Acc& tensor, uint32_t tile, uint32_t dest) {
     for (uint32_t d = 0; d < width_tiles; ++d) {
         noc_async_read<bf_bytes>(tensor.get_noc_addr(tile * width_tiles + d), dest + d * bf_bytes, bf_bytes);
     }
+}
+
+template <typename Acc>
+void read_head_tile(const Acc& tensor, uint32_t tile, uint32_t cb) {
+    cb_reserve_back(cb, width_tiles);
+    issue_head_tile(tensor, tile, get_write_ptr(cb));
 }
 
 // Row r of a bias tile at lag L reads the reversed distance logits of tiles
@@ -172,6 +177,7 @@ void kernel_main() {
     const uint32_t scratch = get_write_ptr(4);
     const uint32_t distances = get_write_ptr(5);
     bool shared_distances = false;
+    bool key_cb_odd = false, value_cb_odd = false;
     for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
         const uint32_t qt = query_tile(task);
         const uint32_t head = task / q_tiles;
@@ -223,6 +229,39 @@ void kernel_main() {
             for (uint32_t key = first; key <= q_abs; ++key) {
                 const uint32_t lag = q_abs - key;
                 const bool need_score = pass == 0 || lag >= saved_tiles;
+                if constexpr (global && q_tiles == 64) {
+                    // The value product waits for probabilities for a whole group of eight keys.
+                    if (key + 1 < start && lag > window_tiles + 1 && (!need_score || !key_cb_odd) &&
+                        (!pass || (!value_cb_odd && (key - first) % value_group_keys != value_group_keys - 1)) &&
+                        (pass == 0 || lag > saved_tiles || !need_score)) {
+                        constexpr uint32_t pair = 2 * width_tiles;
+                        if (need_score) {
+                            cb_reserve_back(1, pair);
+                        }
+                        if (pass) {
+                            cb_reserve_back(2, pair);
+                        }
+                        const uint32_t tile = head / 3 * cache_tiles + key;
+                        for (uint32_t i = 0; i < 2; ++i) {
+                            const uint32_t offset = i * width_tiles * bf_bytes;
+                            if (need_score) {
+                                issue_head_tile(old_k, tile + i, get_write_ptr(1) + offset);
+                            }
+                            if (pass) {
+                                issue_head_tile(old_v, tile + i, get_write_ptr(2) + offset);
+                            }
+                        }
+                        noc_async_read_barrier();
+                        if (need_score) {
+                            cb_push_back(1, pair);
+                        }
+                        if (pass) {
+                            cb_push_back(2, pair);
+                        }
+                        ++key;
+                        continue;
+                    }
+                }
                 if (key >= start) {
                     const uint32_t tile = head / 3 * q_tiles + key - start;
                     if (need_score) {
@@ -248,9 +287,11 @@ void kernel_main() {
                 noc_async_read_barrier();
                 if (need_score) {
                     cb_push_back(1, width_tiles);
+                    key_cb_odd = !key_cb_odd;
                 }
                 if (pass) {
                     cb_push_back(2, width_tiles);
+                    value_cb_odd = !value_cb_odd;
                 }
             }
         }
