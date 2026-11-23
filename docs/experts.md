@@ -58,8 +58,9 @@ rounds the sum to BF16 once, after slot 7, and writes the output row to L1.
 The data movement is the same in both programs:
 
 - The reader core reads the eight IDs (16 bytes), computes each block's bank-local address from the
-  expert ID and issues 13,056-byte reads (12 tiles) with transaction IDs into a three-block ring. It
-  restores the NoC read command state when it finishes, because that state survives across launches.
+  expert ID and issues 13,056-byte reads (12 tiles) into a two-block ring. At most one block of reads
+  is in flight per worker while compute consumes the other block. The reader restores the NoC read
+  command state when it finishes, because that state survives across launches.
 - The writer core gathers the live row of the activation into 8x32 BF16 tiles for the matmul and
   scatters the result rows.
 - If `x`, the IDs or the weights are in DRAM, a small staging program copies them to L1 first. The
@@ -67,11 +68,11 @@ The data movement is the same in both programs:
 
 ## Speed
 
-In a microbenchmark that starts with the route ready, one visit takes about 155 µs (gate/up about
-100 µs, down about 50 µs), against about 234 µs for the stock path. The eight selected experts'
-bytes over that time are about 438 GB/s, 85 % of the card's rated 512 GB/s. Over 48 visits the
-experts take about 7.1 ms of the token; [design.md](design.md) has the full breakdown and
-[benchmarks.md](benchmarks.md) the release figures.
+In a microbenchmark with the route ready, one visit takes about 146 µs, compared with 234 µs in
+the stock path. The 67.7 MB of weights streamed per visit gives 464 GB/s, 95 % of the 490 GB/s a
+contiguous DRAM read benchmark reaches. Over 48 visits the experts take about 6.9 ms of the
+token. See [design.md](design.md) for the breakdown and [benchmarks.md](benchmarks.md) for the
+end-to-end measurements.
 
 Stock indexed `sparse_matmul` also reads only the routed experts, so the gain does not come from
 reading fewer bytes. It comes from two things:

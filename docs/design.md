@@ -1,6 +1,6 @@
 # Decode design
 
-A decode step is one trace replay: 750 device programs that run the 48 layer visits of one token and the LM head. The weight-streaming programs take about 15.3 ms of the 19.4 ms of kernel time per token. That is close to what reading the weights costs at the bandwidth a p150a sustains, so the remaining work is in the other 4 ms and in the gaps between programs.
+A decode step is one trace replay: 703 device programs that run the 48 layer visits of one token and the LM head. The weight-streaming programs take about 15 ms of the 19 ms of kernel time per token. That is close to what reading the weights costs at the bandwidth the tested p150a sustains. A contiguous, bank-local read benchmark reaches 490 GB/s.
 
 Two rules shaped the design:
 
@@ -9,23 +9,23 @@ Two rules shaped the design:
 
 ## Where the time goes
 
-Device profile of one token on the tested card (13x10 workers, `lmax` 8192, BFP8_B experts). Kernel times are sums over all programs of a kind.
+Device profile of one token on the tested card (13x10 workers, `lmax` 2048, BFP8_B experts). Kernel times are sums over all programs of a kind.
 
 | Work | Programs | Kernel ms |
 |---|---:|---:|
-| Routed experts (gate/up, down) | 96 | 7.1 |
+| Routed experts (gate/up, down) | 96 | 6.9 |
 | Q/relative/sink/gate and O projections | 96 | 4.6 |
 | LM head | 1 | 2.1 |
 | K/V and dynamic-tap projections | 112 | 1.5 |
 | Attention-residual mixes | 120 | 1.4 |
-| Message-gate projections | 144 | 1.3 |
+| Message-gate projections | 96 | 1.2 |
 | Router | 48 | 0.5 |
-| Fused attention | 48 | 0.5 |
+| Fused attention | 48 | 0.4 |
 | Attention preparation (norms, conv, cache write) | 48 | 0.3 |
-| Readout, layout and small epilogues | 37 | 0.1 |
-| **Total** | **750** | **19.4** |
+| Readout, layout and small epilogues | 38 | 0.1 |
+| **Total** | **703** | **19.1** |
 
-The first four rows stream weights; together they are the 15.3 ms. The profiled span is about 20.4 ms, so the gaps between programs add about 1 ms. Unprofiled greedy decode runs at about 20.0 ms per token ([benchmarks.md](benchmarks.md)).
+The first four rows stream weights. The firmware span includes about 1 ms between programs. Unprofiled greedy decode runs at about 19.9 ms per token ([benchmarks.md](benchmarks.md)).
 
 ## From the first port to this release
 
@@ -50,7 +50,7 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 
 **Dense projections.** Batch-1 projections are matrix-vector products, bound by weight bandwidth. `inkling_tt/dense.py` picks a DRAM-sharded matmul configuration per shape, so each DRAM bank feeds the workers next to it. The four attention projections of a visit (Q, relative-bias query, sink, output gate) share one fused weight and one program. See [dense.md](dense.md).
 
-**Routed experts.** Each visit routes to 8 of 128 experts. The stock indexed `sparse_matmul` reads only the routed experts too, but from tiles interleaved across all DRAM banks and in six programs. `inkling_tt/experts_stream.py` stores each expert as contiguous bank-local BFP8_B runs and reads the eight selected experts in two programs, about 155 µs per visit instead of 234 µs. Routing stays on device: the router writes expert IDs and weights to a buffer the expert kernels read. See [experts.md](experts.md).
+**Routed experts.** Each visit routes to 8 of 128 experts. The stock indexed `sparse_matmul` reads only the routed experts too, but from tiles interleaved across all DRAM banks and in six programs. `inkling_tt/experts_stream.py` stores each expert as contiguous bank-local BFP8_B runs and reads the eight selected experts in two programs, about 146 µs per visit instead of 234 µs. Routing stays on device: the router writes expert IDs and weights to a buffer the expert kernels read. See [experts.md](experts.md).
 
 **Row epilogues.** Between the matmuls sit chains of small row operations: RMS norms, attention-residual mixing over block banks, head norms and clips, depthwise convolutions, top-8 routing, the MoE activation and combine. As separate TTNN ops they cost 3-5 µs each and dominated the step. `inkling_tt/rowvm.py` compiles each chain into one `generic_op` program that keeps the row in L1 and does its math in FP32. See [rowvm.md](rowvm.md).
 
@@ -71,4 +71,4 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 
 ## Remaining budget
 
-About 4 ms of kernel time and 1 ms of gaps sit outside weight streaming. The largest items are the 120 attention-residual mixes (1.4 ms), attention preparation and fused attention (0.8 ms), the message-gate up projections (0.9 ms, partly FP32 weight reads) and the router (0.5 ms). Shaving single programs has small returns now. The next real gain needs overlap across programs, for example prefetching the next visit's weights on a sub-device while the epilogues run, or a persistent decode kernel.
+About 4 ms of kernel time and 1 ms of gaps sit outside weight streaming. The largest items are the 120 attention-residual mixes (1.4 ms), attention preparation and fused attention (0.8 ms), the message-gate up projections (0.7 ms, partly FP32 weight reads) and the router (0.5 ms). Shaving single programs has small returns now. The next real gain needs overlap across programs, for example prefetching the next visit's weights on a sub-device while the epilogues run, or a persistent decode kernel.

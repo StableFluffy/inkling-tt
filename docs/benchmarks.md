@@ -1,6 +1,6 @@
 # Benchmarks
 
-Release measurements for v0.1.0, taken from a fresh clone of the release commit and a fresh tt-metal build, on one p150a in the [tested configuration](hardware.md#tested-configuration): 13x10 workers, 380 W, tt-metal `79951bd4`. Everything is batch 1 with the default precision policy (BF16 dense, attention and KV cache, BFP8_B experts, HiFi4 with FP32 accumulation).
+Measurements on one p150a in the [tested configuration](hardware.md#tested-configuration): 13x10 workers, 380 W, tt-metal `79951bd4`. Everything is batch 1 with the default precision policy (BF16 dense, attention and KV cache, BFP8_B experts, HiFi4 with FP32 accumulation).
 
 ## Decode
 
@@ -8,10 +8,12 @@ Release measurements for v0.1.0, taken from a fresh clone of the release commit 
 
 | Path | Median | p95 | Tokens/s |
 |---|---:|---:|---:|
-| Greedy, device argmax | 20.02 ms | 20.09 ms | 49.9 |
-| Full logits read back to the host | 20.75 ms | 20.87 ms | 48.2 |
+| Greedy, device argmax | 19.92 ms | 20.05 ms | 50.2 |
+| Full logits read back to the host | 21.06 ms | 21.74 ms | 47.5 |
 | Greedy, stock SDPA attention (`INK_ATTN_DECODE=0`) | 22.79 ms | 22.84 ms | 43.9 |
 | Greedy, restricted to 11x10 (`INK_GRID=11x10`) | 20.54 ms | 20.58 ms | 48.7 |
+
+The default-path rows use 120 timed steps per mode, alternating the two-block reader with the v0.1.0 three-block reader in one job. The three-block reader measured 20.15 ms median and 20.33 ms p95 for greedy decode. Both produced the same 64 greedy tokens. The stock SDPA, restricted grid, and server figures are from v0.1.0.
 
 Decode slows slightly with context length because global-attention visits read more cache: about 20.7 ms/token after a 1.6k-token prompt and 21.3 ms/token after 7.8k tokens (server measurements below).
 

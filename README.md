@@ -43,7 +43,7 @@ The first start compiles the kernels and takes about four minutes. To run the te
 
 ## How it works
 
-A decode step is a single captured trace of 750 device programs. Most of the time goes to reading weights. The DRAM-sharded dense projections and a custom expert streamer, which reads the eight routed experts from bank-local packs, run near the card's memory bandwidth. Between the matmuls, chains of small operations (norms, depth mixing, routing, convolutions) are each fused into one custom program, because launching a program costs more than most of these chains compute. Attention, the readout and greedy token feedback also run as fused programs on the device, so the host leaves the loop during generation.
+A decode step is a single captured trace of 703 device programs. Most of the time goes to reading weights. The DRAM-sharded dense projections and a custom expert streamer, which reads the eight routed experts from bank-local packs, run near the card's memory bandwidth. Between the matmuls, chains of small operations (norms, depth mixing, routing, convolutions) are each fused into one custom program, because launching a program costs more than most of these chains compute. Attention, the readout and greedy token feedback also run as fused programs on the device, so the host leaves the loop during generation.
 
 Read [docs/design.md](docs/design.md) for the time budget and the main techniques.
 
