@@ -19,7 +19,9 @@ _LAUNCH_LOCK = Lock()
 
 
 @lru_cache(maxsize=24)
-def _program(accessors, length, physical_length, global_cache, gate_tile, cols, rows, first_head, heads, row, batch):
+def _program(
+    accessors, length, physical_length, global_cache, gate_tile, cols, rows, first_head, heads, row, batch, parallel
+):
     grid = ttnn.num_cores_to_corerangeset(heads * _SPLITS, ttnn.CoreCoord(cols, rows), row_wise=True)
     split_tiles = (length // 32 + _SPLITS - 1) // _SPLITS
     tiles = min(split_tiles, 4)
@@ -49,6 +51,8 @@ def _program(accessors, length, physical_length, global_cache, gate_tile, cols, 
     if row:
         defines.append(("ATTN_QUERY_ROW", str(row)))
     batch_defines = [("ATTN_ROWS", str(batch)), ("ATTN_WORKERS", str(heads * _SPLITS))] if batch > 1 else []
+    if parallel:
+        batch_defines.append(("ATTN_PARALLEL_ROWS", "1"))
     defines.extend(batch_defines)
     kernels = [
         ttnn.KernelDescriptor(
@@ -168,12 +172,12 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
     return _decode(((q, relative, sink, position),), k, v, table, gate, global_cache, gate_col, out, row)
 
 
-def decode_rows(queries, k, v, table, gate, *, global_cache, gate_col, out):
+def decode_rows(queries, k, v, table, gate, *, global_cache, gate_col, out, parallel=True):
     """Apply the B1 attention partition to each consecutive query in one program."""
-    return _decode(queries, k, v, table, gate, global_cache, gate_col, out, 0)
+    return _decode(queries, k, v, table, gate, global_cache, gate_col, out, 0, parallel=parallel)
 
 
-def _decode(queries, k, v, table, gate, global_cache, gate_col, out, row):
+def _decode(queries, k, v, table, gate, global_cache, gate_col, out, row, *, parallel=False):
     batch = len(queries)
     if not 1 <= batch <= 8:
         raise ValueError("attention requires one to eight query rows")
@@ -256,6 +260,7 @@ def _decode(queries, k, v, table, gate, global_cache, gate_col, out, row):
                 heads,
                 row,
                 batch,
+                parallel and 2 <= batch <= _SPLITS // 4,
             )
             kernels[0].common_runtime_args = [*addresses, *peers, *extra]
             kernels[1].common_runtime_args = [*addresses, *peers, *extra]

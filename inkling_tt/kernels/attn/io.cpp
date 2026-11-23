@@ -24,8 +24,8 @@ constexpr uint32_t ring_tiles = cache_tiles;
 #endif
 constexpr uint32_t operand_count = 9;
 
-uint64_t peer_addr(uint32_t head, uint32_t split, uint32_t addr) {
-    const uint32_t xy = get_common_arg_val<uint32_t>(operand_count + (head - first_head) * splits + split);
+uint64_t peer_addr(uint32_t head, uint32_t worker, uint32_t addr) {
+    const uint32_t xy = get_common_arg_val<uint32_t>(operand_count + (head - first_head) * splits + worker);
     return get_noc_addr(xy & 0xffff, xy >> 16, addr);
 }
 
@@ -131,16 +131,19 @@ void read_values(uint32_t head, const Work& work, uint32_t pos) {
 #ifndef ATTN_WRITER
 uint32_t read_position(uint32_t query) {
     const auto position = operand<6>(4, query);
+    const uint32_t scratch = get_write_ptr(reader_scratch);
+    noc_async_read<4>(position.get_noc_addr(0), scratch, 4);
+    noc_async_read_barrier();
+    return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch);
+}
+
+void publish_position(uint32_t pos) {
     cb_reserve_back(compute_position_cb, 1);
     cb_reserve_back(writer_position_cb, 1);
-    const uint32_t dst = get_write_ptr(compute_position_cb);
-    noc_async_read<4>(position.get_noc_addr(0), dst, 4);
-    noc_async_read_barrier();
-    const uint32_t pos = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(dst);
+    *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(compute_position_cb)) = pos;
     *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_write_ptr(writer_position_cb)) = pos;
     cb_push_back(compute_position_cb, 1);
     cb_push_back(writer_position_cb, 1);
-    return pos;
 }
 
 void read_inputs(uint32_t head, uint32_t split, uint32_t pos, const Work& work, uint32_t query, bool first_chunk = true) {
@@ -272,7 +275,7 @@ void gather_stats(uint32_t head, uint32_t active) {
     cb_push_back(group_stats_cb, 2);
 }
 #else
-void send_stats(uint32_t head, uint32_t split) {
+void send_stats(uint32_t head, uint32_t split, uint32_t first) {
     cb_wait_front(local_stats_cb, 1);
     const auto local = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(local_stats_cb));
     const uint32_t scratch = get_write_ptr(writer_scratch);
@@ -282,38 +285,38 @@ void send_stats(uint32_t head, uint32_t split) {
         msg[h * 2] = local[(row + h) * 16];
         msg[h * 2 + 1] = local[(row + h) * 16 + 1];
     }
-    noc_async_write(scratch, peer_addr(head, 0, get_write_ptr(stats_inbox) + split * 32), 32);
+    noc_async_write(scratch, peer_addr(head, first, get_write_ptr(stats_inbox) + split * 32), 32);
     noc_async_write_barrier();
-    noc_semaphore_inc(peer_addr(head, 0, get_semaphore(stats_sem)), 1);
+    noc_semaphore_inc(peer_addr(head, first, get_semaphore(stats_sem)), 1);
     cb_pop_front(local_stats_cb, 1);
 }
 
-void broadcast_factors(uint32_t head, uint32_t active) {
+void broadcast_factors(uint32_t head, uint32_t active, uint32_t first) {
     cb_wait_front(factor_out_cb, 1);
     const uint32_t src = get_read_ptr(factor_out_cb);
     for (uint32_t split = 0; split < active; ++split) {
-        noc_async_write(src, peer_addr(head, split, get_write_ptr(factor_in_cb)), (queries + (head & 1)) * fp_row);
+        noc_async_write(src, peer_addr(head, first + split, get_write_ptr(factor_in_cb)), (queries + (head & 1)) * fp_row);
     }
     noc_async_write_barrier();
     for (uint32_t split = 0; split < active; ++split) {
-        noc_semaphore_inc(peer_addr(head, split, get_semaphore(factor_sem)), 1);
+        noc_semaphore_inc(peer_addr(head, first + split, get_semaphore(factor_sem)), 1);
     }
     cb_pop_front(factor_out_cb, 1);
 }
 
-void send_partials(uint32_t head, uint32_t split) {
+void send_partials(uint32_t head, uint32_t split, uint32_t first) {
     DeviceZoneScopedN("INK_ATTN_SEND_VALUES");
     cb_wait_front(partials_out_cb, dim_tiles);
     const uint32_t src = get_read_ptr(partials_out_cb);
     const uint32_t dst = get_write_ptr(partials_in_cb) + split * fp_tile;
     for (uint32_t d = 0; d < dim_tiles; ++d) {
         const uint32_t tile = src + d * fp_tile;
-        noc_async_write(tile, peer_addr(head, d, dst), (queries + (head & 1)) * fp_row);
-        noc_async_write(tile + 1024, peer_addr(head, d, dst + 1024), (queries + (head & 1)) * fp_row);
+        noc_async_write(tile, peer_addr(head, first + d, dst), (queries + (head & 1)) * fp_row);
+        noc_async_write(tile + 1024, peer_addr(head, first + d, dst + 1024), (queries + (head & 1)) * fp_row);
     }
     noc_async_write_barrier();
     for (uint32_t d = 0; d < dim_tiles; ++d) {
-        noc_semaphore_inc(peer_addr(head, d, get_semaphore(partials_sem)), 1);
+        noc_semaphore_inc(peer_addr(head, first + d, get_semaphore(partials_sem)), 1);
     }
     cb_pop_front(partials_out_cb, dim_tiles);
 }
@@ -335,9 +338,8 @@ void write_output(uint32_t head, uint32_t d, uint32_t query) {
     cb_pop_front(gated_cb, 1);
 }
 #endif
-void run_row(uint32_t head, uint32_t split, uint32_t query) {
+void run_row(uint32_t head, uint32_t split, uint32_t query, uint32_t pos, [[maybe_unused]] uint32_t first) {
 #ifndef ATTN_WRITER
-    const uint32_t pos = read_position(query);
     const Work work(pos, cache_tiles, split);
     if (work.tile_count || split < dim_tiles) {
         if constexpr (streaming) {
@@ -366,30 +368,35 @@ void run_row(uint32_t head, uint32_t split, uint32_t query) {
         cb_push_back(partials_in_cb, pages);
     }
 #else
-    cb_wait_front(writer_position_cb, 1);
-    const uint32_t pos = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(writer_position_cb));
-    cb_pop_front(writer_position_cb, 1);
     const Work work(pos, cache_tiles, split);
     if (work.tile_count) {
         if constexpr (!streaming) {
             read_values(head, work, pos);
         }
-        send_stats(head, split);
+        send_stats(head, split, first);
         if (split == 0) {
-            broadcast_factors(head, work.active_splits);
+            broadcast_factors(head, work.active_splits, first);
         }
         if constexpr (streaming) {
             for (uint32_t offset = 0; offset < work.tile_count; offset += chunk_tiles) {
                 read_values(head, work.chunk(offset, chunk_tiles), pos);
             }
         }
-        send_partials(head, split);
+        send_partials(head, split, first);
     }
     if (split < dim_tiles) {
         write_output(head, split, query);
     }
 #endif
 }
+#ifdef ATTN_WRITER
+uint32_t receive_position() {
+    cb_wait_front(writer_position_cb, 1);
+    const uint32_t pos = *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_read_ptr(writer_position_cb));
+    cb_pop_front(writer_position_cb, 1);
+    return pos;
+}
+#endif
 }  // namespace
 
 void kernel_main() {
@@ -397,8 +404,51 @@ void kernel_main() {
     const uint32_t worker = get_absolute_logical_y() * grid_width + get_absolute_logical_x();
     const uint32_t head = first_head + worker / splits;
     const uint32_t split = worker % splits;
+#ifdef ATTN_PARALLEL_ROWS
+#ifdef ATTN_WRITER
+    const uint32_t start = receive_position();
+#else
+    const uint32_t start = read_position(0);
+    const Work last(start + rows - 1, cache_tiles, 0);
+    if (last.active_splits <= row_lanes) {
+        const uint32_t query = split / row_lanes;
+        publish_position(query < rows ? (start + query) | parallel_pos : idle_pos);
+        if (query < rows) {
+            run_row(head, split % row_lanes, query, start + query, query * row_lanes);
+        }
+        return;
+    }
+    publish_position(start);
+#endif
+#ifdef ATTN_WRITER
+    if (start & parallel_pos) {
+        if (start != idle_pos) {
+            const uint32_t query = split / row_lanes;
+            run_row(head, split % row_lanes, query, start & ~parallel_pos, query * row_lanes);
+        }
+        return;
+    }
+#endif
+#endif
     for (uint32_t query = 0; query < rows; ++query) {
-        run_row(head, split, query);
+#ifdef ATTN_WRITER
+#ifdef ATTN_PARALLEL_ROWS
+        const uint32_t pos = query == 0 ? start : receive_position();
+#else
+        const uint32_t pos = receive_position();
+#endif
+#else
+#ifdef ATTN_PARALLEL_ROWS
+        const uint32_t pos = start + query;
+        if (query != 0) {
+            publish_position(pos);
+        }
+#else
+        const uint32_t pos = read_position(query);
+        publish_position(pos);
+#endif
+#endif
+        run_row(head, split, query, pos, 0);
 #ifdef ATTN_ROWS
         if (query + 1 < rows) {
             synchronize_row(head, split);

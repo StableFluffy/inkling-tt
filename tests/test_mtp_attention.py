@@ -17,7 +17,8 @@ def main():
         device.enable_program_cache()
         for global_cache in (False, True):
             check(device, global_cache)
-            check_rows(device, global_cache)
+            for rows in (2, 3, 4):
+                check_rows(device, global_cache, rows)
     finally:
         ttnn.close_device(device)
 
@@ -102,7 +103,7 @@ def check(device, global_cache):
         ttnn.release_trace(device, trace)
 
 
-def check_rows(device, global_cache):
+def check_rows(device, global_cache, rows):
     rng = torch.Generator().manual_seed(1051)
     placement = dense._l1_shards(device, 3072, 4)
     capacity = 2208 if global_cache else attn_decode.RING_SLOTS
@@ -118,7 +119,7 @@ def check_rows(device, global_cache):
             upload((32, 32)),
             _alloc(device, (1,), ttnn.int32, RM),
         )
-        for _ in range(4)
+        for _ in range(rows)
     )
     k, v = (upload((1, 8, capacity, 128)) for _ in range(2))
     gate = upload((1, 1, 32, 3072), placement)
@@ -149,13 +150,15 @@ def check_rows(device, global_cache):
     grouped()
     ttnn.end_trace_capture(device, trace, cq_id=0)
     try:
-        for start in (1, 29, 31, 61, 127, 257, 1023, 1087, 2015, 2047, 2204):
+        cutoff = 32 * (16 // rows)
+        cases = (1, 29, 31, 61, cutoff - rows, cutoff - rows + 1, cutoff, 1023, 1087, 2015, 2047, 2204)
+        for start in cases:
             position(start)
             serial()
-            oracle = ttnn.to_torch(out)[..., :4, :]
+            oracle = ttnn.to_torch(out)[..., :rows, :]
             ttnn.execute_trace(device, trace, cq_id=0, blocking=True)
-            assert torch.equal(ttnn.to_torch(out)[..., :4, :], oracle), (global_cache, start)
-        print(f"{capacity} slots: one attention launch matches 44 serial B1 rows", flush=True)
+            assert torch.equal(ttnn.to_torch(out)[..., :rows, :], oracle), (global_cache, start)
+        print(f"{capacity} slots: width {rows} matches {len(cases) * rows} serial B1 rows", flush=True)
     finally:
         ttnn.release_trace(device, trace)
 

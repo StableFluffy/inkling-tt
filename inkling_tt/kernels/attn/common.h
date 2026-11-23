@@ -18,6 +18,11 @@ constexpr bool batched_rows = true;
 constexpr uint32_t rows = 1;
 constexpr bool batched_rows = false;
 #endif
+#ifdef ATTN_PARALLEL_ROWS
+constexpr uint32_t row_lanes = splits / rows;
+constexpr uint32_t parallel_pos = 1u << 31;
+constexpr uint32_t idle_pos = ~0u;
+#endif
 
 inline bool relative_tile_is_zero(uint32_t pos, uint32_t tile) {
     return pos >= window + tile * 32 + 31;

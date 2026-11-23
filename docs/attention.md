@@ -91,6 +91,11 @@ The two in-program reductions use L1 mailboxes and semaphores between the worker
 heads need 128 workers. On the 13x10 grid all eight run in one launch; on 11x10 and 12x10 the kernel
 launches two groups of four heads, with the same splits and reduction order.
 
+For two to four verify rows, a short prefix leaves enough workers in each KV head to give every
+query a disjoint group. Each group runs the same split indices and FP32 reductions as B1. As
+the key prefix grows, the launch reuses a KV head's workers across queries and synchronizes the
+head before reusing its circular buffers.
+
 ## Cost
 
 Measured in isolation, without the Q/K/V preparation and the O projection:

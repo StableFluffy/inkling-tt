@@ -66,8 +66,9 @@ The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dyn
 O each use one sweep of their B1 weights. Head preparation and attention read
 the query's row directly from the packed projections. The output gate writes into that same row
 of the O projection's input shards. One attention launch per head group runs every verify row
-with its B1 split and FP32 reduction order. The workers synchronize within each KV head before
-reusing the circular buffers for the next query.
+with its B1 split and FP32 reduction order. Short prefixes fit on disjoint workers for each
+query. At longer positions the queries reuse a KV head's workers and synchronize before
+reusing its circular buffers.
 
 The post-attention and post-MLP convolution and mix epilogues run on disjoint core groups.
 Each row reads earlier inputs within the block directly from the packed projection or expert

@@ -339,10 +339,14 @@ void combine_values(uint32_t active) {
     cb_pop_front(partials_in_cb, pages);
     cb_pop_front(gate_cb, 1);
 }
-void run_row(uint32_t split) {
+uint32_t receive_position() {
     cb_wait_front(compute_position_cb, 1);
     const uint32_t pos = read_tile_value(compute_position_cb, 0, 0);
     cb_pop_front(compute_position_cb, 1);
+    return pos;
+}
+
+void run_row(uint32_t split, uint32_t pos) {
     const Work work(pos, cache_tiles, split);
     if constexpr (!batched_rows) {
         if (work.tile_count || split < dim_tiles) {
@@ -389,7 +393,19 @@ void kernel_main() {
     if constexpr (batched_rows) {
         compute_kernel_hw_startup<SrcOrder::Reverse>(q_cb, k_cb, exps_cb);
     }
+#ifdef ATTN_PARALLEL_ROWS
+    const uint32_t pos = receive_position();
+    if (pos & parallel_pos) {
+        if (pos != idle_pos) {
+            run_row(split % row_lanes, pos & ~parallel_pos);
+        }
+        return;
+    }
+    run_row(split, pos);
+    for (uint32_t row = 1; row < rows; ++row) {
+#else
     for (uint32_t row = 0; row < rows; ++row) {
-        run_row(split);
+#endif
+        run_row(split, receive_position());
     }
 }
