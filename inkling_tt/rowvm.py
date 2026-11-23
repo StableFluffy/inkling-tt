@@ -474,8 +474,12 @@ def _group_program(keys, projection=()):
     programs = [_program(*key) for key in keys]
     if projection:
         programs.append(_kv_program(*projection))
+    kernels = [kernel for _, items in programs for kernel in items]
+    # Hash the same unbound descriptors after cache eviction.
+    for kernel in kernels:
+        kernel.common_runtime_args = []
     desc = ttnn.ProgramDescriptor(
-        kernels=[k for _, kernels in programs for k in kernels],
+        kernels=kernels,
         cbs=[cb for p, _ in programs for cb in p.cbs],
         semaphores=[s for p, _ in programs for s in p.semaphores],
     )

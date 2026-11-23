@@ -5,7 +5,7 @@ import time
 import torch
 import ttnn
 
-from inkling_tt import paths
+from inkling_tt import paths, rowvm
 from inkling_tt.model import VOCAB
 from inkling_tt.model2 import InklingTT2
 from inkling_tt.mtp_target import TargetVerify
@@ -80,6 +80,7 @@ def main(trace_only):
             ttnn.synchronize_device(dev)
             seed(len(prompt))
             verifier.stage(block, len(prompt))
+            rowvm._group_program.cache_clear()
             trace = ttnn.begin_trace_capture(dev, cq_id=0)
             verifier.verify(grouped_glue=glue, grouped_attention=attention)
             ttnn.end_trace_capture(dev, trace, cq_id=0)
