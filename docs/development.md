@@ -70,6 +70,17 @@ scripts/dev_run.sh "TT_METAL_DEVICE_PROFILER=1 python -m tracy -r -p -o \$INKLIN
 
 `tests/prof_trace.py` captures the decode trace for the given number of layers (default 7) and replays three steps under the profiler.
 
+The MTP profile alternates widths one through four with both prefill buckets resident. It replays two consecutive rounds per sample and uses a larger profiler buffer so both rounds fit.
+
+```bash
+scripts/dev_run.sh "TT_METAL_DEVICE_PROFILER=1 TT_METAL_PROFILER_PROGRAM_SUPPORT_COUNT=10000 \
+  python -m tracy -r -p --no-web-server --dump-device-data-mid-run \
+  --disable-device-data-dump-to-files --disable-device-data-push-to-tracy \
+  -o \$INKLING_WORK/prof-mtp tests/prof_trace.py --mtp --position 29"
+```
+
+The log pairs trace IDs with the draft, verification and context stages and labels the generic expert and decision programs. The gap between the two rounds includes host feedback and dispatch work.
+
 Profiled spans run 0.2-0.4 ms longer than unprofiled replay. Group the rows of `cpp_device_perf_report.csv` by kind of work, as in the table in [design.md](design.md#where-the-time-goes), and compare kernel sums with the firmware span to separate kernel time from gaps. When the weight-streaming rows are close to their byte cost, the remaining budget is the glue and the gaps.
 
 ## Trace rules
