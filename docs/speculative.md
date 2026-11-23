@@ -58,12 +58,13 @@ Each four-tap convolution reads its three earlier inputs from a 32-row FP32 ring
 its current input to that ring. Prefill writes its final four inputs into the same slots. Both
 decode paths share the per-visit rings.
 
-The verifier groups independent input mixes on disjoint cores and batches the Q/K/V message
-controllers across rows. Each controller retains its B1 reduction order. Grouping cuts the
-four-row verifier replay from 39.03 to 38.56 ms at a short prefix.
+The verifier groups previous-pass message mixes with independent attention input mixes on
+disjoint cores. It batches the Q/K/V message controllers across rows and retains their B1
+reduction order. At a short prefix the full four-row verifier replays in 36.45 ms.
 
-The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dynamic taps and
-O each use one sweep of their B1 weights. Head preparation and attention read
+One launch packs the Q, K and V inputs into BF16 tile rows. The dynamic taps reuse the
+packed K and V inputs where their layouts match. Q, K, V, the dynamic taps and O each
+use one sweep of their B1 weights. Head preparation and attention read
 the query's row directly from the packed projections. The output gate writes into that same row
 of the O projection's input shards. One attention launch per head group runs every verify row
 with its B1 split and FP32 reduction order. Short prefixes fit on disjoint workers for each
@@ -139,8 +140,8 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
 | Batched attention against serial B1 | 88/88 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 38.56 ms median, 38.58 ms p95 |
-| B1 greedy in the same job | 19.08 ms median, 19.09 ms p95 |
+| Four-row target verify at `lmax=1120` | 36.45 ms median, 36.61 ms p95 |
+| B1 greedy in the same job | 19.14 ms median, 19.16 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.

@@ -9,7 +9,7 @@ from inkling_tt import attn_decode, rowvm
 from inkling_tt.model import DR, HD, HKV, HQ, LOOP0, LOOP1, NB, NPASS, VOCAB, D, visit_slot
 from inkling_tt.model2 import BF, DRAM, FP, L1, MTP_TAP_VISITS, RM, TILE, Step, _DecodeBank
 from inkling_tt.mtp_experts import VerifyExperts
-from inkling_tt.mtp_projection import SharedProjection, _pack_rows, _tile_row
+from inkling_tt.mtp_projection import SharedProjection, _pack_projections, _pack_rows, _projection_tasks, _tile_row
 from inkling_tt.mtp_weights import PADDED_VOCAB
 from inkling_tt.prefill import _alloc, _grid, _launch, _program, _tasks, _tile_cb
 
@@ -69,6 +69,7 @@ class TargetVerify:
             SharedProjection(device, w)
             for w in (q_weight, layer.wk, layer.wv, global_layer.k_wproj, global_layer.v_wproj, o_weight)
         )
+        self.projection_tasks = _projection_tasks(device, D // 32, 3)
         self.scratch = tuple(
             SimpleNamespace(
                 visit=tuple(
@@ -142,7 +143,16 @@ class TargetVerify:
         outputs = tuple(tensor for step in self.steps[:rows] for tensor in (step.x, step.pos_g, step.tau))
         _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, rows)), (*inputs, *outputs))
 
-    def verify(self, *, rows=None, grouped_glue=True, grouped_attention=True, grouped_front=True, grouped_inputs=True):
+    def verify(
+        self,
+        *,
+        rows=None,
+        grouped_glue=True,
+        grouped_attention=True,
+        grouped_front=True,
+        grouped_inputs=True,
+        packed_projections=True,
+    ):
         m = self.model
         rows = self.rows if rows is None else rows
         if not 2 <= rows <= self.rows:
@@ -152,8 +162,17 @@ class TargetVerify:
         block_attention = self.shared and grouped_attention
         front = batch and block_attention and grouped_front
         input_groups = front and grouped_inputs and m.c.shard_fusion and m.c.group_gates
+        pack = self.shared and packed_projections
         states = self._range(
-            0, LOOP0, 0, states, batch=batch, block_attention=block_attention, front=front, input_groups=input_groups
+            0,
+            LOOP0,
+            0,
+            states,
+            batch=batch,
+            block_attention=block_attention,
+            front=front,
+            input_groups=input_groups,
+            pack=pack,
         )
         prefix = states
         states = self._range(
@@ -165,6 +184,7 @@ class TargetVerify:
             block_attention=block_attention,
             front=front,
             input_groups=input_groups,
+            pack=pack,
         )
         for p in range(1, NPASS):
             reenter = [(x, bank._replace(tail_start=1 + p * ((LOOP1 - LOOP0) // NB)), None) for x, bank, _ in prefix]
@@ -178,6 +198,7 @@ class TargetVerify:
                 block_attention=block_attention,
                 front=front,
                 input_groups=input_groups,
+                pack=pack,
             )
         states = self._range(
             LOOP1,
@@ -188,6 +209,7 @@ class TargetVerify:
             block_attention=block_attention,
             front=front,
             input_groups=input_groups,
+            pack=pack,
         )
         if front:
             _pack_rows(self.taps[3], [hidden for _, _, hidden in states], self.mlp_tasks)
@@ -208,7 +230,7 @@ class TargetVerify:
             rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
         return self.logits[:rows], self.ids[:rows]
 
-    def _range(self, first, stop, pass_id, states, previous=None, *, batch, block_attention, front, input_groups):
+    def _range(self, first, stop, pass_id, states, previous=None, *, batch, block_attention, front, input_groups, pack):
         m = self.model
         for layer in m.layers[first:stop]:
             slot = visit_slot(layer.i, pass_id if layer.is_loop else 0)
@@ -219,8 +241,9 @@ class TargetVerify:
                 else:
                     for i, (x, _, _) in enumerate(states):
                         _tile_row(x, self.taps[tap], target=i)
-            messages_by_row = []
-            for i in range(len(states)):
+            mix_group = rowvm._Group() if input_groups else None
+            messages_by_row, inputs = [], []
+            for i, ((x, bank, attention_input), scratch) in enumerate(zip(states, self.scratch)):
                 messages = None
                 if previous is not None:
                     prev_x, prev_bank, _ = previous[i]
@@ -230,16 +253,15 @@ class TargetVerify:
                         m.dec_msg_q[layer.i - LOOP0][2],
                         prev_bank.count - 2,
                         bank_start=prev_bank.tail_start + 1,
-                        out=self.scratch[i].messages,
+                        out=scratch.messages,
+                        _group=mix_group,
                     )
                 messages_by_row.append(messages)
-            mix_group = rowvm._Group() if input_groups else None
-            inputs = [
-                layer._attention_inputs(
-                    x, bank, messages, attention_input, scratch=scratch, group=mix_group, blend=not input_groups
+                inputs.append(
+                    layer._attention_inputs(
+                        x, bank, messages, attention_input, scratch=scratch, group=mix_group, blend=not input_groups
+                    )
                 )
-                for (x, bank, attention_input), messages, scratch in zip(states, messages_by_row, self.scratch)
-            ]
             if mix_group is not None:
                 mix_group.launch()
                 if previous is not None:
@@ -247,11 +269,21 @@ class TargetVerify:
             projections = None
             if self.shared:
                 xq, xk, xv = zip(*inputs)
-                q = self.q.project(layer.dq.weight, xq)
-                k = self.k.project(layer.wk, xk)
-                v = self.v.project(layer.wv, xv)
-                kd = self.k_dyn.project(layer.k_wproj, xk) if layer.is_global else None
-                vd = self.v_dyn.project(layer.v_wproj, xv) if layer.is_global else None
+                if pack:
+                    _pack_projections(
+                        self.projection_tasks, ((self.q.input, *xq), (self.k.input, *xk), (self.v.input, *xv))
+                    )
+                q = self.q.project(layer.dq.weight, None if pack else xq)
+                k = self.k.project(layer.wk, None if pack else xk)
+                v = self.v.project(layer.wv, None if pack else xv)
+                kd = vd = None
+                if layer.is_global:
+                    if pack and self.k_dyn.input.memory_config() == self.k.input.memory_config():
+                        kd = self.k_dyn.project(layer.k_wproj, activation=self.k.input)
+                        vd = self.v_dyn.project(layer.v_wproj, activation=self.v.input)
+                    else:
+                        kd = self.k_dyn.project(layer.k_wproj, xk)
+                        vd = self.v_dyn.project(layer.v_wproj, xv)
                 projections = (q, k, v, kd, vd)
             attention = []
             prep_group = rowvm._Group() if front else None

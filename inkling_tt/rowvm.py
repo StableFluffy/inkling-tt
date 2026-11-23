@@ -616,6 +616,7 @@ def rms_norm(x, weight=None, *, dtype=FP, out=None, memory_config=None, _group=N
             [_stripe(t, chunk, width) for t in operands],
             [_stripe(y, chunk, width)],
             stripes,
+            group=_group,
         )
     readers = [_Region(x, width)]
     if weight is not None:
