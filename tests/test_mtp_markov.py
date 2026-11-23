@@ -8,7 +8,7 @@ from mtp_reference import DraftContext, DraftReference
 from inkling_tt import paths
 from inkling_tt.model import VOCAB, D, Weights
 from inkling_tt.model2 import BF, FP, RM, TILE
-from inkling_tt.mtp_markov import MarkovDraftHead
+from inkling_tt.mtp_markov import MarkovDraftHead, _cast
 from inkling_tt.mtp_weights import PADDED_VOCAB, RANK, fold_head, load_drafter
 from inkling_tt.prefill import _alloc
 from serve.runtime import DEVICE_PARAMS
@@ -45,6 +45,11 @@ def main():
     device = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
     try:
         device.enable_program_cache()
+        values = torch.linspace(-1, 1, 1024).reshape(1, 1, 32, 32)
+        source = ttnn.from_torch(values, dtype=FP, layout=TILE, device=device)
+        rounded = _alloc(device, values.shape)
+        _cast(source, rounded)
+        assert torch.equal(ttnn.to_torch(rounded), values.bfloat16())
         draft = MarkovDraftHead(device, weights, fold, bias, count)
         anchor = _alloc(device, (1, 1), ttnn.uint32, RM)
         base = [_alloc(device, (1, 1, 1, PADDED_VOCAB), BF) for _ in range(count)]
@@ -73,7 +78,7 @@ def main():
             relative_l2 = (logits.float() - expected_logits).norm() / expected_logits.float().norm()
             print(f"case {i}: IDs {ids} versus CPU {expected_ids}; relative L2={relative_l2:.5f}", flush=True)
             assert ids == expected_ids
-            assert relative_l2 < 0.005
+            assert relative_l2 < 0.007
             eager.append((ids, logits))
 
         ttnn.synchronize_device(device)

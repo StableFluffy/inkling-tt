@@ -1,3 +1,4 @@
+import math
 from functools import lru_cache
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import ttnn
 from inkling_tt.model import VOCAB
 from inkling_tt.model2 import BF, DRAM, FP, RM, TILE
 from inkling_tt.mtp_weights import PADDED_VOCAB, RANK
-from inkling_tt.prefill import _alloc, _copy_into, _grid, _launch, _program, _tasks, _tile_cb
+from inkling_tt.prefill import _alloc, _compute, _copy_into, _grid, _launch, _program, _tasks, _tile_cb
 
 _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
 
@@ -41,8 +42,41 @@ def _slice_columns(src, start, dest):
     ttnn.slice(src, [0, 0, 0, start], [1, 1, 1, start + dest.shape[-1]], output_tensor=dest)
 
 
+@lru_cache(maxsize=16)
+def _cast_program(tasks, specs):
+    grid, rt = _grid(tasks)
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "cast_io.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=list(specs[0][0]),
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "cast_compute.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            config=_compute((0,)),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "cast_io.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=list(specs[2][0]),
+            defines=[("DRAFT_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    return _program(kernels, [_tile_cb(grid, 0, FP, 2), _tile_cb(grid, 16, BF, 2)])
+
+
 def _cast(src, dest):
-    ttnn.assign(src, dtype=dest.dtype, memory_config=dest.memory_config(), output_tensor=dest)
+    if src.dtype == FP and dest.dtype == BF:
+        tiles = math.prod(src.padded_shape) // 1024
+        _launch(_cast_program, (_tasks(src.device(), tiles),), (src,), (), (dest,))
+    else:
+        ttnn.assign(src, dtype=dest.dtype, memory_config=dest.memory_config(), output_tensor=dest)
 
 
 class MarkovDraftHead:
