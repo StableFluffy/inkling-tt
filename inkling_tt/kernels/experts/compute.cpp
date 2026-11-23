@@ -2,6 +2,9 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
+#ifdef EXPERTS_VERIFY_COMBINE
+#include "api/compute/tile_move_copy.h"
+#endif
 
 using namespace ckernel;
 
@@ -95,6 +98,29 @@ void kernel_main() {
     constexpr uint32_t block_k = get_compile_time_arg_val(1);
     constexpr uint32_t cols = get_compile_time_arg_val(2);
 
+#ifdef EXPERTS_VERIFY_COMBINE
+    compute_kernel_hw_startup(cb_x, cb_out);
+    copy_init(cb_x);
+    for (uint32_t i = get_arg_val<uint32_t>(0); i < get_arg_val<uint32_t>(1); ++i) {
+        uint32_t gamma[8];
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+            MATH(gamma[slot] = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+        }
+        tile_regs_acquire();
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+            cb_wait_front(cb_x, 1);
+            copy_tile(cb_x, 0, 0);
+            cb_pop_front(cb_x, 1);
+            MATH((_llk_math_eltwise_binary_sfpu_params_(combine, gamma[slot], slot, 0, VectorMode::None)));
+        }
+        tile_regs_commit();
+        cb_reserve_back(cb_out, 1);
+        tile_regs_wait();
+        pack_tile(1, cb_out);
+        tile_regs_release();
+        cb_push_back(cb_out, 1);
+    }
+#else
     compute_kernel_hw_startup<ckernel::SrcOrder::Reverse>(cb_x, cb_w, cb_out);
     matmul_block_init(cb_x, cb_w, 0, cols, 1, k);
 #if EXPERTS_GATE
@@ -153,5 +179,6 @@ void kernel_main() {
     }
     tile_regs_release();
     cb_push_back(cb_out, count);
+#endif
 #endif
 }
