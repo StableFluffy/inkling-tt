@@ -4,7 +4,8 @@ import torch
 import ttnn
 
 from inkling_tt.model import HD, HKV, D, W
-from inkling_tt.model2 import FP
+from inkling_tt.model2 import FP, RM
+from inkling_tt.mtp_round import RoundDecision
 from inkling_tt.mtp_target import TargetCommit
 from inkling_tt.prefill import _alloc
 from serve.runtime import DEVICE_PARAMS
@@ -56,23 +57,37 @@ def main():
         lmax = 2112
         visits = {0: make_visit(device, W), 5: make_visit(device, lmax)}
         commit = TargetCommit(device, visits, 8)
+        decide = RoundDecision(device, 8)
+        target = tuple(_alloc(device, (1, 1, 1, 1), ttnn.uint32, RM) for _ in range(8))
+        drafts = tuple(_alloc(device, (1, 1, 1, 1), ttnn.uint32, RM) for _ in range(7))
+        position_input = _alloc(device, (1,), ttnn.int32, RM)
+        expected_ids = list(range(42, 50))
         generator = torch.Generator().manual_seed(546)
 
         def prepare(position, rows):
-            stage(torch.tensor([[position, rows, 0, 0, 0, 0, 0, 0]], dtype=torch.int32), commit.meta)
+            stage(torch.tensor([position], dtype=torch.int32), position_input)
+            for i, (token, dest) in enumerate(zip(expected_ids * 2, (*target, *drafts))):
+                if i == rows + 7:
+                    token += 99
+                stage(torch.tensor([[[[token]]]], dtype=torch.int32), dest)
             return stage_visits(visits, commit.staged, generator)
 
+        def run():
+            decide.accept(position_input, target, drafts, commit.meta)
+            commit.commit()
+
         cases = prepare(1023, 1)
-        commit.commit()
+        run()
         check_state(cases, 1023, 1)
         trace = ttnn.begin_trace_capture(device, cq_id=0)
-        commit.commit()
+        run()
         ttnn.end_trace_capture(device, trace, cq_id=0)
         try:
             for position in (31, 32, 1023, 1024, 2047, 2048, lmax - 8):
                 for rows in range(1, 9):
                     cases = prepare(position, rows)
                     ttnn.execute_trace(device, trace, cq_id=0, blocking=True)
+                    assert decide.read() == (expected_ids[:rows], position + rows)
                     check_state(cases, position, rows)
             print("56 traced commits matched sequential state updates across local and global tile boundaries")
         finally:
