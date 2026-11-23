@@ -70,7 +70,8 @@ head work and face-row cache writes. Repeat visits batch the MLP message down pr
 and blend epilogues within the worker grid.
 
 The router projects all verify rows in one program. Each row has its own top-8 leader and keeps
-B1's K-stripe sum and tie-breaking order. The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
+B1's K-stripe sum and tie-breaking order. One mapping program assigns compact rows in expert-ID order.
+The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
 B1's eight routes and FP32 weights per row, streams the existing BFP8_B weight pack at HiFi4 and
 combines the results in the original routing-slot order.
 

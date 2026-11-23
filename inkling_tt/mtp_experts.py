@@ -29,6 +29,19 @@ def _pack_program(rows, specs):
 
 
 @lru_cache(maxsize=16)
+def _route_program(rows, gather_bytes, specs):
+    grid, _ = _grid(((0, 0, 0, 0),))
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=str(_KERNELS / "verify_routes.cpp"),
+        core_ranges=grid,
+        compile_time_args=[rows, gather_bytes, *specs[0][0], *sum(specs[0][-3:], ())],
+        config=ttnn.ReaderConfigDescriptor(),
+    )
+    size = 64 * rows + 128 * 4 + gather_bytes + 32 * 8 * 4
+    return _program([kernel], [_tile_cb(grid, 0, ttnn.uint32, size=size)])
+
+
+@lru_cache(maxsize=16)
 def _combine_program(tasks, specs):
     grid, rt = _grid(tasks)
     io = str(_EXPERT_KERNELS / "verify_combine.cpp")
@@ -76,26 +89,32 @@ class VerifyExperts:
         zeros = ttnn.from_torch(torch.zeros(1, 1, 32, D), dtype=BF, layout=TILE)
         ttnn.copy_host_to_device_tensor(zeros, self.workspace.output)
 
-    def run(self, x, routing, handle):
+    def run(self, x, routing, handle, *, direct_maps=True):
         """Stream the union of B1 routes while preserving each token's combine order."""
         if len(routing) != self.rows:
             raise ValueError("Expected one set of B1 IDs and weights per verify row")
         work = self.workspace
-        route_tensors = tuple(t for pair in routing for t in pair)
-        _launch(_pack_program, (self.rows,), (*route_tensors, work.ids, work.gamma))
-        maps = (work.ids, work.ends, work.gather, work.inverse)
-        with experts._LOCK:
-            desc, kernel = experts._prefill_route_program(
-                False,
-                ((0, 0, 0, 1),),
-                tuple(experts._accessor(t) for t in maps),
-                1,
-                work.gather.shape[-1] * 4,
-                work.rows,
+        if direct_maps:
+            ids = tuple(index for index, _ in routing)
+            _launch(
+                _route_program, (self.rows, work.gather.shape[-1] * 4), (*ids, work.ends, work.gather, work.inverse)
             )
-            kernel.common_runtime_args = [t.buffer_address() for t in maps]
-            desc.kernels = [kernel]
-            ttnn.generic_op(list(maps), desc)
+        else:
+            route_tensors = tuple(t for pair in routing for t in pair)
+            _launch(_pack_program, (self.rows,), (*route_tensors, work.ids, work.gamma))
+            maps = (work.ids, work.ends, work.gather, work.inverse)
+            with experts._LOCK:
+                desc, kernel = experts._prefill_route_program(
+                    False,
+                    ((0, 0, 0, 1),),
+                    tuple(experts._accessor(t) for t in maps),
+                    1,
+                    work.gather.shape[-1] * 4,
+                    work.rows,
+                )
+                kernel.common_runtime_args = [t.buffer_address() for t in maps]
+                desc.kernels = [kernel]
+                ttnn.generic_op(list(maps), desc)
         experts._prefill_io(x, work, False)
         experts._prefill_project(True, work, handle, verify=self.verify_mode)
         experts._prefill_project(False, work, handle, verify=self.verify_mode)

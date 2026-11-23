@@ -1,3 +1,4 @@
+import argparse
 import statistics
 import time
 
@@ -17,7 +18,7 @@ def stage(data, dest):
     ttnn.copy_host_to_device_tensor(host, dest)
 
 
-def main():
+def main(compare_maps):
     rows = 4
     generators = [torch.Generator().manual_seed(i) for i in (456, 457, 458)]
     device = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
@@ -27,7 +28,9 @@ def main():
         handle = experts_stream.prepare(
             device, weights.get("layers.0.mlp.experts.gate_up_proj"), weights.get("layers.0.mlp.experts.down_proj")
         )
-        verifiers = [VerifyExperts(device, rows, streaming=streaming) for streaming in (False, True)]
+        variants = ((True, False), (True, True)) if compare_maps else ((False, True), (True, True))
+        names = ("two maps programs", "one maps program") if compare_maps else ("resident", "pipelined")
+        verifiers = [(VerifyExperts(device, rows, streaming=streaming), direct) for streaming, direct in variants]
         packed = _alloc(device, (1, 1, 32, D))
         routing = [
             (
@@ -56,8 +59,8 @@ def main():
                 refs.append(ttnn.to_torch(experts_stream.moe_decode(row, dev_ids, dev_gamma, handle))[0, 0, 0])
             expected = torch.stack(refs)
             union = ids.unique().numel()
-            for name, verifier in zip(("resident", "pipelined"), verifiers):
-                data = ttnn.to_torch(verifier.run(packed, routing, handle))[0, 0]
+            for name, (verifier, direct_maps) in zip(names, verifiers):
+                data = ttnn.to_torch(verifier.run(packed, routing, handle, direct_maps=direct_maps))[0, 0]
                 failures = (data[:rows] != expected).sum().item()
                 print(f"{name} union {union}: {failures}/{rows * D} mismatches against B1", flush=True)
                 assert torch.equal(data[:rows], expected)
@@ -66,14 +69,14 @@ def main():
 
         ttnn.synchronize_device(device)
         traces = []
-        for verifier in verifiers:
+        for verifier, direct_maps in verifiers:
             trace = ttnn.begin_trace_capture(device, cq_id=0)
-            verifier.run(packed, routing, handle)
+            verifier.run(packed, routing, handle, direct_maps=direct_maps)
             ttnn.end_trace_capture(device, trace, cq_id=0)
             traces.append(trace)
         try:
             samples = [[[], []] for _ in cases]
-            for i in range(36):
+            for i in range(60):
                 j = i % len(cases)
                 x, ids, gamma, expected = cases[j]
                 prepare(x, ids, gamma)
@@ -82,12 +85,12 @@ def main():
                     start = time.perf_counter()
                     ttnn.execute_trace(device, traces[k], cq_id=0, blocking=True)
                     samples[j][k].append(1000 * (time.perf_counter() - start))
-                    assert torch.equal(ttnn.to_torch(verifiers[k].workspace.output)[0, 0, :rows], expected)
+                    assert torch.equal(ttnn.to_torch(verifiers[k][0].workspace.output)[0, 0, :rows], expected)
             for (_, ids, _, _), variants in zip(cases, samples):
-                for name, times in zip(("resident", "pipelined"), variants):
+                for name, times in zip(names, variants):
                     print(
                         f"{name} union {ids.unique().numel()}: {statistics.median(times[2:]):.3f} ms median, "
-                        f"{max(times[2:]):.3f} ms p95",
+                        f"{statistics.quantiles(times[2:], n=20, method='inclusive')[-1]:.3f} ms p95",
                         flush=True,
                     )
         finally:
@@ -98,4 +101,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--compare-maps", action="store_true")
+    main(parser.parse_args().compare_maps)
