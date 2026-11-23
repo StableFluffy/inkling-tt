@@ -92,6 +92,15 @@ def main():
             print("56 traced commits matched sequential state updates across local and global tile boundaries")
         finally:
             ttnn.release_trace(device, trace)
+
+        global_slots = {5, 11, 17, 23, 29, 35, 41, 47}
+        visits = {slot: make_visit(device, lmax if slot in global_slots else W) for slot in range(48)}
+        commit = TargetCommit(device, visits, 8)
+        cases = prepare(1022, 5)
+        run()
+        assert decide.read() == (expected_ids[:5], 1027)
+        check_state(cases, 1022, 5)
+        print("48 visits and 192 histories matched across the ring boundary")
     finally:
         ttnn.close_device(device)
 
