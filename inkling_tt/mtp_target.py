@@ -142,7 +142,7 @@ class TargetVerify:
         outputs = tuple(tensor for step in self.steps[:rows] for tensor in (step.x, step.pos_g, step.tau))
         _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, rows)), (*inputs, *outputs))
 
-    def verify(self, *, rows=None, grouped_glue=True, grouped_attention=True, grouped_front=True):
+    def verify(self, *, rows=None, grouped_glue=True, grouped_attention=True, grouped_front=True, grouped_inputs=True):
         m = self.model
         rows = self.rows if rows is None else rows
         if not 2 <= rows <= self.rows:
@@ -151,15 +151,44 @@ class TargetVerify:
         batch = self.shared and grouped_glue
         block_attention = self.shared and grouped_attention
         front = batch and block_attention and grouped_front
-        states = self._range(0, LOOP0, 0, states, batch=batch, block_attention=block_attention, front=front)
+        input_groups = front and grouped_inputs and m.c.shard_fusion and m.c.group_gates
+        states = self._range(
+            0, LOOP0, 0, states, batch=batch, block_attention=block_attention, front=front, input_groups=input_groups
+        )
         prefix = states
-        states = self._range(LOOP0, LOOP1, 0, states, batch=batch, block_attention=block_attention, front=front)
+        states = self._range(
+            LOOP0,
+            LOOP1,
+            0,
+            states,
+            batch=batch,
+            block_attention=block_attention,
+            front=front,
+            input_groups=input_groups,
+        )
         for p in range(1, NPASS):
             reenter = [(x, bank._replace(tail_start=1 + p * ((LOOP1 - LOOP0) // NB)), None) for x, bank, _ in prefix]
             states = self._range(
-                LOOP0, LOOP1, p, reenter, states, batch=batch, block_attention=block_attention, front=front
+                LOOP0,
+                LOOP1,
+                p,
+                reenter,
+                states,
+                batch=batch,
+                block_attention=block_attention,
+                front=front,
+                input_groups=input_groups,
             )
-        states = self._range(LOOP1, len(m.layers), 0, states, batch=batch, block_attention=block_attention, front=front)
+        states = self._range(
+            LOOP1,
+            len(m.layers),
+            0,
+            states,
+            batch=batch,
+            block_attention=block_attention,
+            front=front,
+            input_groups=input_groups,
+        )
         if front:
             _pack_rows(self.taps[3], [hidden for _, _, hidden in states], self.mlp_tasks)
         else:
@@ -179,7 +208,7 @@ class TargetVerify:
             rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
         return self.logits[:rows], self.ids[:rows]
 
-    def _range(self, first, stop, pass_id, states, previous=None, *, batch, block_attention, front):
+    def _range(self, first, stop, pass_id, states, previous=None, *, batch, block_attention, front, input_groups):
         m = self.model
         for layer in m.layers[first:stop]:
             slot = visit_slot(layer.i, pass_id if layer.is_loop else 0)
@@ -204,10 +233,17 @@ class TargetVerify:
                         out=self.scratch[i].messages,
                     )
                 messages_by_row.append(messages)
+            mix_group = rowvm._Group() if input_groups else None
             inputs = [
-                layer._attention_inputs(x, bank, messages, attention_input, scratch=scratch)
+                layer._attention_inputs(
+                    x, bank, messages, attention_input, scratch=scratch, group=mix_group, blend=not input_groups
+                )
                 for (x, bank, attention_input), messages, scratch in zip(states, messages_by_row, self.scratch)
             ]
+            if mix_group is not None:
+                mix_group.launch()
+                if previous is not None:
+                    inputs = self._blend_attention_rows(layer, inputs, messages_by_row)
             projections = None
             if self.shared:
                 xq, xk, xv = zip(*inputs)
@@ -308,6 +344,37 @@ class TargetVerify:
             if after_mlp is not None:
                 after_mlp.launch()
         return states
+
+    def _blend_attention_rows(self, layer, inputs, messages):
+        weights = tuple(layer.gate_down[s] for s in "qkv")
+        gates = tuple(layer.gates[s] for s in "qkv")
+        d = layer.dec
+        norms = (d.norm_q, d.norm_k, d.norm_v) if layer.is_global else (d.norm_in,) * 3
+        grid = self.model.c.dev.compute_with_storage_grid_size()
+        batch = grid.x * grid.y // (3 * rowvm._MESSAGE_DOWN_STRIPES)
+        result = []
+        for start in range(0, len(inputs), batch):
+            end = min(start + batch, len(inputs))
+            operands = [
+                (u, m, weight)
+                for row, message in zip(inputs[start:end], messages[start:end])
+                for u, m, weight in zip(row, message, weights)
+            ]
+            destinations = tuple(t for scratch in self.scratch[start:end] for t in scratch.qkv_down)
+            rowvm.message_down(operands, out=destinations)
+            for row, message, scratch in zip(inputs[start:end], messages[start:end], self.scratch[start:end]):
+                result.append(
+                    rowvm.qkv_message_projections(
+                        (
+                            ((u, m, h, wf, wg, norm), out.memory_config())
+                            for u, m, h, (_, wf, wg), norm, out in zip(
+                                row, message, scratch.qkv_down, gates, norms, scratch.qkv_blend
+                            )
+                        ),
+                        out=scratch.qkv_blend,
+                    )
+                )
+        return result
 
     def _blend_mlp_rows(self, layer, pending, messages):
         mixed = [row for row, _, _ in pending]

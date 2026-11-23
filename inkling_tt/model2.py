@@ -309,7 +309,7 @@ class Ops:
         S, J = bank
         return (ttnn.add(S, self.c.mm(self.rowsel[J], self.rms(v))), J + 1)
 
-    def mix(self, bank, partial, qmat, nq, weight=None, dtype=FP, *, out=None):
+    def mix(self, bank, partial, qmat, nq, weight=None, dtype=FP, *, out=None, group=None):
         """AttnRes depth mixing: softmax over the J bank rows plus rms(partial), one column per query.
         With weight [1,1,nq,D], each output is additionally RMS-normalised with it (and cast to dtype)."""
         if isinstance(bank, _DecodeBank):
@@ -324,10 +324,11 @@ class Ops:
                     weight=weight,
                     dtype=dtype,
                     out=out,
+                    _group=group,
                 )
             )
         S, J = bank
-        return list(rowvm.attnres_mix(S, partial, qmat[2], J, weight=weight, dtype=dtype, out=out))
+        return list(rowvm.attnres_mix(S, partial, qmat[2], J, weight=weight, dtype=dtype, out=out, _group=group))
         S = ttnn.add(S, self.c.mm(self.rowsel[J], self.rms(partial)))
         if nq == 1:
             lg = ttnn.add(ttnn.sum(ttnn.multiply(S, qmat[1]), dim=-1, keepdim=True), self.rowmask[J])
@@ -839,7 +840,7 @@ class Layer:
     def forward(self, x, bank, vs, st, messages=None):
         return self._forward(x, bank, vs, st, messages)[0]
 
-    def _attention_inputs(self, x, bank, messages, attention_input, *, scratch=None):
+    def _attention_inputs(self, x, bank, messages, attention_input, *, scratch=None, group=None, blend=True):
         ops, d = self.ops, self.dec
         fp_inputs = None if scratch is None else scratch.inputs_fp
         bf_inputs = None if scratch is None else scratch.inputs_bf
@@ -847,7 +848,14 @@ class Layer:
         def mix_attention(weight=None, dtype=FP, nq=1):
             buffers = fp_inputs if dtype == FP else bf_inputs
             return ops.mix(
-                bank, x, d.q_attn, nq, weight=weight, dtype=dtype, out=None if buffers is None else buffers[:nq]
+                bank,
+                x,
+                d.q_attn,
+                nq,
+                weight=weight,
+                dtype=dtype,
+                out=None if buffers is None else buffers[:nq],
+                group=group,
             )
 
         if self.is_global:
@@ -857,7 +865,7 @@ class Layer:
                 xq, xk, xv = mix_attention(d.norm_qkv, BF, 3)
             else:
                 xq, xk, xv = mix_attention(nq=3)
-            if messages is not None:
+            if messages is not None and blend:
                 xq, xk, xv = self._gate_attention(
                     (xq, xk, xv), messages, (d.norm_q, d.norm_k, d.norm_v), scratch=scratch
                 )
@@ -866,7 +874,7 @@ class Layer:
                 xq = xk = xv = (
                     ops.rms(x, d.norm_in, BF)
                     if scratch is None
-                    else rowvm.rms_norm(x, d.norm_in, dtype=BF, out=bf_inputs[0])
+                    else rowvm.rms_norm(x, d.norm_in, dtype=BF, out=bf_inputs[0], _group=group)
                 )
             elif messages is None:
                 xq = xk = xv = attention_input
@@ -874,7 +882,11 @@ class Layer:
                     xq = xk = xv = mix_attention(d.norm_in, BF)[0]
             else:
                 h = attention_input if attention_input is not None else mix_attention()[0]
-                xq, xk, xv = self._gate_attention((h,) * 3, messages, (d.norm_in,) * 3, shared=True, scratch=scratch)
+                xq = xk = xv = h
+                if blend:
+                    xq, xk, xv = self._gate_attention(
+                        (h,) * 3, messages, (d.norm_in,) * 3, shared=True, scratch=scratch
+                    )
         return xq, xk, xv
 
     def _forward(self, x, bank, vs, st, messages=None, *, attention_input=None, next_mix=None):

@@ -598,7 +598,7 @@ class _Group:
         self.entries.clear()
 
 
-def rms_norm(x, weight=None, *, dtype=FP, out=None, memory_config=None):
+def rms_norm(x, weight=None, *, dtype=FP, out=None, memory_config=None, _group=None):
     """Normalize a logical row, optionally multiply by a weight row and round to BF16."""
     _validate(x)
     width = x.shape[-1]
@@ -620,7 +620,7 @@ def rms_norm(x, weight=None, *, dtype=FP, out=None, memory_config=None):
     readers = [_Region(x, width)]
     if weight is not None:
         readers.append(_Region(weight, width))
-    return _run((_RMS, width, flags), readers, [_Region(y, width)])
+    return _run((_RMS, width, flags), readers, [_Region(y, width)], group=_group)
 
 
 def head_norm(
@@ -1308,7 +1308,7 @@ def attnres_mix(
     if any(t.memory_config() != ys[0].memory_config() for t in ys):
         raise ValueError("rowvm mix outputs must use the same memory configuration")
     if valid_rows == 0 and nq == 1 and weight is None and convolution is None:
-        return (rms_norm(partial, dtype=dtype, out=ys[0]),)
+        return (rms_norm(partial, dtype=dtype, out=ys[0], _group=_group),)
     chunk, stripes = _stripes(width, _MIX_CHUNK)
     readers = [
         _stripe(partial, chunk, width, row=partial_row),

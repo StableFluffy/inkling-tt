@@ -58,6 +58,10 @@ Each four-tap convolution reads its three earlier inputs from a 32-row FP32 ring
 its current input to that ring. Prefill writes its final four inputs into the same slots. Both
 decode paths share the per-visit rings.
 
+The verifier groups independent input mixes on disjoint cores and batches the Q/K/V message
+controllers across rows. Each controller retains its B1 reduction order. Grouping cuts the
+four-row verifier replay from 38.86 to 38.23 ms at a short prefix.
+
 The verifier packs the attention inputs into one BF16 tile row. Q, K, V, the dynamic taps and
 O each use one sweep of their B1 weights. Head preparation and attention read
 the query's row directly from the packed projections. The output gate writes into that same row

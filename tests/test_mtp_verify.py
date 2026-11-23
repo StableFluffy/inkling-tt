@@ -71,24 +71,27 @@ def main(trace_only):
         else:
             raise AssertionError("verify accepted a block that crosses lmax")
 
-        model.capture()
-        verify_traces = []
-        for glue, attention, front in (
-            (False, False, False),
-            (True, False, False),
-            (True, True, False),
-            (True, True, True),
-        ):
+        variants = (
+            (False, False, False, False),
+            (True, False, False, False),
+            (True, True, False, False),
+            (True, True, True, False),
+            (True, True, True, True),
+        )
+        for glue, attention, front, inputs in variants:
             seed(len(prompt))
             verifier.stage(block, len(prompt))
-            verifier.verify(grouped_glue=glue, grouped_attention=attention, grouped_front=front)
+            verifier.verify(grouped_glue=glue, grouped_attention=attention, grouped_front=front, grouped_inputs=inputs)
             check_outputs(references[len(prompt)])
-            ttnn.synchronize_device(dev)
+        ttnn.synchronize_device(dev)
+        model.capture()
+        verify_traces = []
+        for glue, attention, front, inputs in variants:
             seed(len(prompt))
             verifier.stage(block, len(prompt))
             rowvm._group_program.cache_clear()
             trace = ttnn.begin_trace_capture(dev, cq_id=0)
-            verifier.verify(grouped_glue=glue, grouped_attention=attention, grouped_front=front)
+            verifier.verify(grouped_glue=glue, grouped_attention=attention, grouped_front=front, grouped_inputs=inputs)
             ttnn.end_trace_capture(dev, trace, cq_id=0)
             verify_traces.append(trace)
         trace = verify_traces[-1]
@@ -140,6 +143,7 @@ def main(trace_only):
                     "verify grouped epilogues",
                     "verify grouped attention",
                     "verify grouped preparation",
+                    "verify grouped mixes and controllers",
                 ),
                 times,
             ):
