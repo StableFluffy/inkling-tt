@@ -74,28 +74,29 @@ def main():
     device = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
     try:
         device.enable_program_cache()
-        block = DraftBlock(device, weights, count + 1, 1088)
+        blocks = [DraftBlock(device, weights, count + 1, 1088, sharded_mlp=mode) for mode in (False, True)]
         head = dense.prepare_weight(device, torch.nn.functional.pad(head.T, (0, PADDED_VOCAB - VOCAB)))
-        projections = [DraftHeadProjection(device, head, weights, count, direct=direct) for direct in (False, True)]
+        projection = DraftHeadProjection(device, head, weights, count)
         markov = MarkovDraftHead(device, weights, fold, bias, count)
         anchor = _alloc(device, (1, 1), ttnn.uint32, RM)
         position = _alloc(device, (1,), ttnn.uint32, RM)
         embedding = ttnn.from_torch(embeddings, dtype=BF, layout=RM, device=device, memory_config=DRAM)
         last = _alloc(device, (1, 1, 1, D))
-        context = DraftContextProjection(block, weights, 128, last)
+        contexts = [DraftContextProjection(block, weights, 128, last) for block in blocks]
+        context = contexts[0]
         positions = DraftPositions(device, 1088)
         features = tuple(_alloc(device, (1, 1, context.chunk, D)) for _ in range(4))
 
-        def extend():
+        def extend(context):
             positions.rotate(context.meta, context.cos, context.sin)
             context.extend(features)
 
-        def forward(projection):
+        def forward(block):
             positions.prepare(block, anchor, position, embedding)
             base, rnn_context = projection.project(block.forward(), last)
             markov.score(base, rnn_context, anchor)
 
-        def read():
+        def read(block):
             hidden = ttnn.to_torch(block.hidden)[0, 0, : count + 1]
             ids = [ttnn.to_torch(index).item() for index in markov.ids]
             logits = torch.stack([ttnn.to_torch(row).flatten()[:VOCAB] for row in markov.logits])
@@ -103,8 +104,10 @@ def main():
 
         eager = []
         for case in cases:
-            stage_case(context, features, extend, case, anchor, position)
-            check_context(case[0], block, last)
+            for block, context in zip(blocks, contexts):
+                stage_case(context, features, lambda context=context: extend(context), case, anchor, position)
+                check_context(case[0], block, last)
+            block = blocks[0]
             positions.prepare(block, anchor, position, embedding)
             expected, token = case[:2]
             assert torch.equal(ttnn.to_torch(block.embedded)[0, 0, 0], embeddings[token]), "anchor"
@@ -118,13 +121,13 @@ def main():
                     (per_position >= cap) & (per_position < cap + block.rows)
                 )
                 assert torch.equal(bits, expected_mask), "draft attention mask"
-            forward(projections[0])
-            ids, hidden, logits = read()
-            forward(projections[1])
-            actual_ids, actual_hidden, actual_logits = read()
-            assert actual_ids == ids
-            assert torch.equal(actual_hidden, hidden)
-            assert torch.equal(actual_logits, logits)
+            forward(blocks[0])
+            ids, hidden, logits = read(blocks[0])
+            forward(blocks[1])
+            actual = read(blocks[1])
+            delta = (actual[2].float() - logits.float()).norm() / logits.float().norm()
+            print(f"sharded: {actual[0]} vs {ids}, relative L2 {delta:.5f}", flush=True)
+            assert actual[0] == ids and delta < 0.01
             hidden_error = (hidden.float() - case[3]).norm() / case[3].float().norm()
             expected_ids, expected_logits = case[4]
             logit_error = (logits.float() - expected_logits).norm() / expected_logits.float().norm()
@@ -136,40 +139,42 @@ def main():
             assert ids == expected_ids
             assert hidden_error < 0.03
             assert logit_error < 0.03
-            eager.append((ids, hidden, logits))
+            eager.append(((ids, hidden, logits), actual))
 
         ttnn.synchronize_device(device)
-        context_trace = ttnn.begin_trace_capture(device, cq_id=0)
-        extend()
-        ttnn.end_trace_capture(device, context_trace, cq_id=0)
-        traces = []
-        for projection in projections:
+        context_traces, traces = [], []
+        for context, block in zip(contexts, blocks):
             trace = ttnn.begin_trace_capture(device, cq_id=0)
-            forward(projection)
+            extend(context)
+            ttnn.end_trace_capture(device, trace, cq_id=0)
+            context_traces.append(trace)
+            trace = ttnn.begin_trace_capture(device, cq_id=0)
+            forward(block)
             ttnn.end_trace_capture(device, trace, cq_id=0)
             traces.append(trace)
         try:
             ms = [[], []]
             for i in range(16):
                 j = i % len(cases)
-                stage_case(
-                    context,
-                    features,
-                    lambda: ttnn.execute_trace(device, context_trace, cq_id=0, blocking=False),
-                    cases[j],
-                    anchor,
-                    position,
-                )
+                for context, trace in zip(contexts, context_traces):
+                    stage_case(
+                        context,
+                        features,
+                        lambda trace=trace: ttnn.execute_trace(device, trace, cq_id=0, blocking=False),
+                        cases[j],
+                        anchor,
+                        position,
+                    )
                 ttnn.synchronize_device(device)
                 for k in (0, 1) if i % 2 == 0 else (1, 0):
                     start = time.perf_counter()
                     ttnn.execute_trace(device, traces[k], cq_id=0, blocking=True)
                     ms[k].append(1000 * (time.perf_counter() - start))
-                    ids, hidden, logits = read()
-                    assert ids == eager[j][0]
-                    assert torch.equal(hidden, eager[j][1])
-                    assert torch.equal(logits, eager[j][2])
-            for label, timings in zip(("full tile copy", "live row copy"), ms):
+                    ids, hidden, logits = read(blocks[k])
+                    assert ids == eager[j][k][0]
+                    assert torch.equal(hidden, eager[j][k][1])
+                    assert torch.equal(logits, eager[j][k][2])
+            for label, timings in zip(("ordinary MLP", "sharded MLP"), ms):
                 p95 = statistics.quantiles(timings[4:], n=20, method="inclusive")[-1]
                 print(
                     f"DSpark {count} drafts ({label}): median {statistics.median(timings[4:]):.2f} ms, "
@@ -179,7 +184,8 @@ def main():
         finally:
             for trace in traces:
                 ttnn.release_trace(device, trace)
-            ttnn.release_trace(device, context_trace)
+            for trace in context_traces:
+                ttnn.release_trace(device, trace)
     finally:
         ttnn.close_device(device)
 

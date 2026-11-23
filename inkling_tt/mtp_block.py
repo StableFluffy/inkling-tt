@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 import ttnn
 
-from inkling_tt import rowvm
+from inkling_tt import dense, rowvm
 from inkling_tt.model import HD, HKV, HQ, D
 from inkling_tt.model2 import BF, DRAM, FP, TILE
 from inkling_tt.mtp_markov import _cast
@@ -49,6 +49,13 @@ def _head_copy_program(tasks, shard_tiles, total_tiles, grid_width, specs, *, ro
         config=ttnn.ReaderConfigDescriptor(),
     )
     return _program([kernel], [])
+
+
+def _head_copy_args(device, handle):
+    shard_tiles = handle.output_shards.shard_spec.shape[1] // 32
+    total_tiles = handle.n // 32
+    workers = (total_tiles + shard_tiles - 1) // shard_tiles
+    return _tasks(device, workers), shard_tiles, total_tiles, device.compute_with_storage_grid_size().x
 
 
 def _norm_rows(x, weight, out, rows):
@@ -108,7 +115,7 @@ class _Rope:
 class DraftBlock:
     """Device transformer on one DSpark block with fixed-size prefix storage."""
 
-    def __init__(self, device, weights, rows, prefix_capacity):
+    def __init__(self, device, weights, rows, prefix_capacity, *, sharded_mlp=True):
         if not 2 <= rows <= 8 or prefix_capacity < 32 or prefix_capacity % 32:
             raise ValueError("DSpark needs 2-8 rows and a positive, tile-aligned prefix capacity")
         self.rows = rows
@@ -120,9 +127,22 @@ class DraftBlock:
             return ttnn.from_torch(x.contiguous(), dtype=BF, layout=TILE, device=device, memory_config=DRAM)
 
         self.weights = {}
+        self.mlp_work = {}
         for name, weight in weights.items():
             if (name.startswith("layers.") and "ctx" not in name and "dflare" not in name) or name == "norm.weight":
-                self.weights[name] = upload(weight.T if weight.ndim == 2 else weight.reshape(1, 1, 1, -1))
+                if sharded_mlp and ".mlp." in name:
+                    handle = dense.prepare_weight(device, weight.T)
+                    self.weights[name] = handle
+                    shape = (handle.k, handle.n)
+                    if shape not in self.mlp_work:
+                        args = _head_copy_args(device, handle)
+                        bufs = tuple(
+                            ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 32, width)), BF, TILE, device, mem)
+                            for width, mem in ((handle.k, handle.input_shards), (handle.n, handle.output_shards))
+                        )
+                        self.mlp_work[shape] = (*bufs, args)
+                else:
+                    self.weights[name] = upload(weight.T if weight.ndim == 2 else weight.reshape(1, 1, 1, -1))
         row = lambda n, dtype=BF: _alloc(device, (1, 1, 32, n), dtype)
         self.embedded = upload(weights["mask_embed"].reshape(1, 1, 1, D).expand(1, 1, 32, D))
         self.residual, self.branch, self.hidden = (row(D) for _ in range(3))
@@ -154,7 +174,21 @@ class DraftBlock:
                 self.probs[cap] = _alloc(device, (1, HKV, HQ // HKV * 32, width))
 
     def _linear(self, x, name, dest):
-        ttnn.linear(x, self.weights[name + ".weight"], compute_kernel_config=self.ck, optional_output_tensor=dest)
+        weight = self.weights[name + ".weight"]
+        if not isinstance(weight, dense.DenseWeight):
+            ttnn.linear(x, weight, compute_kernel_config=self.ck, optional_output_tensor=dest)
+            return
+        inputs, output, copy_args = self.mlp_work[(weight.k, weight.n)]
+        ttnn.interleaved_to_sharded(x, weight.input_shards, preallocated_output=inputs)
+        ttnn.linear(
+            inputs,
+            weight.tensor,
+            program_config=weight.program,
+            compute_kernel_config=weight.compute,
+            memory_config=weight.output_shards,
+            optional_output_tensor=output,
+        )
+        _launch(_head_copy_program, copy_args, (output, dest))
 
     def _residual(self):
         ttnn.add(self.residual, self.branch, dtype=FP, output_tensor=self.merged)
@@ -215,10 +249,7 @@ class DraftHeadProjection:
             )
         self.hidden_shards, self.head_shards = head_buffers
         self.base = None if direct else _alloc(device, self.head_shards.shape)
-        shard_tiles = head.output_shards.shard_spec.shape[1] // 32
-        total_tiles = PADDED_VOCAB // 32
-        workers = (total_tiles + shard_tiles - 1) // shard_tiles
-        self.copy_args = (_tasks(device, workers), shard_tiles, total_tiles, device.compute_with_storage_grid_size().x)
+        self.copy_args = _head_copy_args(device, head)
         width = 3 * RANK
         self.hidden_fixed, self.fixed = (_alloc(device, (1, 1, 32, width), FP) for _ in range(2))
         self.last_fixed = _alloc(device, (1, 1, 1, width), FP)

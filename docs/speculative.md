@@ -36,7 +36,7 @@ unembedding. Folding these weights and the bias on the CPU in FP64 leaves one BF
 projection per proposal. The device compares all 200,058 valid scores after the BF16 score add and
 softcap.
 
-The kernels use BF16 projections at HiFi4 with FP32 accumulation. Norms, nonlinearities and
+The draft MLP streams DRAM-sharded BF16 weights. The projections use HiFi4 with FP32 accumulation. Norms, nonlinearities and
 attention statistics use FP32. The device context and draft tests warm both graphs before
 capturing them.
 
@@ -87,7 +87,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 9.21 ms median, 9.29 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 8.86 ms median, 8.94 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
 | Four BF16 target head rows, serial | 8.257 ms median, 8.444 ms p95 |
