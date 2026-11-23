@@ -9,7 +9,11 @@ constexpr uint32_t cols = get_compile_time_arg_val(2);
 #if defined(TRISC_MATH) && EXPERTS_GATE
 #include "ckernel_sfpu_conversions.h"
 #include "ckernel_sfpu_sigmoid.h"
+#ifdef EXPERTS_VERIFY
+#include "ckernel_sfpu_tanh.h"
+#else
 #include "ckernel_sfpu_softcap.h"
+#endif
 #include "llk_math_eltwise_binary_sfpu_macros.h"
 
 namespace {
@@ -45,8 +49,13 @@ void cap(uint32_t tile, uint32_t, uint32_t) {
         if constexpr (!Gate) {
             x = convert<vFloat16b>(x, RoundMode::Nearest);
         }
+#ifdef EXPERTS_VERIFY
+        x *= Gate ? 0.25f : 0.04f;
+        dst_reg[i] = ckernel::sfpu::_sfpu_tanh_fp32_accurate_(x) * (Gate ? 4.0f : 25.0f);
+#else
         dst_reg[i] = ckernel::sfpu::_sfpu_softcap_(
             x, vFloat(Gate ? 4.0f : 25.0f), vFloat(Gate ? 0.25f : 0.04f));
+#endif
     });
 }
 
@@ -93,7 +102,11 @@ void kernel_main() {
             for (uint32_t t = 0; t < out_cols; ++t) {
                 MATH((ckernel::sfpu::sigmoid_init<false>()));
                 MATH((_llk_math_eltwise_binary_sfpu_params_(gate_sigmoid, t, 0, 0, VectorMode::None)));
+#ifdef EXPERTS_VERIFY
+                MATH((ckernel::sfpu::tanh_init<false, true>()));
+#else
                 MATH((ckernel::sfpu::softcap_init()));
+#endif
                 MATH((_llk_math_eltwise_binary_sfpu_params_(cap<true>, t, 0, 0, VectorMode::None)));
                 MATH((_llk_math_eltwise_binary_sfpu_params_(cap<false>, t + out_cols, 0, 0, VectorMode::None)));
                 MATH((_llk_math_eltwise_binary_sfpu_params_(hidden, t, 0, 0, VectorMode::None)));

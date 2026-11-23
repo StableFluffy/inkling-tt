@@ -576,7 +576,9 @@ def _prefill_io_program(combine, tasks, specs, map_bytes, token_tiles, rows, wid
 
 
 @lru_cache(maxsize=32)
-def _prefill_projection_program(gate, tasks, fidelity, specs, broadcast_down, rows, single_weights, wide_blocks):
+def _prefill_projection_program(
+    gate, tasks, fidelity, specs, broadcast_down, rows, single_weights, wide_blocks, verify
+):
     groups = zip(tasks, (4, 2)) if gate else ((tasks, 1),)
     k = _GU_K if gate else _DOWN_K
     block_k = _GU_K_BLOCK if gate else _DOWN_K_BLOCK
@@ -608,6 +610,8 @@ def _prefill_projection_program(gate, tasks, fidelity, specs, broadcast_down, ro
             ("EXPERTS_BROADCAST", str(int(broadcast_down))),
             ("EXPERTS_WIDE_L1_BLOCKS", str(wide_blocks)),
         ]
+        if verify:
+            definitions.append(("EXPERTS_VERIFY", "1"))
         for source, accessor, config in (
             ("prefill_weights.cpp", specs[0], ttnn.ReaderConfigDescriptor()),
             ("prefill_rows.cpp", sum(specs, ()), ttnn.WriterConfigDescriptor()),
@@ -678,7 +682,7 @@ def _prefill_io(x, workspace, combine, compact=None):
         ttnn.generic_op([*inputs, *tail, output], desc)
 
 
-def _prefill_project(gate, workspace, handle):
+def _prefill_project(gate, workspace, handle, *, verify=False):
     x, output = (workspace.wide, workspace.hidden) if gate else (workspace.hidden, workspace.wide)
     weights, tasks = (handle.gate_up, handle.gate_tasks) if gate else (handle.down, handle.down_tasks)
     broadcast_down = not gate and workspace.broadcast_down
@@ -697,6 +701,7 @@ def _prefill_project(gate, workspace, handle):
             workspace.rows,
             workspace.tokens > 1024,
             wide_blocks,
+            verify,
         )
         for reader, writer in zip(kernels[::3], kernels[1::3]):
             reader.common_runtime_args = [ends.buffer_address(), weights.buffer_address()]
