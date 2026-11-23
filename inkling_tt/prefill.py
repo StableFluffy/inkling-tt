@@ -211,7 +211,7 @@ def _tiled_attention(
     _launch(
         _attention_program,
         (
-            _tasks(q.device(), HQ * (tiles // query_group)),
+            _tasks(q.device(), HQ * tiles // query_group),
             tiles,
             cache_k.shape[-2] // 32,
             is_global,
@@ -505,6 +505,7 @@ class Prefill:
             os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", str(wide_score_tiles if chunk > 1024 else 97))
         )
         self._global_score_tiles = min(m.lmax // 32, max(0, score_tiles))
+        grouping = os.environ.get("INK_PREFILL_QUERY_GROUP", "3")
         self._query_group = 1
         self._group_score_tiles = self._global_score_tiles
         if (
@@ -512,11 +513,12 @@ class Prefill:
             and grid.x * grid.y >= 130
             and m.lmax >= 16384
             and self._retain_scores
-            and self._global_score_tiles >= 132
-            and os.getenv("INK_PREFILL_QUERY_GROUP", "4") == "4"
+            and grouping in ("3", "4")
+            and self._global_score_tiles >= 33 * int(grouping)
         ):
-            self._query_group = 4
-            self._group_score_tiles = min(self._global_score_tiles // 4, 38 if default_l1 else 34)
+            self._query_group = int(grouping)
+            budget = (54 if default_l1 else 50) if self._query_group == 3 else (38 if default_l1 else 34)
+            self._group_score_tiles = min(self._global_score_tiles // self._query_group, budget)
         self._warmed = False
         self.dev.enable_program_cache()
         self.rows = _alloc(self.dev, (1, 1, chunk, D))

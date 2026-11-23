@@ -19,7 +19,7 @@ Decode slows slightly with context length because global-attention visits read m
 
 ## Prefill
 
-`scripts/run_tests.sh buckets` measures warm prefill from position 0 with both buckets (128 and 2048 rows) resident at `lmax` 32768, including the readback of the last logits. The 128-, 2,048-, 8,192- and 32,768-token rows use four warmed runs per length with both prefill buckets resident. The other rows use ten runs with the standard ring.
+`scripts/run_tests.sh buckets` measures warm prefill from position 0 with both buckets (128 and 2048 rows) resident at `lmax` 32768, including the readback of the last logits. The grouped-head timings at 2,048, 8,192 and 32,768 tokens use two warmed runs per length. The 128-token row uses four. The other rows use ten runs with the standard ring.
 
 | Prompt tokens | Median TTFT | p95 TTFT | Tokens/s |
 |---:|---:|---:|---:|
@@ -27,11 +27,11 @@ Decode slows slightly with context length because global-attention visits read m
 | 128 | 0.1858 s | 0.1870 s | 689 |
 | 300 | 0.5127 s | 0.5130 s | 585 |
 | 1,024 | 0.8529 s | 0.8538 s | 1,201 |
-| 2,048 | 1.0450 s | 1.0474 s | 1,960 |
-| 8,192 | 4.3467 s | 4.3494 s | 1,885 |
-| 32,768 | 20.779 s | 20.782 s | 1,577 |
+| 2,048 | 1.0400 s | 1.0409 s | 1,969 |
+| 8,192 | 4.3240 s | 4.3257 s | 1,895 |
+| 32,768 | 20.693 s | 20.696 s | 1,584 |
 
-Grouping four adjacent query tiles cuts the full-cache median from 22.546 s to 20.779 s. At 8,192 tokens the median moves from 4.316 s to 4.347 s. These are interleaved measurements and the first-token logits were bitwise identical at all four lengths.
+Sharing the prefix across four adjacent query tiles cuts the full-cache median from 22.546 s to 20.779 s. Grouping the three heads of a KV group cuts a further 0.078 s in its interleaved comparison. The logits were bitwise identical across both schedules at 2,048, 8,192, 30,000 and 32,768 tokens.
 
 Each chunk goes to whichever bucket costs less for the tokens that remain, so a 300-token prompt runs as three 128-row chunks and an 8,192-token prompt as four 2048-row chunks. Throughput falls at 32k because attention over the global layers grows with the prompt. The 32,768-token row fills the whole cache and leaves no room for output.
 

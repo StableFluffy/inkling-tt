@@ -278,7 +278,7 @@ void kernel_main() {
         if (qt >= valid_tiles) {
             continue;
         }
-        const uint32_t n = valid_tiles - qt < group_size ? valid_tiles - qt : group_size;
+        const uint32_t n = live_queries(qt, valid_tiles);
         const uint32_t first = start + qt;
         const uint32_t shared = shared_keys(first, saved_tiles);
         cb_wait_front(q, group_size * head_tiles);
@@ -298,7 +298,7 @@ void kernel_main() {
 #if PREFILL_DISTANCE
             project_distances();
 #endif
-            const uint32_t last = first + i;
+            const uint32_t last = first + i * query_step;
             const uint32_t keep = last + 1 > saved_tiles ? last + 1 - saved_tiles : 0;
             for (uint32_t key = shared; key <= last; ++key) {
                 const uint32_t lag = last - key;
@@ -329,7 +329,7 @@ void kernel_main() {
             cb_pop_front(prob, pv_keys * group_size);
         }
         for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t count = first + i + 1;
+            const uint32_t count = first + i * query_step + 1;
             const uint32_t keep = count > saved_tiles ? count - saved_tiles : 0;
             for (uint32_t group = shared; group < count; group += pv_keys) {
                 const uint32_t keys = count - group < pv_keys ? count - group : pv_keys;

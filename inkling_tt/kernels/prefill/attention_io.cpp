@@ -117,19 +117,19 @@ void kernel_main() {
     const auto out = TensorAccessor(a0, addr(1), bf_bytes);
     const uint32_t distances = get_write_ptr(5);
 #if PREFILL_QUERY_GROUP > 1
-    const uint32_t groups = q_tiles / group_size;
+    const uint32_t groups = q_tiles / query_tiles_per_task;
     for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
         const uint32_t qt = first_query(task, q_tiles);
         if (qt >= valid_tiles) {
             continue;
         }
-        const uint32_t n = valid_tiles - qt < group_size ? valid_tiles - qt : group_size;
+        const uint32_t n = live_queries(qt, valid_tiles);
         const uint32_t first = start + qt;
         const uint32_t shared = shared_keys(first, saved_tiles);
         for (uint32_t i = 0; i < n; ++i) {
             cb_wait_front(15, 1);
             invalidate_l1_cache();
-            const uint32_t last = first + i;
+            const uint32_t last = first + i * query_step;
             for (uint32_t key = shared; key <= last; ++key) {
                 const uint32_t lag = last - key;
                 if (lag <= window_tiles && lag % 2 == 1) {
@@ -145,7 +145,7 @@ void kernel_main() {
         for (uint32_t i = 0; i < n; ++i) {
             cb_wait_front(16, width_tiles);
             const uint32_t data = get_read_ptr(16);
-            const uint32_t tile = (qt + i) * heads + task / groups;
+            const uint32_t tile = (qt + i * query_step) * heads + (task / groups) * heads_per_task + i * head_step;
             for (uint32_t d = 0; d < width_tiles; ++d) {
                 noc_async_write<bf_bytes>(data + d * bf_bytes, out.get_noc_addr(tile * width_tiles + d), bf_bytes);
             }
@@ -218,14 +218,14 @@ void kernel_main() {
     const uint32_t distances = get_write_ptr(5);
 #if PREFILL_QUERY_GROUP > 1
     static_assert(global && saved_tiles > window_tiles);
-    const uint32_t groups = q_tiles / group_size;
+    const uint32_t groups = q_tiles / query_tiles_per_task;
     for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
         const uint32_t qt = first_query(task, q_tiles);
         if (qt >= valid_tiles) {
             continue;
         }
-        const uint32_t n = valid_tiles - qt < group_size ? valid_tiles - qt : group_size;
-        const uint32_t head = task / groups;
+        const uint32_t n = live_queries(qt, valid_tiles);
+        const uint32_t head = (task / groups) * heads_per_task;
         const uint32_t first = start + qt;
         const uint32_t shared = shared_keys(first, saved_tiles);
         const uint32_t kv_head = head / 3;
@@ -251,14 +251,15 @@ void kernel_main() {
         const uint32_t q_dest = get_write_ptr(0);
         const uint32_t sink_dest = get_write_ptr(9);
         for (uint32_t i = 0; i < n; ++i) {
-            issue_head_tile(q, head * q_tiles + qt + i, q_dest + i * width_tiles * bf_bytes);
-            noc_async_read<bf_bytes>(sinks.get_noc_addr(qt + i), scratch, bf_bytes);
+            const uint32_t slot = (head + i * head_step) * q_tiles + qt + i * query_step;
+            issue_head_tile(q, slot, q_dest + i * width_tiles * bf_bytes);
+            noc_async_read<bf_bytes>(sinks.get_noc_addr(qt + i * query_step), scratch, bf_bytes);
             noc_async_read_barrier();
             invalidate_l1_cache();
             const auto raw = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scratch);
             auto out = words(sink_dest + i * fp_bytes);
             for (uint32_t row = 0; row < 32; ++row) {
-                out[face_index(row, 0)] = uint32_t(raw[face_index(row, head)]) << 16;
+                out[face_index(row, 0)] = uint32_t(raw[face_index(row, head + i * head_step)]) << 16;
             }
         }
         cb_push_back(9, group_size);
@@ -270,8 +271,8 @@ void kernel_main() {
             cb_push_back(1, width_tiles);
         }
         for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t last = first + i;
-            const uint32_t slot = head * q_tiles + qt + i;
+            const uint32_t last = first + i * query_step;
+            const uint32_t slot = (head + i * head_step) * q_tiles + qt + i * query_step;
 #if PREFILL_DISTANCE
             cb_reserve_back(18, 1);
             noc_async_read<bf_bytes>(relative.get_noc_addr(slot), get_write_ptr(18), bf_bytes);
@@ -328,7 +329,7 @@ void kernel_main() {
         };
         second_pass(0, shared, shared);
         for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t count = first + i + 1;
+            const uint32_t count = first + i * query_step + 1;
             second_pass(shared, count, count > saved_tiles ? count - saved_tiles : 0);
         }
     }
