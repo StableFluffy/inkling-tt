@@ -95,7 +95,7 @@ def _verify_stage_program(lmax, tasks, specs):
 class TargetVerify:
     """Run a layer-major block with B1 row arithmetic and read-only committed state."""
 
-    def __init__(self, model, proposals, *, streaming=False, shared=True):
+    def __init__(self, model, proposals, *, streaming=False, compare_serial=False):
         c = model.c
         if (
             model.trace_id is not None
@@ -127,12 +127,11 @@ class TargetVerify:
         layer = model.layers[0]
         q_weight, o_weight = layer.dq.weight, layer.wo
         global_layer = next(layer for layer in model.layers if layer.is_global)
-        self.shared = shared
-        if shared:
-            self.q, self.k, self.v, self.k_dyn, self.v_dyn, self.o = (
-                SharedProjection(device, w)
-                for w in (q_weight, layer.wk, layer.wv, global_layer.k_wproj, global_layer.v_wproj, o_weight)
-            )
+        self.shared = True
+        self.q, self.k, self.v, self.k_dyn, self.v_dyn, self.o = (
+            SharedProjection(device, w)
+            for w in (q_weight, layer.wk, layer.wv, global_layer.k_wproj, global_layer.v_wproj, o_weight)
+        )
         self.scratch = tuple(
             SimpleNamespace(
                 visit=tuple(
@@ -146,16 +145,16 @@ class TargetVerify:
                 mixed_fp=row(D, FP),
                 mlp_down=(row(64, mem=L1),),
                 messages=tuple(row(D, FP) for _ in range(4)),
-                sharded_q=row(D, mem=q_weight.input_shards),
-                qrsg=row(q_weight.n, mem=q_weight.output_shards),
-                k=row(HKV * HD),
-                v=row(HKV * HD),
-                k_dyn=row(32),
-                v_dyn=row(32),
-                attended=row(o_weight.n, mem=o_weight.output_shards),
             )
             for _ in range(self.rows)
         )
+        if compare_serial:
+            for scratch in self.scratch:
+                scratch.sharded_q = row(D, mem=q_weight.input_shards)
+                scratch.qrsg = row(q_weight.n, mem=q_weight.output_shards)
+                scratch.k, scratch.v = (row(HKV * HD) for _ in range(2))
+                scratch.k_dyn, scratch.v_dyn = (row(32) for _ in range(2))
+                scratch.attended = row(o_weight.n, mem=o_weight.output_shards)
         self.histories = tuple(_alloc(device, (1, 1, 4, width), FP) for width in (HKV * HD, HKV * HD, D, D))
         self.mlp = _alloc(device, (1, 1, 32, D))
         self.branch = ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 1, D)), BF, TILE, device, L1)
