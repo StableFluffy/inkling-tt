@@ -122,13 +122,13 @@ def _program(kernels, buffers):
 
 
 @lru_cache(maxsize=32)
-def _attention_program(tasks, query_tiles, cache_tiles, is_global, retain_scores, specs, project=False):
+def _attention_program(tasks, query_tiles, cache_tiles, is_global, retain_scores, specs, project=False, query_group=1):
     grid, rt = _grid(tasks)
     args = [query_tiles, cache_tiles, int(is_global), HQ, int(retain_scores)]
     cbs = [
         _tile_cb(grid, i, dt, pages, size)
         for i, dt, pages, size in (
-            (0, BF, 4, None),
+            (0, BF, 4 * query_group, None),
             (1, BF, 8, None),
             (2, BF, 32, None),
             (3, FP, 2, None),
@@ -136,11 +136,9 @@ def _attention_program(tasks, query_tiles, cache_tiles, is_global, retain_scores
             (5, FP, 32, None),
             (6, ttnn.uint32, 1, 32),
             (7, ttnn.uint32, 1, 32),
-            (8, FP, 2, None),
-            (9, FP, 1, None),
+            (9, FP, query_group, None),
             (10, FP, 1, None),
-            (11, BF, 8, None),
-            (12, FP, 4, None),
+            (11, BF, 8 * query_group, None),
             (14, FP, 2, None),
             (15, ttnn.uint32, 1, 32),
             (16, BF, 8, None),
@@ -149,10 +147,16 @@ def _attention_program(tasks, query_tiles, cache_tiles, is_global, retain_scores
     ]
     if project:
         cbs += [_tile_cb(grid, 18, BF, 2), _tile_cb(grid, 19, BF, 32)]
-    defines = [("PREFILL_DISTANCE", "1")] if project else []
+    defines = [("PREFILL_QUERY_GROUP", str(query_group))]
+    if project:
+        defines.append(("PREFILL_DISTANCE", "1"))
+    stats = (8,) if query_group == 1 else tuple(range(20, 20 + query_group))
+    outputs = (12,) if query_group == 1 else tuple(range(24, 24 + query_group))
+    cbs += [_tile_cb(grid, cb, FP, 2) for cb in stats]
+    cbs += [_tile_cb(grid, cb, FP, 4) for cb in outputs]
     if retain_scores:
-        cbs.append(_tile_cb(grid, 13, FP, retain_scores))
-    fp32_inputs = (3, 8, 9, 10, 12, 14) + ((13,) if retain_scores else ())
+        cbs.append(_tile_cb(grid, 13, FP, query_group * retain_scores))
+    fp32_inputs = (3, 9, 10, 14, *stats, *outputs) + ((13,) if retain_scores else ())
     reader, writer = tuple(sum(group, ()) for group in specs)
     kernels = [
         ttnn.KernelDescriptor(
@@ -198,6 +202,7 @@ def _tiled_attention(
     retain_scores=False,
     global_score_tiles=0,
     table=None,
+    query_group=1,
 ):
     """Two-pass biased attention. With `table`, `distance` is the padded relative query
     [1, HQ, T, 32] and the kernel forms the distance logits itself."""
@@ -206,7 +211,7 @@ def _tiled_attention(
     _launch(
         _attention_program,
         (
-            _tasks(q.device(), HQ * tiles),
+            _tasks(q.device(), HQ * (tiles // query_group)),
             tiles,
             cache_k.shape[-2] // 32,
             is_global,
@@ -215,6 +220,7 @@ def _tiled_attention(
         inputs,
         (meta, out),
         project=table is not None,
+        query_group=query_group,
     )
     return out
 
@@ -492,12 +498,25 @@ class Prefill:
         self._broadcast_dense = os.environ.get("INK_PREFILL_DENSE", "broadcast") == "broadcast"
         self._retain_scores = os.environ.get("INK_PREFILL_KEEP_SCORES", "1") == "1"
         wide_score_tiles = 188 if grid.x * grid.y >= 130 else 160
-        if chunk > 1024 and not has_default_l1_budget(self.dev):
+        default_l1 = chunk <= 1024 or has_default_l1_budget(self.dev)
+        if not default_l1:
             wide_score_tiles -= 12
         score_tiles = int(
             os.environ.get("INK_PREFILL_GLOBAL_SCORE_TILES", str(wide_score_tiles if chunk > 1024 else 97))
         )
         self._global_score_tiles = min(m.lmax // 32, max(0, score_tiles))
+        self._query_group = 1
+        self._group_score_tiles = self._global_score_tiles
+        if (
+            chunk == 2048
+            and grid.x * grid.y >= 130
+            and m.lmax >= 16384
+            and self._retain_scores
+            and self._global_score_tiles >= 132
+            and os.getenv("INK_PREFILL_QUERY_GROUP", "4") == "4"
+        ):
+            self._query_group = 4
+            self._group_score_tiles = min(self._global_score_tiles // 4, 38 if default_l1 else 34)
         self._warmed = False
         self.dev.enable_program_cache()
         self.rows = _alloc(self.dev, (1, 1, chunk, D))
@@ -707,8 +726,9 @@ class Prefill:
             layer.is_global,
             self.attn_out,
             retain_scores=self._retain_scores,
-            global_score_tiles=self._global_score_tiles,
+            global_score_tiles=self._group_score_tiles,
             table=table,
+            query_group=self._query_group if layer.is_global else 1,
         )
         _launch(
             _state_program,

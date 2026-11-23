@@ -1,4 +1,5 @@
 #include "api/dataflow/dataflow_api.h"
+#include "query_group.h"
 
 constexpr uint32_t bf_bytes = 2048;
 constexpr uint32_t fp_bytes = 4096;
@@ -115,6 +116,44 @@ void kernel_main() {
     // task's distances loaded and 17 (writer -> reader) releases them.
     const auto out = TensorAccessor(a0, addr(1), bf_bytes);
     const uint32_t distances = get_write_ptr(5);
+#if PREFILL_QUERY_GROUP > 1
+    const uint32_t groups = q_tiles / group_size;
+    for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
+        const uint32_t qt = first_query(task, q_tiles);
+        if (qt >= valid_tiles) {
+            continue;
+        }
+        const uint32_t n = valid_tiles - qt < group_size ? valid_tiles - qt : group_size;
+        const uint32_t first = start + qt;
+        const uint32_t shared = shared_keys(first, saved_tiles);
+        for (uint32_t i = 0; i < n; ++i) {
+            cb_wait_front(15, 1);
+            invalidate_l1_cache();
+            const uint32_t last = first + i;
+            for (uint32_t key = shared; key <= last; ++key) {
+                const uint32_t lag = last - key;
+                if (lag <= window_tiles && lag % 2 == 1) {
+                    cb_reserve_back(14, 1);
+                    make_bias(get_write_ptr(14), distances, lag);
+                    cb_push_back(14, 1);
+                }
+            }
+            cb_pop_front(15, 1);
+            cb_reserve_back(17, 1);
+            cb_push_back(17, 1);
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            cb_wait_front(16, width_tiles);
+            const uint32_t data = get_read_ptr(16);
+            const uint32_t tile = (qt + i) * heads + task / groups;
+            for (uint32_t d = 0; d < width_tiles; ++d) {
+                noc_async_write<bf_bytes>(data + d * bf_bytes, out.get_noc_addr(tile * width_tiles + d), bf_bytes);
+            }
+            noc_async_write_barrier();
+            cb_pop_front(16, width_tiles);
+        }
+    }
+#else
     for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
         const uint32_t qt = query_tile(task);
         if (qt >= valid_tiles) {
@@ -147,6 +186,7 @@ void kernel_main() {
         noc_async_write_barrier();
         cb_pop_front(16, width_tiles);
     }
+#endif
 #else
     constexpr auto a1 = TensorAccessorArgs<a0.next_compile_time_args_offset()>();
     constexpr auto a2 = TensorAccessorArgs<a1.next_compile_time_args_offset()>();
@@ -176,6 +216,123 @@ void kernel_main() {
 #endif
     const uint32_t scratch = get_write_ptr(4);
     const uint32_t distances = get_write_ptr(5);
+#if PREFILL_QUERY_GROUP > 1
+    static_assert(global && saved_tiles > window_tiles);
+    const uint32_t groups = q_tiles / group_size;
+    for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
+        const uint32_t qt = first_query(task, q_tiles);
+        if (qt >= valid_tiles) {
+            continue;
+        }
+        const uint32_t n = valid_tiles - qt < group_size ? valid_tiles - qt : group_size;
+        const uint32_t head = task / groups;
+        const uint32_t first = start + qt;
+        const uint32_t shared = shared_keys(first, saved_tiles);
+        const uint32_t kv_head = head / 3;
+        auto issue = [&](bool value, uint32_t key, uint32_t dest) {
+            if (key < start) {
+                const uint32_t tile = kv_head * cache_tiles + key;
+                if (value) {
+                    issue_head_tile(old_v, tile, dest);
+                } else {
+                    issue_head_tile(old_k, tile, dest);
+                }
+            } else {
+                const uint32_t tile = kv_head * q_tiles + key - start;
+                if (value) {
+                    issue_head_tile(v, tile, dest);
+                } else {
+                    issue_head_tile(k, tile, dest);
+                }
+            }
+        };
+        cb_reserve_back(0, group_size * width_tiles);
+        cb_reserve_back(9, group_size);
+        const uint32_t q_dest = get_write_ptr(0);
+        const uint32_t sink_dest = get_write_ptr(9);
+        for (uint32_t i = 0; i < n; ++i) {
+            issue_head_tile(q, head * q_tiles + qt + i, q_dest + i * width_tiles * bf_bytes);
+            noc_async_read<bf_bytes>(sinks.get_noc_addr(qt + i), scratch, bf_bytes);
+            noc_async_read_barrier();
+            invalidate_l1_cache();
+            const auto raw = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(scratch);
+            auto out = words(sink_dest + i * fp_bytes);
+            for (uint32_t row = 0; row < 32; ++row) {
+                out[face_index(row, 0)] = uint32_t(raw[face_index(row, head)]) << 16;
+            }
+        }
+        cb_push_back(9, group_size);
+        cb_push_back(0, group_size * width_tiles);
+        for (uint32_t key = 0; key < shared; ++key) {
+            cb_reserve_back(1, width_tiles);
+            issue(false, key, get_write_ptr(1));
+            noc_async_read_barrier();
+            cb_push_back(1, width_tiles);
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t last = first + i;
+            const uint32_t slot = head * q_tiles + qt + i;
+#if PREFILL_DISTANCE
+            cb_reserve_back(18, 1);
+            noc_async_read<bf_bytes>(relative.get_noc_addr(slot), get_write_ptr(18), bf_bytes);
+            noc_async_read_barrier();
+            cb_push_back(18, 1);
+            cb_wait_front(5, window_tiles);
+#else
+            const uint32_t distance_tiles = last < window_tiles ? last + 1 : window_tiles;
+            for (uint32_t j = window_tiles - distance_tiles; j < window_tiles; ++j) {
+                noc_async_read<fp_bytes>(distance.get_noc_addr(slot * window_tiles + j), distances + j * fp_bytes, fp_bytes);
+            }
+            noc_async_read_barrier();
+#endif
+            invalidate_l1_cache();
+            cb_reserve_back(15, 1);
+            cb_push_back(15, 1);
+            for (uint32_t key = shared; key <= last; ++key) {
+                cb_reserve_back(1, width_tiles);
+                issue(false, key, get_write_ptr(1));
+                const uint32_t lag = last - key;
+                if (lag <= window_tiles && lag % 2 == 0) {
+                    cb_reserve_back(3, 1);
+                    make_bias(get_write_ptr(3), distances, lag);
+                    cb_push_back(3, 1);
+                }
+                noc_async_read_barrier();
+                cb_push_back(1, width_tiles);
+            }
+            cb_wait_front(17, 1);
+            cb_pop_front(17, 1);
+#if PREFILL_DISTANCE
+            cb_pop_front(5, window_tiles);
+#endif
+        }
+        auto second_pass = [&](uint32_t begin, uint32_t end, uint32_t keep) {
+            for (uint32_t group = begin; group < end; group += value_group_keys) {
+                const uint32_t count = end - group < value_group_keys ? end - group : value_group_keys;
+                cb_reserve_back(2, value_group_keys * width_tiles);
+                const uint32_t v_dest = get_write_ptr(2);
+                for (uint32_t j = 0; j < count; ++j) {
+                    const uint32_t key = group + j;
+                    if (key < keep) {
+                        cb_reserve_back(1, width_tiles);
+                        issue(false, key, get_write_ptr(1));
+                    }
+                    issue(true, key, v_dest + j * width_tiles * bf_bytes);
+                    noc_async_read_barrier();
+                    if (key < keep) {
+                        cb_push_back(1, width_tiles);
+                    }
+                }
+                cb_push_back(2, value_group_keys * width_tiles);
+            }
+        };
+        second_pass(0, shared, shared);
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t count = first + i + 1;
+            second_pass(shared, count, count > saved_tiles ? count - saved_tiles : 0);
+        }
+    }
+#else
     bool shared_distances = false;
     bool key_cb_odd = false, value_cb_odd = false;
     for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
@@ -296,5 +453,6 @@ void kernel_main() {
             }
         }
     }
+#endif
 #endif
 }

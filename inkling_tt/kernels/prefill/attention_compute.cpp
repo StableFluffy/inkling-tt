@@ -10,6 +10,8 @@
 #include "api/compute/sfpu_binary_bcast.h"
 #include "api/compute/tile_move_copy.h"
 
+#include "query_group.h"
+
 using namespace ckernel;
 
 namespace {
@@ -19,11 +21,13 @@ constexpr uint32_t v = 2;
 constexpr uint32_t bias = 3;
 constexpr uint32_t odd_bias = 14;
 constexpr uint32_t control = 7;
-constexpr uint32_t stats = 8;
+constexpr uint32_t single_stats = 8;
+constexpr uint32_t stats_base = 20;
 constexpr uint32_t sink = 9;
 constexpr uint32_t score = 10;
 constexpr uint32_t prob = 11;
-constexpr uint32_t accum = 12;
+constexpr uint32_t single_accum = 12;
+constexpr uint32_t accum_base = 24;
 constexpr uint32_t saved = 13;
 constexpr uint32_t saved_tiles = get_compile_time_arg_val(4);
 constexpr uint32_t out = 16;
@@ -63,29 +67,33 @@ inline void pack(uint32_t cb, uint32_t n) {
     cb_push_back(cb, n);
 }
 
-void seed() {
-    cb_wait_front(sink, 1);
+void seed(uint32_t stats = single_stats, uint32_t query = 0) {
+    cb_wait_front(sink, group_size);
     tile_regs_acquire();
-    load(sink, 0, 0);
-    load(sink, 0, 1);
+    load(sink, query, 0);
+    load(sink, query, 1);
     binop_with_scalar_tile_init();
     mul_unary_tile(0, scale);
     fill_tile_init();
     fill_tile_bitcast(1, one);
-    cb_pop_front(sink, 1);
+    if constexpr (group_size == 1) {
+        cb_pop_front(sink, 1);
+    }
     pack(stats, 2);
 }
 
-void qk(bool biased, bool keep, uint32_t page, uint32_t lag) {
+void qk(bool biased, bool keep, uint32_t page, uint32_t lag, uint32_t query = 0) {
     cb_wait_front(k, head_tiles);
     tile_regs_acquire();
     // The preceding FP32 datacopy leaves a different source tile stride.
     reconfig_full_operand<SrcOrder::Reverse>(q, k);
     matmul_init(q, k, 1);
     for (uint32_t d = 0; d < head_tiles; ++d) {
-        matmul_tiles(q, k, d, d, 0);
+        matmul_tiles(q, k, query * head_tiles + d, d, 0);
     }
-    cb_pop_front(k, head_tiles);
+    if constexpr (group_size == 1) {
+        cb_pop_front(k, head_tiles);
+    }
     if (biased) {
         const uint32_t cb = lag % 2 == 0 ? bias : odd_bias;
         cb_wait_front(cb, 1);
@@ -109,7 +117,7 @@ void qk(bool biased, bool keep, uint32_t page, uint32_t lag) {
     cb_push_back(score, 1);
 }
 
-void update_stats() {
+void update_stats(uint32_t stats = single_stats) {
     cb_wait_front(score, 1);
     cb_wait_front(stats, 2);
     tile_regs_acquire();
@@ -139,7 +147,7 @@ void update_stats() {
     pack(stats, 2);
 }
 
-void invert_denominator() {
+void invert_denominator(uint32_t stats = single_stats) {
     cb_wait_front(stats, 2);
     tile_regs_acquire();
     load(stats, 0, 0);
@@ -150,7 +158,7 @@ void invert_denominator() {
     pack(stats, 2);
 }
 
-void probability(bool kept, uint32_t page) {
+void probability(bool kept, uint32_t page, uint32_t stats = single_stats, uint32_t dst = 0) {
     if (!kept) {
         cb_wait_front(score, 1);
     }
@@ -169,7 +177,15 @@ void probability(bool kept, uint32_t page) {
     if (!kept) {
         cb_pop_front(score, 1);
     }
-    pack(prob, 1);
+    if constexpr (group_size == 1) {
+        pack(prob, 1);
+    } else {
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_reconfig_data_format(prob);
+        pack_tile<true>(0, prob, dst);
+        tile_regs_release();
+    }
 }
 
 // Accumulate P @ V for a group of keys in Dest. The FP32 accumulator round
@@ -204,7 +220,8 @@ void project_distances() {
 }
 #endif
 
-void pv(bool first, bool last, uint32_t keys) {
+void pv(bool first, bool last, uint32_t keys, uint32_t query = 0) {
+    const uint32_t accum = group_size == 1 ? single_accum : accum_base + query;
     tile_regs_acquire();
     if (!first) {
         cb_wait_front(accum, head_tiles);
@@ -215,15 +232,23 @@ void pv(bool first, bool last, uint32_t keys) {
     }
     reconfig_full_operand<SrcOrder::Reverse>(prob, v);
     matmul_init(prob, v);
-    // Consume each probability tile from the CB front: a group can wrap the ring.
-    for (uint32_t j = 0; j < keys; ++j) {
-        cb_wait_front(prob, 1);
-        cb_wait_front(v, head_tiles);
-        for (uint32_t d = 0; d < head_tiles; ++d) {
-            matmul_tiles(prob, v, 0, d, d);
+    if constexpr (group_size == 1) {
+        // Consume each probability tile from the CB front: a group can wrap the ring.
+        for (uint32_t j = 0; j < keys; ++j) {
+            cb_wait_front(prob, 1);
+            cb_wait_front(v, head_tiles);
+            for (uint32_t d = 0; d < head_tiles; ++d) {
+                matmul_tiles(prob, v, 0, d, d);
+            }
+            cb_pop_front(v, head_tiles);
+            cb_pop_front(prob, 1);
         }
-        cb_pop_front(v, head_tiles);
-        cb_pop_front(prob, 1);
+    } else {
+        for (uint32_t j = 0; j < keys; ++j) {
+            for (uint32_t d = 0; d < head_tiles; ++d) {
+                matmul_tiles(prob, v, query * pv_keys + j, j * head_tiles + d, d);
+            }
+        }
     }
     if (last) {
         for (uint32_t d = 0; d < head_tiles; ++d) {
@@ -246,6 +271,91 @@ void kernel_main() {
     const uint32_t start = read_tile_value(control, 0, 0) / 32;
     const uint32_t valid_tiles = (read_tile_value(control, 0, 1) + 31) / 32;
     cb_pop_front(control, 1);
+#if PREFILL_QUERY_GROUP > 1
+    constexpr uint32_t save_total = saved_tiles * group_size;
+    for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
+        const uint32_t qt = first_query(task, query_tiles);
+        if (qt >= valid_tiles) {
+            continue;
+        }
+        const uint32_t n = valid_tiles - qt < group_size ? valid_tiles - qt : group_size;
+        const uint32_t first = start + qt;
+        const uint32_t shared = shared_keys(first, saved_tiles);
+        cb_wait_front(q, group_size * head_tiles);
+        for (uint32_t i = 0; i < n; ++i) {
+            seed(stats_base + i, i);
+        }
+        cb_pop_front(sink, group_size);
+        cb_reserve_back(saved, save_total);
+        for (uint32_t key = 0; key < shared; ++key) {
+            for (uint32_t i = 0; i < n; ++i) {
+                qk(false, false, 0, 0, i);
+                update_stats(stats_base + i);
+            }
+            cb_pop_front(k, head_tiles);
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+#if PREFILL_DISTANCE
+            project_distances();
+#endif
+            const uint32_t last = first + i;
+            const uint32_t keep = last + 1 > saved_tiles ? last + 1 - saved_tiles : 0;
+            for (uint32_t key = shared; key <= last; ++key) {
+                const uint32_t lag = last - key;
+                qk(lag <= 32, key >= keep, i * saved_tiles + key - keep, lag, i);
+                cb_pop_front(k, head_tiles);
+                update_stats(stats_base + i);
+            }
+            invert_denominator(stats_base + i);
+        }
+        cb_push_back(saved, save_total);
+        cb_wait_front(saved, save_total);
+        for (uint32_t group = 0; group < shared; group += pv_keys) {
+            cb_reserve_back(prob, pv_keys * group_size);
+            for (uint32_t j = 0; j < pv_keys; ++j) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    qk(false, false, 0, 0, i);
+                    probability(false, 0, stats_base + i, i * pv_keys + j);
+                }
+                cb_pop_front(k, head_tiles);
+            }
+            cb_push_back(prob, pv_keys * group_size);
+            cb_wait_front(prob, pv_keys * group_size);
+            cb_wait_front(v, pv_keys * head_tiles);
+            for (uint32_t i = 0; i < n; ++i) {
+                pv(group == 0, false, pv_keys, i);
+            }
+            cb_pop_front(v, pv_keys * head_tiles);
+            cb_pop_front(prob, pv_keys * group_size);
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t count = first + i + 1;
+            const uint32_t keep = count > saved_tiles ? count - saved_tiles : 0;
+            for (uint32_t group = shared; group < count; group += pv_keys) {
+                const uint32_t keys = count - group < pv_keys ? count - group : pv_keys;
+                cb_reserve_back(prob, pv_keys * group_size);
+                for (uint32_t j = 0; j < keys; ++j) {
+                    const uint32_t key = group + j;
+                    const bool kept = key >= keep;
+                    if (!kept) {
+                        qk(false, false, 0, 0, i);
+                        cb_pop_front(k, head_tiles);
+                    }
+                    probability(kept, i * saved_tiles + key - keep, stats_base + i, i * pv_keys + j);
+                }
+                cb_push_back(prob, pv_keys * group_size);
+                cb_wait_front(prob, pv_keys * group_size);
+                cb_wait_front(v, pv_keys * head_tiles);
+                pv(group == 0, group + keys == count, keys, i);
+                cb_pop_front(v, pv_keys * head_tiles);
+                cb_pop_front(prob, pv_keys * group_size);
+            }
+            cb_pop_front(stats_base + i, 2);
+        }
+        cb_pop_front(q, group_size * head_tiles);
+        cb_pop_front(saved, save_total);
+    }
+#else
     for (uint32_t task = get_arg_val<uint32_t>(0); task < get_arg_val<uint32_t>(1); ++task) {
         const uint32_t i = task % query_tiles;
         const uint32_t qt = i % 2 == 0 ? i / 2 : query_tiles - 1 - i / 2;
@@ -285,9 +395,10 @@ void kernel_main() {
             pv(group == 0, group + keys == count, keys);
         }
         cb_pop_front(q, head_tiles);
-        cb_pop_front(stats, 2);
+        cb_pop_front(single_stats, 2);
         if constexpr (saved_tiles != 0) {
             cb_pop_front(saved, saved_tiles);
         }
     }
+#endif
 }
