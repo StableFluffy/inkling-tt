@@ -27,7 +27,7 @@ def main():
         handle = experts_stream.prepare(
             device, weights.get("layers.0.mlp.experts.gate_up_proj"), weights.get("layers.0.mlp.experts.down_proj")
         )
-        verify = VerifyExperts(device, rows)
+        verifiers = [VerifyExperts(device, rows, streaming=streaming) for streaming in (False, True)]
         packed = _alloc(device, (1, 1, 32, D))
         routing = [
             (
@@ -50,43 +50,49 @@ def main():
             gamma = torch.rand(rows, 8, generator=generator)
             gamma *= 8 / gamma.sum(-1, keepdim=True)
             prepare(x, ids, gamma)
-            output = verify.run(packed, routing, handle)
-            data = ttnn.to_torch(output)[0, 0]
             refs = []
             for i, (dev_ids, dev_gamma) in enumerate(routing):
                 row = ttnn.from_torch(x[:, :, i : i + 1], dtype=BF, layout=TILE, device=device, memory_config=L1)
                 refs.append(ttnn.to_torch(experts_stream.moe_decode(row, dev_ids, dev_gamma, handle))[0, 0, 0])
             expected = torch.stack(refs)
             union = ids.unique().numel()
-            failures = (data[:rows] != expected).sum().item()
-            print(f"union {union}: {failures}/{rows * D} mismatches against B1", flush=True)
-            assert torch.equal(data[:rows], expected)
-            assert torch.count_nonzero(data[rows:]) == 0
+            for name, verifier in zip(("resident", "pipelined"), verifiers):
+                data = ttnn.to_torch(verifier.run(packed, routing, handle))[0, 0]
+                failures = (data[:rows] != expected).sum().item()
+                print(f"{name} union {union}: {failures}/{rows * D} mismatches against B1", flush=True)
+                assert torch.equal(data[:rows], expected)
+                assert torch.count_nonzero(data[rows:]) == 0
             cases.append((x, ids, gamma, expected))
 
         ttnn.synchronize_device(device)
-        trace = ttnn.begin_trace_capture(device, cq_id=0)
-        verify.run(packed, routing, handle)
-        ttnn.end_trace_capture(device, trace, cq_id=0)
+        traces = []
+        for verifier in verifiers:
+            trace = ttnn.begin_trace_capture(device, cq_id=0)
+            verifier.run(packed, routing, handle)
+            ttnn.end_trace_capture(device, trace, cq_id=0)
+            traces.append(trace)
         try:
-            samples = [[] for _ in cases]
-            for i in range(18):
+            samples = [[[], []] for _ in cases]
+            for i in range(36):
                 j = i % len(cases)
                 x, ids, gamma, expected = cases[j]
                 prepare(x, ids, gamma)
                 ttnn.synchronize_device(device)
-                start = time.perf_counter()
-                ttnn.execute_trace(device, trace, cq_id=0, blocking=True)
-                samples[j].append(1000 * (time.perf_counter() - start))
-                assert torch.equal(ttnn.to_torch(verify.workspace.output)[0, 0, :rows], expected)
-            for (_, ids, _, _), times in zip(cases, samples):
-                print(
-                    f"union {ids.unique().numel()}: {statistics.median(times[1:]):.3f} ms median, "
-                    f"{max(times[1:]):.3f} ms p95",
-                    flush=True,
-                )
+                for k in (0, 1) if i % 2 == 0 else (1, 0):
+                    start = time.perf_counter()
+                    ttnn.execute_trace(device, traces[k], cq_id=0, blocking=True)
+                    samples[j][k].append(1000 * (time.perf_counter() - start))
+                    assert torch.equal(ttnn.to_torch(verifiers[k].workspace.output)[0, 0, :rows], expected)
+            for (_, ids, _, _), variants in zip(cases, samples):
+                for name, times in zip(("resident", "pipelined"), variants):
+                    print(
+                        f"{name} union {ids.unique().numel()}: {statistics.median(times[2:]):.3f} ms median, "
+                        f"{max(times[2:]):.3f} ms p95",
+                        flush=True,
+                    )
         finally:
-            ttnn.release_trace(device, trace)
+            for trace in traces:
+                ttnn.release_trace(device, trace)
     finally:
         ttnn.close_device(device)
 

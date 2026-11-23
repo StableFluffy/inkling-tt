@@ -25,10 +25,11 @@ def _pack_program(rows, specs):
 
 
 class VerifyExperts:
-    def __init__(self, device, rows):
+    def __init__(self, device, rows, *, streaming=False):
         if not 2 <= rows <= 8:
             raise ValueError("Expert verify needs two to eight live rows")
         self.rows = rows
+        self.verify_mode = 2 if streaming else 1
         self.workspace = experts.prepare_prefill(device, 32)
 
     def run(self, x, routing, handle):
@@ -52,7 +53,7 @@ class VerifyExperts:
             desc.kernels = [kernel]
             ttnn.generic_op(list(maps), desc)
         experts._prefill_io(x, work, False)
-        experts._prefill_project(True, work, handle, verify=True)
-        experts._prefill_project(False, work, handle, verify=True)
+        experts._prefill_project(True, work, handle, verify=self.verify_mode)
+        experts._prefill_project(False, work, handle, verify=self.verify_mode)
         experts._prefill_io(x, work, True)
         return work.output

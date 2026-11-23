@@ -22,6 +22,7 @@ _GU_K_BLOCK = 6
 _GU_LANES = 4
 _GU_K, _DOWN_K = _WIDTH // 32, _HIDDEN // 32
 _RING = 2
+_VERIFY_RING = 3
 _ACT_ROWS = 8
 _DOWN_K_BLOCK = 12
 _LOCK = Lock()
@@ -598,7 +599,13 @@ def _prefill_projection_program(
                     (1 if rows == 32 and gate else 2) * k,
                     ttnn.TileDescriptor(ttnn.Tile([rows, 32])),
                 ),
-                _cb(grid, 1, _BFP8, 1088, (1 if gate and single_weights else 2) * k * cols),
+                _cb(
+                    grid,
+                    1,
+                    _BFP8,
+                    1088,
+                    (_VERIFY_RING * block_k if verify == 2 else (1 if gate and single_weights else 2) * k) * cols,
+                ),
                 _cb(grid, 2, ttnn.uint32, _EXPERTS * 4),
                 _cb(grid, 3, ttnn.uint32, _EXPERTS * 4),
                 _cb(grid, 16, _BF, 2048, 2 * (cols // 2 if gate else cols)),
@@ -612,6 +619,8 @@ def _prefill_projection_program(
         ]
         if verify:
             definitions.append(("EXPERTS_VERIFY", "1"))
+        if verify == 2:
+            definitions.extend((("EXPERTS_VERIFY_STREAM", "1"), ("EXPERTS_VERIFY_RING", str(_VERIFY_RING))))
         for source, accessor, config in (
             ("prefill_weights.cpp", specs[0], ttnn.ReaderConfigDescriptor()),
             ("prefill_rows.cpp", sum(specs, ()), ttnn.WriterConfigDescriptor()),
@@ -627,6 +636,8 @@ def _prefill_projection_program(
             ),
         ):
             path = _KERNELS / source
+            if verify == 2 and source == "prefill_weights.cpp":
+                path = _KERNELS / "verify_weights.cpp"
             if rows == 32 and source != "prefill_weights.cpp":
                 path = _PREFILL_KERNELS / source.replace("prefill_", "expert_")
             elif broadcast_down and source == "prefill_rows.cpp":

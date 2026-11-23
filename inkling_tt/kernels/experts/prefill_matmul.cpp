@@ -90,12 +90,20 @@ void kernel_main() {
         if (begin == end) {
             continue;
         }
+#ifndef EXPERTS_VERIFY_STREAM
         cb_wait_front(1, k * cols);
+#endif
         for (uint32_t block = begin; block < end; ++block) {
             cb_wait_front(0, k);
             tile_regs_acquire();
             for (uint32_t step = 0; step < k; step += block_k) {
+#ifdef EXPERTS_VERIFY_STREAM
+                cb_wait_front(1, block_k * cols);
+                matmul_block_k(0, 1, step, 0, 0, 0, cols, 1, k, block_k, cols);
+                cb_pop_front(1, block_k * cols);
+#else
                 matmul_block_k(0, 1, step, step * cols, 0, 0, cols, 1, k, block_k, cols);
+#endif
             }
             cb_pop_front(0, k);
 #if EXPERTS_GATE
@@ -121,7 +129,9 @@ void kernel_main() {
             tile_regs_release();
             cb_push_back(16, out_cols);
         }
+#ifndef EXPERTS_VERIFY_STREAM
         cb_pop_front(1, k * cols);
+#endif
     }
     cb_pop_front(2, 1);
 }
