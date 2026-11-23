@@ -10,6 +10,7 @@ void kernel_main() {
     constexpr uint32_t packet_bytes = 12 * tile_bytes;
     constexpr uint32_t blocks_per_expert = k / block_k;
     constexpr uint32_t ring = EXPERTS_VERIFY_RING;
+    constexpr uint32_t ahead = ring - 2;
     const auto ends = TensorAccessor(TensorAccessorArgs<3>(), get_common_arg_val<uint32_t>(0), 512);
     const uint32_t weights = get_common_arg_val<uint32_t>(1);
     cb_reserve_back(2, 1);
@@ -53,7 +54,7 @@ void kernel_main() {
 
     const uint32_t blocks = count * blocks_per_expert;
     reset_noc_trid_barrier_counter(NOC_CLEAR_OUTSTANDING_REQ_MASK, noc_index);
-    cb_reserve_back(1, 2 * block_tiles);
+    cb_reserve_back(1, (ahead + 1) * block_tiles);
     const uint32_t base = get_write_ptr(1);
     auto ticket = [](uint32_t block) { return block % ring + 1; };
     for (uint32_t block = 0; block < blocks; ++block) {
@@ -72,16 +73,18 @@ void kernel_main() {
         for (uint32_t p = 0; p < block_bytes; p += packet_bytes) {
             noc_async_read_one_packet_with_state_with_trid(bank, src + p, dest + p, trid);
         }
-        if (block) {
-            noc_async_read_barrier_with_trid(ticket(block - 1));
+        if (block >= ahead) {
+            noc_async_read_barrier_with_trid(ticket(block - ahead));
             cb_push_back(1, block_tiles);
             if (block + 1 < blocks) {
-                cb_reserve_back(1, 2 * block_tiles);
+                cb_reserve_back(1, (ahead + 1) * block_tiles);
             }
         }
     }
-    noc_async_read_barrier_with_trid(ticket(blocks - 1));
-    cb_push_back(1, block_tiles);
+    for (uint32_t block = blocks - ahead; block < blocks; ++block) {
+        noc_async_read_barrier_with_trid(ticket(block));
+        cb_push_back(1, block_tiles);
+    }
     noc_async_read_one_packet_set_state<true>(get_noc_addr(MEM_ZEROS_BASE), 0, 1);
     noc_async_read_set_trid(0);
 }
