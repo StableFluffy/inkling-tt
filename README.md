@@ -54,6 +54,7 @@ Read [docs/design.md](docs/design.md) for the time budget and the main technique
 - [Hardware](docs/hardware.md): tested configuration, stock cards and worker grids, memory
 - [Benchmarks](docs/benchmarks.md): release numbers and how to reproduce them
 - [Decode design](docs/design.md), [Prefill](docs/prefill.md), [Precision](docs/precision.md)
+- [DSpark draft and verification kernels](docs/speculative.md)
 - Kernels: [row epilogues](docs/rowvm.md), [experts](docs/experts.md), [attention](docs/attention.md), [dense projections](docs/dense.md)
 - [Model architecture](docs/model.md)
 - [Development](docs/development.md): tests, profiling, trace rules, release image
