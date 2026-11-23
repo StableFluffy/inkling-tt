@@ -19,8 +19,8 @@ the layer's weighted RMSNorm. The layer projects BF16 K and V from the mixture a
 learned K norm and NeoX RoPE to K. The first and third layers keep 1,024-slot rings. The middle
 layer keeps the full prefix. When the maximum context exceeds 2,048, the round also keeps a
 1,024-slot copy of the global draft cache for short prefixes. The long draft uses a tiled FP32
-softmax whose L1 scratch fits alongside the target and prefill workspaces. A fourth tap mixture supplies the Markov context from the last
-committed input.
+softmax whose L1 scratch fits alongside the target and prefill workspaces. A fourth tap mixture
+supplies the Markov context from the last committed input.
 
 ## Draft scores
 
@@ -60,7 +60,7 @@ decode paths share the per-visit rings.
 
 The verifier groups previous-pass message mixes with independent attention input mixes on
 disjoint cores. It batches the Q/K/V message controllers across rows and retains their B1
-reduction order. At a short prefix the full four-row verifier replays in 36.45 ms.
+reduction order. At a short prefix the full four-row verifier replays in 36.46 ms.
 
 One launch packs the Q, K and V inputs into BF16 tile rows. The dynamic taps reuse the
 packed K and V inputs where their layouts match. Q, K, V, the dynamic taps and O each
@@ -103,13 +103,13 @@ estimated conditional acceptance `a`, a width `R` yields an expected `1 + a + ..
 
 An adaptive request starts with two rows if both its probe overhead and the cost of building
 draft context fit 0.3 ms per allowed decode ID. The prefill bucket schedule and startup
-measurements of each bucket's context trace give the context cost. Each round charges its estimated replay time and credits the B1 time of its emitted
-IDs. A wider round must fit the remaining budget even if every proposal is rejected. The
+measurements of each bucket's context trace give the context cost. Each round charges its estimated
+replay time and credits the B1 time of its emitted IDs. A wider round must fit the remaining budget even if every proposal is rejected. The
 budget allows one two-row probe. Width one switches the request to B1.
 
 The host queues an asynchronous read of the 64-byte result, followed by the context update and
-the next shared draft trace when another speculative round fits and pays off at the lowest possible acceptance. The draft starts from the
-device-published anchor and position. The host uses the returned width to submit the matching
+the next shared draft trace when another round fits the budget even if it emits only one ID.
+The draft starts from the device-published anchor and position. The host uses the returned width to submit the matching
 scoring and verification traces while the draft runs. Near the short-prefix boundary or the
 output limit, the next launch waits for the accepted position.
 
@@ -118,30 +118,29 @@ output limit, the next launch waits for the accepted position.
 The component tests run through the pinned dev image.
 
 ```sh
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-rope"
-scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_experts.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_router.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_decision.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_verify.py"
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_round.py --adaptive"
-INK_LMAX=2048 scripts/bench_decode.sh
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_round.py --proposals 3"
 ```
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 5.85 ms median, 5.89 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 5.85 ms median, 5.87 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
-| Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
-| Four expert rows, union of 20 | 0.443 ms median, 0.446 ms p95 |
-| Four BF16 target head rows, serial | 7.708 ms median, 7.742 ms p95 |
-| Four BF16 target head rows, shared | 2.030 ms median, 2.058 ms p95 |
+| Four router rows with staging, shared | 34.47 µs median, 36.67 µs p95 |
+| Four expert rows, union of 20 | 0.443 ms median, 0.453 ms p95 |
+| Four BF16 target head rows, serial | 7.712 ms median, 7.745 ms p95 |
+| Four BF16 target head rows, shared | 2.031 ms median, 2.068 ms p95 |
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
-| Batched attention against serial B1 | 88/88 bitwise-equal rows |
+| Batched attention against serial B1 | 216/216 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 36.45 ms median, 36.61 ms p95 |
-| B1 greedy in the same job | 19.14 ms median, 19.16 ms p95 |
+| Four-row target verify at `lmax=1120` | 36.46 ms median, 36.49 ms p95 |
+| B1 greedy in the same job | 18.93 ms median, 18.95 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.
@@ -150,15 +149,19 @@ The serial verifier check compares logits and taps at the local window boundary,
 ring wrap and the global cache limit. It also runs B1 with alternate continuations after each
 possible rejection and compares with a serial run of the same accepted prefix.
 
-Adaptive rounds reproduce the B1 IDs on 32-token continuations, including a prompt
-that reaches the 1,024-key window boundary. Times exclude prefill and draft context priming.
+The round test checks 32 output IDs against serial B1 on chat, Python, Korean and a
+prompt that crosses the 1,024-key window boundary. All IDs match with fixed
+three-proposal rounds. These timings exclude prefill and draft context priming.
 
-| Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
+| Prompt | B1 median / p95 ms per ID | Fixed MTP median / p95 ms per ID |
 |---|---:|---:|
-| Chat | 19.28/19.32 | 12.60/12.60 |
-| Python | 19.25/19.28 | 13.59/13.60 |
-| Korean | 19.16/19.16 | 19.63/19.64 |
-| Ring wrap | 19.72/19.73 | 16.16/16.16 |
+| Chat | 19.04/19.13 | 11.83/11.83 |
+| Python | 19.06/19.14 | 12.53/12.53 |
+| Korean | 19.03/19.12 | 17.80/17.82 |
+| Ring wrap | 19.61/19.68 | 16.48/16.49 |
+
+Adaptive serving budgets the initial probe against the requested output length. For these
+32-ID fixtures it uses B1. The 64-token HTTP benchmark below measures the adaptive path.
 
 ## HTTP serving
 
@@ -167,5 +170,5 @@ with `"mtp": false`. See [serving.md](serving.md#speculative-decoding) for the c
 launch command.
 
 `tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` compares streamed responses
-with both prefill buckets resident and an 8,192-token context. It checks the stream choices
-and usage for each run. The HTTP results and the default are in [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).
+with both prefill buckets resident and an 8,192-token context. It checks the streamed choices
+and usage for every run. See [benchmarks.md](benchmarks.md#adaptive-greedy-mtp).

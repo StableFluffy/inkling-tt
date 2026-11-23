@@ -34,7 +34,7 @@ ENTRYPOINT ["python", "-u", "-m", "serve.openai_server", "--weights", "/models/h
 # Metadata last, so a new revision label does not invalidate the layers above.
 ARG BASE_IMAGE
 ARG TT_METAL_COMMIT=79951bd44b7484a136b3619e0d81f26baa8a1936
-ARG INKLING_VERSION=0.1.0-dev
+ARG INKLING_VERSION=0.1.1-dev
 ARG INKLING_COMMIT=unknown
 ARG SOURCE_URL=https://github.com/StableFluffy/inkling-tt
 LABEL org.opencontainers.image.title="inkling-2-mini-tt" \

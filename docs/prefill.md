@@ -1,6 +1,6 @@
 # Prefill
 
-Prefill runs the prompt through the decode model's weights and caches in fixed-shape chunks, each replayed from a trace. Two buckets, 128 and 2048 rows, stay resident; every chunk advances all 48 layer visits and writes the K/V caches and convolution histories that the decode trace reads next. The rule to remember: every prefill program and buffer is created and run once before the decode trace is captured.
+Prefill runs the prompt through the decode model's weights and caches in fixed-shape chunks, each replayed from a trace. Two buckets, 128 and 2048 rows, stay resident; every chunk advances all 48 layer visits and writes the K/V caches and convolution histories that the decode trace reads next. Each bucket allocates its buffers and runs its programs eagerly before trace capture.
 
 The code is `inkling_tt/prefill.py`, the expert path in `inkling_tt/experts_stream.py`, and the kernels in `inkling_tt/kernels/prefill/`. The model it computes is described in [model.md](model.md).
 
@@ -72,7 +72,7 @@ another 0.28 s on a 32k-token prompt.
 
 ## Convolution, depth mixing, message gates
 
-- The stencil kernel (`conv_io.cpp`, `conv_compute.cpp`) applies the four-tap causal convolution, static or dynamic, to a whole chunk. It reads the visit's three-row FP32 history, accumulates in FP32, and updates the history in place in the layout decode reads. At position 0 it treats the history as zero. The post-attention and post-MoE stencils also apply the residual add. They round the convolution to BF16 before the FP32 add, and round the final layer output to BF16 nearest-even.
+- The stencil kernel (`conv_io.cpp`, `conv_compute.cpp`) applies the four-tap causal convolution, static or dynamic, to a whole chunk. It reads the visit's three preceding inputs from the FP32 history ring, accumulates in FP32, and writes the latest inputs back to the slots decode reads. At position 0 it treats the history as zero. The post-attention and post-MoE stencils also apply the residual add. They round the convolution to BF16 before the FP32 add, and round the final layer output to BF16 nearest-even.
 - The heads kernel (`heads_io.cpp`, `heads_compute.cpp`) clips or RMS-scales each 128-channel head in FP32 and writes head-major tiles. It also reads each 16-channel relative head directly from the packed Q projection, clips it, and writes a zero-padded 32-column tile. Global Q and relative heads round to BF16 before and after multiplying by the row's `tau`. At 2048 rows the relative branch takes about 37 µs on sliding visits and 46 µs on global visits, down from 618 and 754 µs with separate TTNN operations.
 - Depth mixing reads the normalized bank entries directly for both the depth logits and the weighted sum. `depth_score_compute.cpp` keeps each worker's query matrix in L1 and follows the stock matmul's two-tile partial sums and final FP32 reload. TTNN normalizes the depth logits with softmax. `mix_compute.cpp` then applies the resulting weights for one, three or four query rows. Reading the bank in place saves about 24 ms on a full 2048-row chunk.
 - On each repeat pass, the message reads share one normalized copy of the previous pass's final row state. Two packed query matrices cover all 12 layers. Each layer reads its four probability columns from the packed softmax output as it mixes the bank.
@@ -86,8 +86,8 @@ Prefill and decode share the visit state of `InklingTT2`: the 48 K/V caches, the
 
 ## MTP memory budget
 
-The MTP runtime allocates both buckets, the verifier and the drafter before it warms any
-prefill or speculative trace. The buckets share the LM head projection with decode and the
+The runtime allocates both buckets, the verifier and the drafter before warming their
+programs. The buckets share the LM head projection with decode and the
 drafter. Wide expert lanes use one resident expert weight buffer each. Route weights and
 more of the wide down-projection output go to DRAM. Global attention retains up to 56 score
 tiles per worker. The remaining tiles are recomputed in the second FP32 pass.
@@ -111,4 +111,4 @@ Each `Prefill` constructor refuses to run after capture. It allocates its buffer
 
 ## Throughput
 
-Chunk time is close to a fixed part plus a part linear in rows. The fixed cost comes mostly from expert reads. A 128-row chunk routes to most of the 128 experts at every visit, and a full chunk can stream about twice the 26 GB expert pack across 48 visits. A 128-token prompt delivers about a third of the token throughput of a full 2048-row chunk. The eight global visits attend over a growing prefix, so throughput at 32K is about three quarters of the 2048-row rate. Warm median TTFT is 0.17 s at 128 tokens, 0.91 s at 2,048 and 3.78 s at 8,192. See [benchmarks.md](benchmarks.md) for the full timing sweep.
+Chunk time is close to a fixed part plus a part linear in rows. The fixed cost comes mostly from expert reads. A 128-row chunk routes to most of the 128 experts at every visit, and a full chunk can stream about twice the 26 GB expert pack across 48 visits. At 128 tokens the 128-row bucket takes 0.170 s median versus 0.558 s for the 2048-row bucket. At 2,048 tokens the 2048-row bucket takes 0.892 s versus 2.759 s using only 128-row chunks. The eight global visits attend over a growing prefix, so throughput at 32K is about three quarters of the 2048-row rate. Warm median TTFT is 0.17 s at 128 tokens, 0.89 s at 2,048 and 3.74 s at 8,192. See [benchmarks.md](benchmarks.md) for the full timing sweep.

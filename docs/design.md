@@ -15,17 +15,17 @@ Device profile on the tested card (13x10 workers, `lmax` 2048, BFP8_B experts). 
 |---|---:|---:|
 | Routed experts (gate/up, down) | 96 | 6.90 |
 | Q bundle and O projections | 96 | 4.60 |
-| LM head | 1 | 1.84 |
-| Paired K/V projection and head preparation | 48 | 1.44 |
+| LM head | 1 | 1.85 |
+| Paired K/V projection and head preparation | 48 | 1.38 |
 | Dynamic-tap projections | 16 | 0.09 |
-| Attention-residual mixes | 120 | 1.28 |
+| Attention-residual mixes | 120 | 1.23 |
 | Message-gate projections | 96 | 1.21 |
-| Router | 48 | 0.46 |
+| Router | 48 | 0.47 |
 | Fused attention | 48 | 0.42 |
 | Readout, layout and small epilogues | 38 | 0.13 |
-| **Total** | **607** | **18.38** |
+| **Total** | **607** | **18.27** |
 
-The expert and projection programs account for 14.9 ms, including the head preparation fused into the K/V projection. Firmware spans 18.60 ms per token, with 0.22 ms outside kernels. The larger dispatch ring lets Metal stage the next program while the current one runs. Unprofiled decode timings are in [benchmarks.md](benchmarks.md).
+The expert and projection programs account for 14.8 ms, including the head preparation fused into the K/V projection. Firmware spans 18.49 ms per token, with 0.22 ms outside kernels. The larger dispatch ring lets Metal stage the next program while the current one runs. Unprofiled decode timings are in [benchmarks.md](benchmarks.md).
 
 ## From the first port to this release
 
@@ -45,7 +45,7 @@ The optimizations use the precision policy in [precision.md](precision.md).
 | Fused router, head tail, message gates and token feedback (750 programs) | 20.0 |
 | Paired K/V, tuned dense projections and batched row reads | 19.3 |
 | Larger dispatch ring and fixed read virtual channels | 18.5 |
-| Paired K/V and head preparation in one launch | 18.4 |
+| Paired K/V and head preparation in one launch | 18.2 |
 
 ## The pieces
 
@@ -64,6 +64,11 @@ The optimizations use the precision policy in [precision.md](precision.md).
 **Visit fusion.** Consecutive visits share boundaries: the epilogue that ends one visit also starts the next one, and the convolution history, residual and block bank are updated in the same program. A first-pass sliding visit runs the Q bundle, K/V and head preparation, fused attention, O projection, post-attention mix, router, two expert projections and post-MLP mix.
 
 **Fused attention.** One program per visit computes the learned relative bias, the per-head sink, the masked softmax in FP32, the V product and the sigmoid output gate, and writes its output straight into the input shards of the O projection. It reads only the cache positions that exist, so a large `lmax` does not slow short sequences. See [attention.md](attention.md).
+
+**Target history.** Sliding attention keeps a 1,024-key window in a 1,088-slot ring. Each convolution
+keeps its unfiltered inputs in a 32-row FP32 ring. Absolute positions let the verifier stage a block
+and let B1 overwrite any rejected suffix while preserving the original reduction order. See
+[speculative.md](speculative.md).
 
 **Readout.** The LM head writes width-sharded logits. One program (`rowvm.head_tail`) copies them into a row-major logits row, masks the padded vocabulary and finds the argmax. For greedy decoding a second one-core program (`rowvm.token_feedback`) copies the chosen token's embedding row from an on-device table into the next step's input and advances the position, so the host does not touch the critical path. `m.greedy(tok, pos, n)` enqueues `n` replays and reads all IDs back at the end.
 

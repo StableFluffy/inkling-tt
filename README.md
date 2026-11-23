@@ -6,12 +6,12 @@ Inkling-2-Mini is a 26B-parameter mixture-of-experts model from Thinking Machine
 
 | | |
 |---|---|
-| Decode, batch 1 | **20.1 ms/token** (49.7 tokens/s) |
-| Time to first token | 0.17 s short prompt, 0.99 s at 1.6k tokens, 4.2 s at 7.8k tokens |
+| Greedy decode, batch 1 | **18.21 ms/token** (54.9 tokens/s) |
+| Time to first token | 0.13 s short prompt, 0.85 s at 1.6k tokens, 3.68 s at 7.8k tokens |
 | Context | 32,768 tokens |
 | Agreement with HF (BF16, CPU) | 380/384 top-1, 384/384 top-5 next-token predictions |
 
-These are server-side measurements of the v0.1.0 image on the tested card (all 14 Tensix columns enabled, 380 W). Current source benchmarks and reproduction commands are in [docs/benchmarks.md](docs/benchmarks.md).
+Decode comes from the traced batch-1 harness and first-token latency from the standalone server on one p150a with all 14 Tensix columns enabled at 380 W. See [docs/benchmarks.md](docs/benchmarks.md) for the measurements and [CHANGELOG.md](CHANGELOG.md) for the release changes.
 
 ## Quickstart
 
@@ -35,6 +35,8 @@ docker run -d --name inkling --privileged \
   -v "$PWD/cache":/cache \
   inkling-2-mini-tt:0.1.1
 
+until curl -sf localhost:8000/health; do sleep 10; done
+
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages": [{"role": "user", "content": "What is 2+3?"}], "temperature": 0, "max_tokens": 256}'
 ```
@@ -47,11 +49,11 @@ hf download thinkingmachines/Inkling-2-Mini mtp.safetensors \
   --revision b85c3cfa615fc413cc9af3379f491b963f3b586a --local-dir ./Inkling-2-Mini
 ```
 
-The first start compiles the kernels and takes about four minutes. To run the tests and benchmarks, or to change the code, install from source: [docs/install.md](docs/install.md).
+The first start compiles the kernels into the mounted cache. For tests, benchmarks and source changes, see [docs/install.md](docs/install.md).
 
 ## How it works
 
-A decode step is a single captured trace of 607 device programs on the tested grid. Most of the time goes to reading weights. The DRAM-sharded dense projections and a custom expert streamer, which reads the eight routed experts from bank-local packs, run near the card's memory bandwidth. Between the matmuls, chains of small operations (norms, depth mixing, routing, convolutions) are each fused into one custom program, because launching a program costs more than most of these chains compute. Attention, the readout and greedy token feedback also run as fused programs on the device, so the host leaves the loop during generation.
+A decode step is a single captured trace of 607 device programs on the tested grid. Most of the time goes to reading weights. The DRAM-sharded dense projections and a custom expert streamer, which reads the eight routed experts from bank-local packs, run near the card's memory bandwidth. Between the matmuls, chains of small operations (norms, depth mixing, routing, convolutions) are each fused into one custom program, because launching a program costs more than most of these chains compute. Attention, the readout and greedy token feedback also run as fused programs. Sampled decode filters the full vocabulary on the device and reads back one token ID per step.
 
 Read [docs/design.md](docs/design.md) for the time budget and the main techniques.
 

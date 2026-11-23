@@ -4,7 +4,7 @@
 #   REF            inkling-tt commit or tag to package (default HEAD). Only `git archive REF` reaches the image;
 #                  uncommitted or untracked files in this checkout never do
 #   TAG            local image tag (default inkling-2-mini-tt:dev)
-#   VERSION        org.opencontainers.image.version label (default 0.1.0-dev)
+#   VERSION        org.opencontainers.image.version label (default 0.1.1-dev)
 #   SOURCE_URL     org.opencontainers.image.source label (default https://github.com/StableFluffy/inkling-tt)
 #   INKLING_DEV_IMAGE  base image, pinned by digest (default from scripts/env.sh)
 #   CTX            staging directory (default .image-ctx in this checkout)
@@ -15,7 +15,7 @@ source "$REPO/scripts/env.sh"
 TT_METAL_COMMIT_PIN=79951bd44b7484a136b3619e0d81f26baa8a1936
 CTX=${CTX:-$REPO/.image-ctx}
 TAG=${TAG:-inkling-2-mini-tt:dev}
-VERSION=${VERSION:-0.1.0-dev}
+VERSION=${VERSION:-0.1.1-dev}
 SOURCE_URL=${SOURCE_URL:-https://github.com/StableFluffy/inkling-tt}
 REF=${REF:-HEAD}
 fail() { echo "build_image: $*" >&2; exit 1; }

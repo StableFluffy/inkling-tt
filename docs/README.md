@@ -13,6 +13,7 @@ How it works:
 
 - [design.md](design.md): the decode step, where its time goes and the techniques behind it
 - [prefill.md](prefill.md): traced chunked prefill
+- [speculative.md](speculative.md): the DSpark drafter and greedy target verification
 - [precision.md](precision.md): the precision policy and the evidence for it
 - [model.md](model.md): the Inkling-2-Mini architecture, as needed to port it
 
