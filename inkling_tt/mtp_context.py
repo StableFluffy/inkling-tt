@@ -72,7 +72,7 @@ class DraftPositions:
 class DraftContextProjection:
     """Project committed target taps and write only the valid rows to draft KV."""
 
-    def __init__(self, block, weights, chunk, last):
+    def __init__(self, block, weights, chunk, last, *, meta=None):
         if chunk < 32 or chunk % 32:
             raise ValueError("DSpark context projection needs tile-aligned chunks")
         device = block.hidden.device()
@@ -95,7 +95,7 @@ class DraftContextProjection:
         self.norm.append(upload(weights["markov_head.dflare_norm.weight"].reshape(1, 1, 1, D)))
 
         row = lambda width, dtype=BF: _alloc(device, (1, 1, chunk, width), dtype)
-        self.meta = _alloc(device, (1, 8), ttnn.uint32, RM)
+        self.meta = meta if meta is not None else _alloc(device, (1, 8), ttnn.uint32, RM)
         self.cos, self.sin = (row(HD // 2, FP) for _ in range(2))
         self.acc, self.temp = (row(D, FP) for _ in range(2))
         self.normalized = row(D)

@@ -60,6 +60,15 @@ The commit kernel copies the accepted rows' KV into the local rings and global s
 convolution history takes its newest inputs from the accepted prefix and its remaining lags from
 the previous history. The continuation ID remains pending for the next round.
 
+## Round replay
+
+The round allocates scratch and warms the device programs before capture. It scores the draft,
+stages the pending token and proposals, verifies them, and commits the longest matching prefix.
+The drafter and target reuse the same width-sharded head input and output buffers.
+
+The round extends the draft cache from accepted target taps, then publishes the next pending ID
+and position for the following replay. The host reads the emitted IDs from one 64-byte result.
+
 ## Device checks
 
 The component tests run through the pinned dev image.
@@ -72,6 +81,7 @@ scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_attention.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_commit.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_head.py"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_verify.py"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_round.py"
 INK_LMAX=2048 scripts/bench_decode.sh
 ```
 
@@ -100,3 +110,13 @@ including a block that spans the local ring wrap and one that ends at the global
 
 The shared projections cut four-row verification from 68.11 to 50.08 ms in the same job. The
 attention and row epilogues still run once per verify row. The OpenAI server uses the B1 decode path.
+
+The three-proposal round reproduces the B1 IDs on 32-token continuations, including a prompt
+that reaches the 1,024-slot ring wrap. Times exclude prefill and draft context priming.
+
+| Prompt | B1 median / p95 ms per ID | MTP median / p95 ms per ID |
+|---|---:|---:|
+| Chat | 20.14 / 20.20 | 16.25 / 16.29 |
+| Python | 20.17 / 20.20 | 17.48 / 17.49 |
+| Korean | 20.17 / 20.19 | 24.44 / 24.46 |
+| Ring wrap | 20.67 / 20.77 | 22.04 / 22.04 |

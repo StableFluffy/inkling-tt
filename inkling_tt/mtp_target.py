@@ -96,6 +96,21 @@ def _tile_row(src, dst, *, source=0, target=0):
     _launch(_tile_row_program, args, (src, dst))
 
 
+@lru_cache(maxsize=8)
+def _verify_stage_program(lmax, tasks, specs):
+    rows = len(tasks)
+    grid, rt = _grid(tasks)
+    unique = (*specs[0][:4], *specs[0][3 + rows : 6 + rows])
+    kernel = ttnn.KernelDescriptor(
+        kernel_source=str(_KERNELS / "verify_stage.cpp"),
+        core_ranges=grid,
+        compile_time_args=[rows, lmax, *sum(unique, ())],
+        runtime_args=rt,
+        config=ttnn.ReaderConfigDescriptor(),
+    )
+    return _program([kernel], [_tile_cb(grid, 0, BF, size=128 + 2 * D)])
+
+
 class TargetVerify:
     """Run a layer-major block with B1 row arithmetic and read-only committed state."""
 
@@ -198,6 +213,14 @@ class TargetVerify:
             raise ValueError("Verify block must fit within the allocated context")
         for step, tok, pos in zip(self.steps, block, range(start, start + self.rows)):
             step.write(self.model.embed_row(tok), pos)
+
+    def stage_device(self, anchor, drafts, start):
+        m = self.model
+        if len(drafts) != self.rows - 1 or not m.c.row_major_state or not hasattr(m, "embed_table"):
+            raise ValueError("Device verification requires normalized feedback embeddings and a full draft block")
+        inputs = (start, m.embed_table, m.tau_table, anchor, *drafts)
+        outputs = tuple(tensor for step in self.steps for tensor in (step.x, step.pos_g, step.tau))
+        _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, self.rows)), (*inputs, *outputs))
 
     def verify(self):
         m = self.model

@@ -205,15 +205,15 @@ class DraftBlock:
 
 
 class DraftHeadProjection:
-    def __init__(self, device, head, weights, proposals, *, direct=True):
+    def __init__(self, device, head, weights, proposals, *, direct=True, head_buffers=None):
         self.head = head
         self.idx = range(1, proposals + 1)
-        self.hidden_shards = ttnn.allocate_tensor_on_device(
-            ttnn.Shape((1, 1, 32, D)), BF, TILE, device, head.input_shards
-        )
-        self.head_shards = ttnn.allocate_tensor_on_device(
-            ttnn.Shape((1, 1, 32, PADDED_VOCAB)), BF, TILE, device, head.output_shards
-        )
+        if head_buffers is None:
+            head_buffers = tuple(
+                ttnn.allocate_tensor_on_device(ttnn.Shape((1, 1, 32, width)), BF, TILE, device, mem)
+                for width, mem in ((D, head.input_shards), (PADDED_VOCAB, head.output_shards))
+            )
+        self.hidden_shards, self.head_shards = head_buffers
         self.base = None if direct else _alloc(device, self.head_shards.shape)
         shard_tiles = head.output_shards.shard_spec.shape[1] // 32
         total_tiles = PADDED_VOCAB // 32
