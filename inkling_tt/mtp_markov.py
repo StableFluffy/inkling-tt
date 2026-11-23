@@ -6,7 +6,7 @@ import torch
 import ttnn
 
 from inkling_tt.model import VOCAB
-from inkling_tt.model2 import BF, DRAM, FP, RM, TILE
+from inkling_tt.model2 import BF, DRAM, FP, RM, TILE, act
 from inkling_tt.mtp_weights import PADDED_VOCAB, RANK
 from inkling_tt.prefill import _alloc, _compute, _copy_into, _grid, _launch, _program, _tasks, _tile_cb
 
@@ -14,16 +14,16 @@ _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
 
 
 @lru_cache(maxsize=8)
-def _logit_row_program(tasks, specs):
+def _logit_row_program(tasks, fp32, specs):
     grid, rt = _grid(tasks)
     kernel = ttnn.KernelDescriptor(
         kernel_source=str(_KERNELS / "logit_row.cpp"),
         core_ranges=grid,
         runtime_args=rt,
-        compile_time_args=[VOCAB, 2 * PADDED_VOCAB, *sum(specs[0], ())],
+        compile_time_args=[VOCAB, 2 * PADDED_VOCAB, int(fp32), *sum(specs[0], ())],
         config=ttnn.ReaderConfigDescriptor(),
     )
-    return _program([kernel], [_tile_cb(grid, 0, BF, size=128)])
+    return _program([kernel], [_tile_cb(grid, 0, BF, size=192 if fp32 else 128)])
 
 
 @lru_cache(maxsize=4)
@@ -87,6 +87,7 @@ class MarkovDraftHead:
             raise ValueError("Markov draft width must be between one and seven")
         self.device = device
         self.proposals = proposals
+        self.fused_scores = True
         self.compute = ttnn.init_device_compute_kernel_config(
             device.arch(), math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True
         )
@@ -150,13 +151,24 @@ class MarkovDraftHead:
             self._linear(self.latent, self.fold, self.correction)
             ttnn.add(self.correction, self.fold_bias, dtype=BF, output_tensor=self.biased)
             ttnn.add(base, self.biased, output_tensor=self.summed)
-            ttnn.mul(self.summed, 1 / 30, dtype=FP, output_tensor=self.scaled)
-            ttnn.tanh(self.scaled, output_tensor=self.capped)
-            ttnn.mul(self.capped, 30.0, dtype=BF, output_tensor=self.summed)
+            if self.fused_scores:
+                ttnn.mul(
+                    self.summed,
+                    1.0,
+                    dtype=FP,
+                    input_tensor_a_activations=[act("SOFTCAP", 30.0)],
+                    output_tensor=self.capped,
+                )
+                logits = self.capped
+            else:
+                ttnn.mul(self.summed, 1 / 30, dtype=FP, output_tensor=self.scaled)
+                ttnn.tanh(self.scaled, output_tensor=self.capped)
+                ttnn.mul(self.capped, 30.0, dtype=BF, output_tensor=self.summed)
+                logits = self.summed
             _launch(
                 _logit_row_program,
-                (_tasks(self.device, PADDED_VOCAB // 32),),
-                (self.summed, self.logits[i]),
+                (_tasks(self.device, PADDED_VOCAB // 32), self.fused_scores),
+                (logits, self.logits[i]),
             )
             ttnn.argmax(self.logits[i], dim=-1, keepdim=True, output_tensor=self.ids[i])
             prev = self.ids[i]

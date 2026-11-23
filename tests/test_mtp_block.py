@@ -60,7 +60,7 @@ def check_context(ctx, block, last):
     assert error < 0.01, f"Markov tap mixture relative L2={error:.5f}"
 
 
-def main(compare_queries=False):
+def main(compare_queries=False, compare_scores=False):
     count = 3
     weights = load_drafter(paths.snapshot())
     target = Weights(paths.hf_sd())
@@ -76,13 +76,15 @@ def main(compare_queries=False):
     try:
         device.enable_program_cache()
         labels = ("ordinary queries", "packed queries") if compare_queries else ("ordinary MLP", "sharded MLP")
+        if compare_scores:
+            labels = ("ordinary scores", "fused scores")
         blocks = [
             DraftBlock(
                 device,
                 weights,
                 count + 1,
                 1088,
-                sharded_mlp=True if compare_queries else mode,
+                sharded_mlp=True if compare_queries or compare_scores else mode,
                 pack_queries=mode if compare_queries else True,
             )
             for mode in (False, True)
@@ -106,6 +108,7 @@ def main(compare_queries=False):
         def forward(block):
             positions.prepare(block, anchor, position, embedding)
             base, rnn_context = projection.project(block.forward(), last)
+            markov.fused_scores = block is blocks[1] if compare_scores else True
             markov.score(base, rnn_context, anchor)
 
         def read(block):
@@ -204,5 +207,8 @@ def main(compare_queries=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--compare-queries", action="store_true")
-    main(parser.parse_args().compare_queries)
+    comparisons = parser.add_mutually_exclusive_group()
+    comparisons.add_argument("--compare-queries", action="store_true")
+    comparisons.add_argument("--compare-scores", action="store_true")
+    options = parser.parse_args()
+    main(options.compare_queries, options.compare_scores)

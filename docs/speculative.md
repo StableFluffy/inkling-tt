@@ -37,8 +37,8 @@ only each proposal's live row. The Markov head starts each round with a zero
 recurrent state and uses the previous ID, the draft hidden row and the last context mixture. Its
 256-wide output projects through the checkpoint hidden-out matrix and the untied target
 unembedding. Folding these weights and the bias on the CPU in FP64 leaves one BF16 vocabulary
-projection per proposal. The device compares all 200,058 valid scores after the BF16 score add and
-softcap.
+projection per proposal. One FP32 softcap pass follows the BF16 score add. The row copy rounds
+the softcapped scores to BF16 and the device compares all 200,058 valid vocabulary entries.
 
 The draft MLP streams DRAM-sharded BF16 weights. The projections use HiFi4 with FP32 accumulation. Norms, nonlinearities and
 attention statistics use FP32. The device context and draft tests warm both graphs before
@@ -94,7 +94,7 @@ and position for the following replay. The host reads the emitted IDs from one 6
 The component tests run through the pinned dev image.
 
 ```sh
-scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-queries"
+scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/test_mtp_block.py --compare-scores"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 python -u tests/bench_mtp_acceptance.py --steps 64 --proposals 4"
 scripts/dev_run.sh "OMP_NUM_THREADS=4 INK_PREFILL_EXPERT_DOUT_L1=480 python -u tests/bench_mtp_acceptance.py --steps 64 --long-context"
 scripts/dev_run.sh "OMP_NUM_THREADS=8 python -u tests/test_mtp_experts.py"
@@ -109,7 +109,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 8.05 ms median, 8.12 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 7.24 ms median, 7.25 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
 | Four expert rows, union of 20 | 0.466 ms median, 0.470 ms p95 |
