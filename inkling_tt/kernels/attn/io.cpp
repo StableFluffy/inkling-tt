@@ -13,7 +13,16 @@ constexpr bool streaming = split_tiles > chunk_tiles;
 constexpr uint32_t gate_tile = get_compile_time_arg_val(2);
 constexpr uint32_t grid_width = get_compile_time_arg_val(3);
 constexpr uint32_t first_head = get_compile_time_arg_val(4);
+#ifdef ATTN_STAGED
+constexpr uint32_t operand_count = 12;
+#ifdef ATTN_WRITER
+constexpr uint32_t staged_scratch = 23;
+#else
+constexpr uint32_t staged_scratch = 22;
+#endif
+#else
 constexpr uint32_t operand_count = 9;
+#endif
 
 uint64_t peer_addr(uint32_t head, uint32_t split, uint32_t addr) {
     const uint32_t xy = get_common_arg_val<uint32_t>(operand_count + (head - first_head) * splits + split);
@@ -32,8 +41,8 @@ auto operand(uint32_t bytes) {
     return TensorAccessor(args, get_common_arg_val<uint32_t>(I), bytes);
 }
 
-template <class Accessor>
-void read_cache(const Accessor& cache, uint32_t head, const Work& work, uint32_t cb) {
+template <bool Values, class Accessor>
+void read_cache(const Accessor& cache, uint32_t head, const Work& work, uint32_t cb, uint32_t pos, uint32_t start) {
     const uint32_t count = work.tile_count * dim_tiles;
     const uint32_t first = (head * cache_tiles + work.first_tile) * dim_tiles;
     const uint32_t dst = get_write_ptr(cb);
@@ -47,13 +56,54 @@ void read_cache(const Accessor& cache, uint32_t head, const Work& work, uint32_t
         noc_async_read<bf_tile>(cache.get_noc_addr(first + tile), dst + tile * bf_tile, bf_tile);
         tile = tile + 1 == count ? 0 : tile + 1;
     }
+#ifdef ATTN_STAGED
+    const auto staged = operand<Values ? 10 : 9>(bf_tile);
+    const uint32_t tmp = get_write_ptr(staged_scratch);
+    for (uint32_t col = 0; col < dim_tiles; ++col) {
+        bool loaded = false;
+        for (uint32_t p = start; p <= pos && p - start < 8; ++p) {
+            const uint32_t slot = p % (cache_tiles * 32);
+            const uint32_t key_tile = slot / 32;
+            if (key_tile < work.first_tile || key_tile >= work.first_tile + work.tile_count) {
+                continue;
+            }
+            if (!loaded) {
+                noc_async_read<bf_tile>(staged.get_noc_addr(head * dim_tiles + col), tmp, bf_tile);
+                noc_async_read_barrier();
+                loaded = true;
+            }
+            const uint32_t target = dst + ((key_tile - work.first_tile) * dim_tiles + col) * bf_tile;
+            const uint32_t row = slot % 32;
+            for (uint32_t f = 0; f < 2; ++f) {
+                const uint32_t from = tmp + f * 512 + (p - start) * bf_row;
+                const uint32_t to = target + (row / 16 * 2 + f) * 512 + (row % 16) * bf_row;
+                noc_async_read<bf_row>(get_noc_addr(from), to, bf_row);
+            }
+        }
+        if (loaded) {
+            noc_async_read_barrier();
+        }
+    }
+#endif
 }
 
-void read_values(uint32_t head, const Work& work) {
+uint32_t start_position() {
+#ifdef ATTN_STAGED
+    const auto start = operand<11>(4);
+    const uint32_t scratch = get_write_ptr(staged_scratch);
+    noc_async_read<4>(start.get_noc_addr(0), scratch, 4);
+    noc_async_read_barrier();
+    return *reinterpret_cast<volatile tt_l1_ptr uint32_t*>(scratch);
+#else
+    return 0;
+#endif
+}
+
+void read_values(uint32_t head, const Work& work, uint32_t pos, uint32_t start) {
     const auto v = operand<2>(bf_tile);
     const uint32_t kv_tiles = work.tile_count * dim_tiles;
     cb_reserve_back(v_cb, kv_tiles);
-    read_cache(v, head, work, v_cb);
+    read_cache<true>(v, head, work, v_cb, pos, start);
     noc_async_read_barrier();
     cb_push_back(v_cb, kv_tiles);
 }
@@ -73,7 +123,7 @@ uint32_t read_position() {
     return pos;
 }
 
-void read_inputs(uint32_t head, uint32_t split, uint32_t pos, const Work& work, bool first_chunk = true) {
+void read_inputs(uint32_t head, uint32_t split, uint32_t pos, uint32_t start, const Work& work, bool first_chunk = true) {
     DeviceZoneScopedN("INK_ATTN_READ");
     const auto q = operand<0>(bf_tile);
     const auto k = operand<1>(bf_tile);
@@ -141,7 +191,7 @@ void read_inputs(uint32_t head, uint32_t split, uint32_t pos, const Work& work, 
         }
     }
     if (active) {
-        read_cache(k, head, work, k_cb);
+        read_cache<false>(k, head, work, k_cb, pos, start);
     }
     noc_async_read_barrier();
     if (output_worker) {
@@ -268,19 +318,20 @@ void kernel_main() {
     const uint32_t worker = get_absolute_logical_y() * grid_width + get_absolute_logical_x();
     const uint32_t head = first_head + worker / splits;
     const uint32_t split = worker % splits;
+    const uint32_t start = start_position();
 #ifndef ATTN_WRITER
     const uint32_t pos = read_position();
     const Work work(pos, cache_tiles, split);
     if (work.tile_count || split < dim_tiles) {
         if constexpr (streaming) {
             if (!work.tile_count) {
-                read_inputs(head, split, pos, work);
+                read_inputs(head, split, pos, start, work);
             }
             for (uint32_t offset = 0; offset < work.tile_count; offset += chunk_tiles) {
-                read_inputs(head, split, pos, work.chunk(offset, chunk_tiles), offset == 0);
+                read_inputs(head, split, pos, start, work.chunk(offset, chunk_tiles), offset == 0);
             }
         } else {
-            read_inputs(head, split, pos, work);
+            read_inputs(head, split, pos, start, work);
         }
     }
     if (split == 0) {
@@ -303,7 +354,7 @@ void kernel_main() {
     const Work work(pos, cache_tiles, split);
     if (work.tile_count) {
         if constexpr (!streaming) {
-            read_values(head, work);
+            read_values(head, work, pos, start);
         }
         send_stats(head, split);
         if (split == 0) {
@@ -311,7 +362,7 @@ void kernel_main() {
         }
         if constexpr (streaming) {
             for (uint32_t offset = 0; offset < work.tile_count; offset += chunk_tiles) {
-                read_values(head, work.chunk(offset, chunk_tiles));
+                read_values(head, work.chunk(offset, chunk_tiles), pos, start);
             }
         }
         send_partials(head, split);

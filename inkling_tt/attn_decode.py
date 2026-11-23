@@ -17,7 +17,7 @@ _MAX_LENGTH = 32768
 _LAUNCH_LOCK = Lock()
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=24)
 def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head, heads):
     grid = ttnn.num_cores_to_corerangeset(heads * _SPLITS, ttnn.CoreCoord(cols, rows), row_wise=True)
     split_tiles = (length // 32 + _SPLITS - 1) // _SPLITS
@@ -42,18 +42,21 @@ def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head,
     if split_tiles > 4:
         unpack[20] = unpack[21] = ttnn.UnpackToDestMode.UnpackToDestFp32
     config.unpack_to_dest_mode = unpack
+    staged = len(accessors) > 9
+    defines = [("ATTN_STAGED", "1")] if staged else []
     kernels = [
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "io.cpp"),
             core_ranges=grid,
             compile_time_args=args,
+            defines=defines,
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
             kernel_source=str(_KERNELS / "io.cpp"),
             core_ranges=grid,
             compile_time_args=args,
-            defines=[("ATTN_WRITER", "1")],
+            defines=[*defines, ("ATTN_WRITER", "1")],
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
@@ -90,6 +93,8 @@ def _program(accessors, length, global_cache, gate_tile, cols, rows, first_head,
     )
     if split_tiles > 4:
         buffers += ((20, fp, 1, 4096), (21, fp, 4, 4096))
+    if staged:
+        buffers += ((22, bf, 1, 2048), (23, bf, 1, 2048))
     cbs = [
         ttnn.CBDescriptor(
             total_size=pages * size,
@@ -153,7 +158,7 @@ def prepare_table(table, *, global_cache, device=None):
     )
 
 
-def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out):
+def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate_col, out, staged=None):
     """Apply position-derived attention and write the gated row into preallocated O shards."""
     length = k.shape[-2]
     if length < 32 or length > _MAX_LENGTH or length % 32 or (not global_cache and length != _WINDOW):
@@ -200,6 +205,25 @@ def decode(q, k, v, relative, sink, table, position, gate, *, global_cache, gate
     if out.buffer_unique_id() in {t.buffer_unique_id() for t in inputs}:
         raise ValueError("fused attention decode requires independent output storage")
 
+    if staged is not None:
+        staged_k, staged_v, start = staged
+        for state in (staged_k, staged_v):
+            if (
+                tuple(state.shape) != (1, kv_heads, 32, 128)
+                or state.dtype != ttnn.bfloat16
+                or state.layout != ttnn.TILE_LAYOUT
+                or state.is_sharded()
+                or state.device() != device
+            ):
+                raise ValueError("staged attention K/V must be interleaved BF16 tiles for the current block")
+        if (
+            tuple(start.shape) != (1,)
+            or start.dtype != ttnn.int32
+            or start.layout != ttnn.ROW_MAJOR_LAYOUT
+            or start.device() != device
+        ):
+            raise ValueError("staged attention requires the block start position on device")
+        operands = (*operands, *staged)
     accessors = tuple(tuple(ttnn.TensorAccessorArgs(t).get_compile_time_args()) for t in operands)
     cols, rows, heads, peers = _placement(device, kv_heads)
     addresses = [t.buffer_address() for t in operands]
