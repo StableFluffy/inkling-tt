@@ -41,7 +41,7 @@ Prefill reads the decode weights in place; there is no second copy. Most schedul
 - Message-gate down projection (4608 x 64): eight K partitions emit FP32 partials, reduced in partition order (`dense.message_prefill_down`). This one is close to decode but not bit-identical.
 - K and V: one full-chunk `ttnn.linear`.
 - Other DRAM-sharded weights: the decode program runs once per 32-row block.
-- Router: BF16 operands in 96-wide K blocks, with the partials summed in FP32. For some tokens the score margin between the eighth and ninth expert is smaller than the rounding drift of one full-K accumulation.
+- The router projection reads each 96-column window from the original BF16 activation rows and keeps that window's weights in L1. It preserves the one-tile accumulation schedule and emits the same FP32 partials for the final sum. At 2048 rows the projection takes about 0.11 ms, down from 0.62 ms with separate reshape, permutation and matmul operations. For some tokens the margin between the eighth and ninth expert is smaller than the drift of one full-K accumulation.
 
 ## Routing and experts
 

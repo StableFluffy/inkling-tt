@@ -290,6 +290,45 @@ def _conv_program(tasks, cols, dynamic, tiles, x_dtype, out_dtype, residual_dtyp
 
 
 @lru_cache(maxsize=16)
+def _router_projection_program(tasks, rows, specs):
+    grid, rt = _grid(tasks)
+    reader, writer = tuple(sum(group, ()) for group in specs)
+    kt, nt = _ROUTER_K_BLOCK // 32, E // 32
+    args = [rows, D // 32, kt, nt]
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "router_projection_io.cpp"),
+            core_ranges=grid,
+            compile_time_args=[*args, *reader],
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "router_projection_io.cpp"),
+            core_ranges=grid,
+            compile_time_args=[*args, *writer],
+            runtime_args=rt,
+            defines=[("PREFILL_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "router_projection_compute.cpp"),
+            core_ranges=grid,
+            compile_time_args=args,
+            runtime_args=rt,
+            config=_compute((3,)),
+        ),
+    ]
+    return _program(
+        kernels,
+        [
+            _tile_cb(grid, i, dtype, n)
+            for i, dtype, n in ((0, BF, 2 * kt), (1, BF, kt * nt), (3, FP, nt), (16, FP, 2 * nt))
+        ],
+    )
+
+
+@lru_cache(maxsize=16)
 def _depth_score_program(tasks, cols, rows, specs):
     grid, rt = _grid(tasks)
     reader, writer = specs
@@ -669,6 +708,10 @@ class Prefill:
         self.last = _alloc(self.dev, (1, 1, 1, D))
         self.logits = _alloc(self.dev, (1, 1, 1, m.head.n))
         self.rel_weights = {}
+        self._fused_router_projection = os.environ.get("INK_PREFILL_ROUTER_PROJECT", "1") == "1"
+        self.router_partials = (
+            _alloc(self.dev, (1, D // _ROUTER_K_BLOCK, chunk, E), FP) if self._fused_router_projection else None
+        )
         self.router_weights = {}
         for layer in m.layers:
             table = ttnn.to_torch(layer.rel_table)[:W].flip(0).T.contiguous()
@@ -901,9 +944,20 @@ class Prefill:
         # Bound the inner dimension accumulated in Tensix DST. Router cutoff
         # margins can be smaller than the accumulation drift of a full-K GEMM.
         pieces = D // _ROUTER_K_BLOCK
-        blocks = ttnn.reshape(x, [1, self.chunk, pieces, _ROUTER_K_BLOCK])
-        blocks = ttnn.permute(blocks, (0, 2, 1, 3))
-        partials = ttnn.matmul(blocks, self.router_weights[layer.i], dtype=FP, compute_kernel_config=self.c.ck_exact)
+        weight = self.router_weights[layer.i]
+        if self._fused_router_projection:
+            partials = self.router_partials
+            rows = self.chunk // 32
+            _launch(
+                _router_projection_program,
+                (_tasks(self.dev, pieces * rows), rows),
+                (x, weight),
+                (partials,),
+            )
+        else:
+            blocks = ttnn.reshape(x, [1, self.chunk, pieces, _ROUTER_K_BLOCK])
+            blocks = ttnn.permute(blocks, (0, 2, 1, 3))
+            partials = ttnn.matmul(blocks, weight, dtype=FP, compute_kernel_config=self.c.ck_exact)
         return ttnn.sum(partials, dim=1, keepdim=True)
 
     def moe(self, layer, x):
