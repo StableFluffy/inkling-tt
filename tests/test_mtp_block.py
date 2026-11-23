@@ -77,7 +77,7 @@ def main(compare_queries=False, compare_scores=False, compare_projections=False,
         device.enable_program_cache()
         labels = ("ordinary queries", "packed queries") if compare_queries else ("ordinary MLP", "sharded MLP")
         if compare_scores:
-            labels = ("ordinary scores", "fused scores")
+            labels = ("separate score epilogue", "fused score epilogue")
         if compare_projections:
             labels = ("ordinary projections", "sharded projections")
         if compare_rope:
@@ -97,7 +97,7 @@ def main(compare_queries=False, compare_scores=False, compare_projections=False,
         ]
         head = dense.prepare_weight(device, torch.nn.functional.pad(head.T, (0, PADDED_VOCAB - VOCAB)))
         projection = DraftHeadProjection(device, head, weights, count)
-        markov = MarkovDraftHead(device, weights, fold, bias, count)
+        markov = MarkovDraftHead(device, weights, fold, bias, count, compare_scores=compare_scores)
         anchor = _alloc(device, (1, 1), ttnn.uint32, RM)
         position = _alloc(device, (1,), ttnn.uint32, RM)
         embedding = ttnn.from_torch(embeddings, dtype=BF, layout=RM, device=device, memory_config=DRAM)

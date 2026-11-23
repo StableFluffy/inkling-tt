@@ -38,8 +38,8 @@ only each proposal's live row. The Markov head starts each round with a zero
 recurrent state and uses the previous ID, the draft hidden row and the last context mixture. Its
 256-wide output projects through the checkpoint hidden-out matrix and the untied target
 unembedding. Folding these weights and the bias on the CPU in FP64 leaves one BF16 vocabulary
-projection per proposal. One FP32 softcap pass follows the BF16 score add. The row copy rounds
-the softcapped scores to BF16 and the device compares all 200,058 valid vocabulary entries.
+projection per proposal. One kernel adds the bias and base scores, applies the FP32 softcap,
+and writes the rounded BF16 logit row. The device compares all 200,058 valid vocabulary entries.
 
 The draft Q, O and MLP projections stream DRAM-sharded BF16 weights. K and V use tuned one-dimensional
 matmuls. The projections use HiFi4 with FP32 accumulation. Norms, nonlinearities and
@@ -128,7 +128,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 
 | Check | Result |
 |---|---|
-| Three proposals, 1,088-slot draft global prefix | 6.52 ms median, 6.55 ms p95 |
+| Three proposals, 1,088-slot draft global prefix | 5.85 ms median, 5.89 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
 | Four expert rows, union of 20 | 0.463 ms median, 0.466 ms p95 |

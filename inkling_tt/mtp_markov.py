@@ -14,16 +14,54 @@ _KERNELS = Path(__file__).resolve().parent / "kernels" / "mtp"
 
 
 @lru_cache(maxsize=8)
-def _logit_row_program(tasks, fp32, specs):
+def _logit_row_program(tasks, specs):
     grid, rt = _grid(tasks)
     kernel = ttnn.KernelDescriptor(
         kernel_source=str(_KERNELS / "logit_row.cpp"),
         core_ranges=grid,
         runtime_args=rt,
-        compile_time_args=[VOCAB, 2 * PADDED_VOCAB, int(fp32), *sum(specs[0], ())],
+        compile_time_args=[VOCAB, 2 * PADDED_VOCAB, 1, *sum(specs[0], ())],
         config=ttnn.ReaderConfigDescriptor(),
     )
-    return _program([kernel], [_tile_cb(grid, 0, BF, size=192 if fp32 else 128)])
+    return _program([kernel], [_tile_cb(grid, 0, BF, size=192)])
+
+
+@lru_cache(maxsize=8)
+def _score_program(tasks, specs):
+    grid, rt = _grid(tasks)
+    io = str(_KERNELS / "score_io.cpp")
+    args = [VOCAB, PADDED_VOCAB]
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=io,
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=[*args, *sum(specs[0], ())],
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "score_compute.cpp"),
+            core_ranges=grid,
+            runtime_args=rt,
+            config=_compute((0,)),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=io,
+            core_ranges=grid,
+            runtime_args=rt,
+            compile_time_args=[*args, *specs[2][0]],
+            defines=[("DRAFT_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+    ]
+    buffers = [
+        _tile_cb(grid, 0, FP, 2),
+        _tile_cb(grid, 1, BF, 2),
+        _tile_cb(grid, 2, BF, 2),
+        _tile_cb(grid, 3, BF, size=64),
+        _tile_cb(grid, 16, BF, 2),
+    ]
+    return _program(kernels, buffers)
 
 
 @lru_cache(maxsize=4)
@@ -82,7 +120,7 @@ def _cast(src, dest):
 class MarkovDraftHead:
     """Score a fixed number of proposals from BF16 base logits and FP32 recurrent context rows."""
 
-    def __init__(self, device, weights, fold, fold_bias, proposals):
+    def __init__(self, device, weights, fold, fold_bias, proposals, *, compare_scores=False):
         if not 1 <= proposals <= 7:
             raise ValueError("Markov draft width must be between one and seven")
         self.device = device
@@ -110,9 +148,9 @@ class MarkovDraftHead:
         self.keep, self.replace, self.retained, self.new = (row(RANK) for _ in range(4))
         self.nonlinear_arg, self.nonlinear_out = (row(RANK, FP) for _ in range(2))
         self.correction = row(PADDED_VOCAB, FP)
-        self.biased = row(PADDED_VOCAB)
-        self.summed = row(PADDED_VOCAB)
-        self.scaled, self.capped = (row(PADDED_VOCAB, FP) for _ in range(2))
+        if compare_scores:
+            self.biased, self.summed = (row(PADDED_VOCAB) for _ in range(2))
+            self.capped = row(PADDED_VOCAB, FP)
         self.logits = tuple(_alloc(device, (1, 1, 1, PADDED_VOCAB), BF, RM) for _ in range(proposals))
         self.ids = tuple(_alloc(device, (1, 1, 1, 1), ttnn.uint32, RM) for _ in range(proposals))
 
@@ -150,9 +188,17 @@ class MarkovDraftHead:
         for i, (base, context) in enumerate(zip(base_rows, context_rows)):
             self._recur(prev, context)
             self._linear(self.latent, self.fold, self.correction)
-            ttnn.add(self.correction, self.fold_bias, dtype=BF, output_tensor=self.biased)
-            ttnn.add(base, self.biased, output_tensor=self.summed)
             if self.fused_scores:
+                _launch(
+                    _score_program,
+                    (_tasks(self.device, PADDED_VOCAB // 32),),
+                    (self.correction, self.fold_bias, base),
+                    (),
+                    (self.logits[i],),
+                )
+            else:
+                ttnn.add(self.correction, self.fold_bias, dtype=BF, output_tensor=self.biased)
+                ttnn.add(base, self.biased, output_tensor=self.summed)
                 ttnn.mul(
                     self.summed,
                     1.0,
@@ -160,17 +206,11 @@ class MarkovDraftHead:
                     input_tensor_a_activations=[act("SOFTCAP", 30.0)],
                     output_tensor=self.capped,
                 )
-                logits = self.capped
-            else:
-                ttnn.mul(self.summed, 1 / 30, dtype=FP, output_tensor=self.scaled)
-                ttnn.tanh(self.scaled, output_tensor=self.capped)
-                ttnn.mul(self.capped, 30.0, dtype=BF, output_tensor=self.summed)
-                logits = self.summed
-            _launch(
-                _logit_row_program,
-                (_tasks(self.device, PADDED_VOCAB // 32), self.fused_scores),
-                (logits, self.logits[i]),
-            )
+                _launch(
+                    _logit_row_program,
+                    (_tasks(self.device, PADDED_VOCAB // 32),),
+                    (self.capped, self.logits[i]),
+                )
             ttnn.argmax(self.logits[i], dim=-1, keepdim=True, output_tensor=self.ids[i])
             prev = self.ids[i]
         return self.ids[:count], self.logits[:count]
