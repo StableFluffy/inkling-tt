@@ -18,7 +18,7 @@ These are server-side measurements on the tested card (all 14 Tensix columns ena
 Download the converted weights (53 GB) and the official tokenizer files:
 
 ```bash
-hf download maywell/Inkling-2-Mini-TT --include 'hf_sd/*' --local-dir .
+hf download maywell/Inkling-2-Mini-TT-p150a --include 'hf_sd/*' --local-dir .
 hf download thinkingmachines/Inkling-2-Mini --revision b85c3cfa615fc413cc9af3379f491b963f3b586a \
   --exclude '*.safetensors' --local-dir ./Inkling-2-Mini
 ```
