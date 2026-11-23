@@ -61,6 +61,10 @@ O each use one sweep of their B1 weights. Head preparation and attention read
 the query's row directly from the packed projections. The output gate writes into that same row
 of the O projection's input shards.
 
+The post-attention and post-MLP convolution and mix epilogues run on disjoint core groups.
+Each row reads earlier inputs within the block directly from the packed projection or expert
+output. Earlier positions come from the FP32 history ring.
+
 The router projects all verify rows in one program. Each row has its own top-8 leader and keeps
 B1's K-stripe sum and tie-breaking order. The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
 B1's eight routes and FP32 weights per row, streams the existing BFP8_B weight pack at HiFi4 and
@@ -108,8 +112,8 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Four BF16 target head rows, shared | 2.155 ms median, 2.311 ms p95 |
 | Indexed attention with future writes | 208/208 bitwise-equal rows |
 | Rejected suffixes overwritten by B1 | 18/18 bitwise-equal continuations |
-| Four-row target verify at `lmax=1120` | 45.11 ms median, 45.33 ms p95 |
-| B1 greedy in the same job | 19.42 ms median, 19.45 ms p95 |
+| Four-row target verify at `lmax=1120` | 42.34 ms median, 42.41 ms p95 |
+| B1 greedy in the same job | 19.36 ms median, 19.42 ms p95 |
 
 Draft timing measures replay without context extension and host transfers. Expert timings measure
 one layer, including the device route maps and the combine.

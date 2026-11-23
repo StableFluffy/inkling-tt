@@ -139,16 +139,17 @@ class TargetVerify:
         outputs = tuple(tensor for step in self.steps for tensor in (step.x, step.pos_g, step.tau))
         _launch(_verify_stage_program, (m.lmax, _tasks(m.c.dev, self.rows)), (*inputs, *outputs))
 
-    def verify(self):
+    def verify(self, *, grouped_glue=True):
         m = self.model
         states = [(step.x, _DecodeBank(bank, 0, 1), None) for step, bank in zip(self.steps, self.banks)]
-        states = self._range(0, LOOP0, 0, states)
+        batch = self.shared and grouped_glue
+        states = self._range(0, LOOP0, 0, states, batch=batch)
         prefix = states
-        states = self._range(LOOP0, LOOP1, 0, states)
+        states = self._range(LOOP0, LOOP1, 0, states, batch=batch)
         for p in range(1, NPASS):
             reenter = [(x, bank._replace(tail_start=1 + p * ((LOOP1 - LOOP0) // NB)), None) for x, bank, _ in prefix]
-            states = self._range(LOOP0, LOOP1, p, reenter, states)
-        states = self._range(LOOP1, len(m.layers), 0, states)
+            states = self._range(LOOP0, LOOP1, p, reenter, states, batch=batch)
+        states = self._range(LOOP1, len(m.layers), 0, states, batch=batch)
         for i, (_, _, hidden) in enumerate(states):
             _tile_row(hidden, self.taps[3], target=i)
         head = m.head
@@ -165,7 +166,7 @@ class TargetVerify:
             rowvm.head_tail(self.head_output, logits, index, VOCAB, row=i)
         return self.logits, self.ids
 
-    def _range(self, first, stop, pass_id, states, previous=None):
+    def _range(self, first, stop, pass_id, states, previous=None, *, batch):
         m = self.model
         for layer in m.layers[first:stop]:
             slot = visit_slot(layer.i, pass_id if layer.is_loop else 0)
@@ -215,39 +216,47 @@ class TargetVerify:
             if self.shared:
                 projected = self.o.project(layer.wo)
                 attention = [projected] * self.rows
+            after_attention = rowvm._Group() if batch else None
             pending = []
-            mixed_rows = []
             for i, ((x, bank, _), a, messages, scratch) in enumerate(
                 zip(states, attention, messages_by_row, self.scratch)
             ):
-                mixed, bank, residual = layer._finish_attention(
+                mixed, bank, residual = layer._mix_attention_output(
                     x,
                     bank,
                     visit.conv[2],
                     a,
-                    messages,
+                    messages is not None,
                     position=self.steps[i].pos_g,
                     scratch=scratch,
                     row=i if self.shared else 0,
+                    group=after_attention,
                 )
+                pending.append((mixed, bank, residual))
+            if after_attention is not None:
+                after_attention.launch()
+            mixed_rows = []
+            for i, ((mixed, _, _), messages, scratch) in enumerate(zip(pending, messages_by_row, self.scratch)):
+                mixed = layer._blend_mlp(mixed, messages, scratch=scratch)
                 if self.shared:
                     mixed_rows.append(mixed)
                 else:
                     ids, gamma = self.routes[i]
                     rowvm.fused_router(mixed, layer.router_w.tensor, layer.dec.router_b, ids_out=ids, gamma_out=gamma)
                     _tile_row(mixed, self.mlp, target=i)
-                pending.append((bank, residual))
             if self.shared:
                 _pack_rows(self.mlp, mixed_rows, self.mlp_tasks)
                 rowvm.fused_router_block(self.mlp, layer.router_w.tensor, layer.dec.router_b, self.routes)
             grouped = self.experts.run(self.mlp, self.routes, layer.expert_stream)
+            after_mlp = rowvm._Group() if batch else None
             states = []
-            for i, (bank, residual) in enumerate(pending):
-                _tile_row(grouped, self.branch, source=i)
+            for i, (_, bank, residual) in enumerate(pending):
+                if not batch:
+                    _tile_row(grouped, self.branch, source=i)
                 out, mixed_out = self.outputs[slot][i]
                 states.append(
                     layer._finish_visit(
-                        self.branch,
+                        grouped if batch else self.branch,
                         bank,
                         residual,
                         visit.conv[3],
@@ -255,6 +264,10 @@ class TargetVerify:
                         position=self.steps[i].pos_g,
                         out=out,
                         mixed_out=mixed_out,
+                        row=i if batch else 0,
+                        group=after_mlp,
                     )
                 )
+            if after_mlp is not None:
+                after_mlp.launch()
         return states

@@ -884,7 +884,11 @@ class Layer:
         y = self.sconv(self._visit_moe(xm, vs), self.pm_taps, vs.conv[3])
         return rowvm.add(z if z.dtype == FP else f32(z), f32(y), dtype=BF), bank, None
 
-    def _finish_attention(self, x, bank, history, a, messages, *, position, scratch=None, row=0):
+    def _finish_attention(self, x, bank, history, a, messages, *, position):
+        mixed, bank, z = self._mix_attention_output(x, bank, history, a, messages is not None, position=position)
+        return self._blend_mlp(mixed, messages), bank, z
+
+    def _mix_attention_output(self, x, bank, history, a, gated, *, position, scratch=None, row=0, group=None):
         d = self.dec
         z_bf, z_fp, xm = self.c.visit_scratch if scratch is None else scratch.visit
         z = z_bf if self.block_boundary else z_fp
@@ -903,32 +907,40 @@ class Layer:
             a,
             d.q_mlp[2],
             J,
-            weight=d.norm_post if messages is None else None,
-            dtype=BF if messages is None else FP,
-            out=(xm,) if messages is None else None if scratch is None else (scratch.mixed_fp,),
-            memory_config=L1 if messages is None else DRAM,
+            weight=None if gated else d.norm_post,
+            dtype=FP if gated else BF,
+            out=(None if scratch is None else (scratch.mixed_fp,)) if gated else (xm,),
+            memory_config=DRAM if gated else L1,
             convolution=(history, d.pa_taps, residual, z),
             bank_start=start,
             shared_prefix=bool(start),
             append=append,
             partial_row=row,
             position=position,
+            _group=group,
         )[0]
-        if messages is not None:
-            mixed = self.gate_msg(
-                "mlp",
-                mixed,
-                messages[3],
-                weight=d.norm_post,
-                out=xm,
-                controller_out=None if scratch is None else scratch.mlp_down,
-            )
         return mixed, bank, z
 
-    def _finish_visit(self, branch, bank, residual, history, next_mix, *, position, out=None, mixed_out=None):
+    def _blend_mlp(self, mixed, messages, *, scratch=None):
+        if messages is None:
+            return mixed
+        xm = self.c.visit_scratch[2] if scratch is None else scratch.visit[2]
+        return self.gate_msg(
+            "mlp",
+            mixed,
+            messages[3],
+            weight=self.dec.norm_post,
+            out=xm,
+            controller_out=None if scratch is None else scratch.mlp_down,
+        )
+
+    def _finish_visit(
+        self, branch, bank, residual, history, next_mix, *, position, out=None, mixed_out=None, row=0, group=None
+    ):
         taps = self.dec.pm_taps
         if next_mix is None:
-            return rowvm.conv_residual(history, branch, taps, residual, out=out, position=position), bank, None
+            y = rowvm.conv_residual(history, branch, taps, residual, out=out, position=position, row=row, _group=group)
+            return y, bank, None
         query, weight = next_mix
         rm = self.c.row_major_state
         y = out
@@ -948,7 +960,9 @@ class Layer:
             out=(mixed_out,) if mixed_out is not None else None,
             convolution=(history, taps, residual, y),
             round_residual=True,
+            partial_row=row,
             position=position,
+            _group=group,
             memory_config=(L1 if self.c.paired_kv and weight is not None else DRAM)
             if mixed_out is None
             else mixed_out.memory_config(),

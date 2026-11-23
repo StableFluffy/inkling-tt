@@ -254,6 +254,32 @@ void transfer(uint32_t task, [[maybe_unused]] uint32_t pos) {
         uint32_t row = shared_prefix ? (r == 0 ? 0 : start_row + r - 1)
                                      : start_row + (concat_rows ? 0 : r);
         if constexpr (cache_length && bytes == 4) {
+#ifdef ROWVM_PACKED_HISTORY
+            constexpr auto src_args = TensorAccessorArgs<get_compile_time_arg_val(1 + region_words * count + I - 1)>();
+            const auto source = TensorAccessor(src_args, get_common_arg_val<uint32_t>(I - 1), 2048);
+            const uint32_t source_row = get_common_arg_val<uint32_t>(count + 2 * (I - 1));
+            if (source_row > r) {
+                const uint32_t inner = source_row - r - 1;
+                const uint32_t packed_scratch = get_write_ptr(31) + (inner & 1) * 32;
+                for (uint32_t f = 0; f < faces; ++f) {
+                    const uint32_t face = start_face + f;
+                    const uint32_t offset = (inner / 16 * 32 + (face % 2) * 16 + inner % 16) * 32;
+                    noc_async_read<32>(source.get_noc_addr(face / 2, offset), packed_scratch + f * 64, 32);
+                }
+                noc_async_read_barrier();
+                invalidate_l1_cache();
+                for (uint32_t f = 0; f < faces; ++f) {
+                    const auto src = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(packed_scratch + f * 64);
+                    auto dst = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(
+                        dense + r * dense_tiles * tile_bytes + f * face_bytes);
+#pragma GCC unroll 16
+                    for (uint32_t lane = 0; lane < 16; ++lane) {
+                        dst[lane] = uint32_t(src[lane]) << 16;
+                    }
+                }
+                continue;
+            }
+#endif
 #ifdef ROWVM_WRITE
             row = pos % cache_length;
 #else

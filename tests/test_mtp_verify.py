@@ -78,11 +78,13 @@ def main(trace_only):
         ttnn.end_trace_capture(dev, trace, cq_id=0)
         seed(len(prompt))
         verifier.stage(block, len(prompt))
-        verifier.shared = False
+        verifier.verify(grouped_glue=False)
+        ttnn.synchronize_device(dev)
+        seed(len(prompt))
+        verifier.stage(block, len(prompt))
         baseline_trace = ttnn.begin_trace_capture(dev, cq_id=0)
-        verifier.verify()
+        verifier.verify(grouped_glue=False)
         ttnn.end_trace_capture(dev, baseline_trace, cq_id=0)
-        verifier.shared = True
         try:
             for pos, expected in references.items():
                 seed(pos)
@@ -120,7 +122,7 @@ def main(trace_only):
                     start = time.perf_counter()
                     ttnn.execute_trace(dev, traces[kind], cq_id=0, blocking=True)
                     times[kind].append(1000 * (time.perf_counter() - start))
-            for name, samples in zip(("B1", "verify serial projections", "verify shared projections"), times):
+            for name, samples in zip(("B1", "verify serial epilogues", "verify grouped epilogues"), times):
                 warm = samples[2:]
                 print(
                     f"{name}: {statistics.median(warm):.2f} ms median, "

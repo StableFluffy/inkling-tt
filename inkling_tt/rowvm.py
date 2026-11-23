@@ -194,7 +194,16 @@ def _linear_base(core_coords, grid_x):
 
 @lru_cache(maxsize=256)
 def _program(
-    compute_args, readers, writers, core_coords, task_cols, index_args, position_args, grid_width, wait_for_kv
+    compute_args,
+    readers,
+    writers,
+    core_coords,
+    task_cols,
+    index_args,
+    position_args,
+    grid_width,
+    wait_for_kv,
+    packed_history,
 ):
     cores = tuple(ttnn.CoreCoord(x, y) for x, y in core_coords)
     base = _linear_base(core_coords, grid_width) if _RECT else None
@@ -216,7 +225,8 @@ def _program(
         return desc, [kernel]
     bf_cols = max((s[5] for s in readers if s[1] == 2), default=0)
     if bf_cols:
-        cbs.append(_cb(grid, 31, 4, page_size=((bf_cols + 31) // 32) * 64))
+        face_width = 16 if packed_history else 32
+        cbs.append(_cb(grid, 31, 4, page_size=((bf_cols + face_width - 1) // face_width) * 64))
     semaphores = []
     task_defines = _ZONES + (
         []
@@ -289,6 +299,8 @@ def _program(
         if compute_args[0] in _KV_OPS:
             cbs.append(_cb(grid, 10, 2))
             write_defines.append(("ROWVM_CACHE_WRAP", str(compute_args[4])))
+    if packed_history:
+        defines.append(("ROWVM_PACKED_HISTORY", "1"))
     if history_ring:
         task_defines = [*task_defines, ("ROWVM_INDEXED_CONV", "1")]
     rt_args = [(c, [task]) for task, c in enumerate(cores)] if base is None else []
@@ -387,6 +399,8 @@ def _run(
     if len(set(output_ids)) != len(output_ids) or input_ids.intersection(writable_ids):
         raise ValueError("rowvm outputs must have independent storage")
     grid = device.compute_with_storage_grid_size()
+    if group is not None and group.cores is None and group.tasks + tasks > grid.x * grid.y:
+        group.launch()
     offset = group.tasks if group is not None else 0
     if group is not None and group.cores is not None:
         coords = group.cores[offset : offset + tasks]
@@ -415,7 +429,26 @@ def _run(
     if position is not None:
         position_args = tuple(ttnn.TensorAccessorArgs(position).get_compile_time_args())
         common_args.append(position.buffer_address())
-    args = (compute_args, in_specs, out_specs, coords, task_cols, index_args, position_args, grid.x, wait_for_kv)
+    packed_history = (
+        group is not None
+        and compute_args[0] in (_CONV_MIX, _CONV_ADD)
+        and any(
+            spec[13] and spec[1] == 4 and readers[i - 1].row > 0 and readers[i - 1].tensor.dtype == BF
+            for i, spec in enumerate(in_specs)
+        )
+    )
+    args = (
+        compute_args,
+        in_specs,
+        out_specs,
+        coords,
+        task_cols,
+        index_args,
+        position_args,
+        grid.x,
+        wait_for_kv,
+        packed_history,
+    )
     if group is not None:
         group.tasks += tasks
         group.entries.append((args, readers, writers, common_args, inputs, outputs))
@@ -527,6 +560,8 @@ class _Group:
         self.cores = cores
 
     def launch(self, kv=None):
+        if not self.entries:
+            return
         inputs, outputs, kernels = [], [], []
         projection = ()
         if kv is not None:
@@ -554,6 +589,8 @@ class _Group:
                 inputs.extend(kv)
             desc.kernels = kernels
             ttnn.generic_op(inputs + outputs[::-1], desc)
+        self.tasks = 0
+        self.entries.clear()
 
 
 def rms_norm(x, weight=None, *, dtype=FP, out=None, memory_config=None):
@@ -1053,18 +1090,18 @@ def depthwise_conv(history, x, taps, *, dyn=None, dtype=FP, out=None, memory_con
     )
 
 
-def conv_residual(history, x, taps, residual, *, out=None, position=None):
+def conv_residual(history, x, taps, residual, *, out=None, position=None, row=0, _group=None):
     """Update the convolution history, round the convolution, and add the residual in BF16."""
-    width = _width(x)
-    _validate(residual, x.shape)
+    width = _width(residual)
+    _row_window(x, width, 0, row=row)
     ring = _conv_history(history, taps, width, position)
     state_rows = 1 if ring else 4
     chunk, stripes = _stripes(width, 128)
-    y = _output(x, x.shape, BF, out, None)
+    y = _output(x, residual.shape, BF, out, None)
     return _run(
         (_CONV_ADD, chunk, 2 | 16),
         [
-            _stripe(x, chunk, width),
+            _stripe(x, chunk, width, row=row),
             _stripe(history, chunk, width, rows=3, cache_length=ring),
             _stripe(taps, chunk, width, rows=4),
             _stripe(residual, chunk, width),
@@ -1072,6 +1109,7 @@ def conv_residual(history, x, taps, residual, *, out=None, position=None):
         [_stripe(y, chunk, width), _stripe(history, chunk, width, rows=state_rows, cache_length=ring)],
         stripes,
         position=position if ring else None,
+        group=_group,
     )
 
 
@@ -1223,6 +1261,7 @@ def attnres_mix(
     round_residual=False,
     partial_row=0,
     position=None,
+    _group=None,
 ):
     """Read a normalized bank with up to four pre-scaled queries.
 
@@ -1323,6 +1362,7 @@ def attnres_mix(
         task_cols=stripes,
         query_outputs=ys,
         position=position if convolution is not None and ring else None,
+        group=_group,
     )
     return ys
 
