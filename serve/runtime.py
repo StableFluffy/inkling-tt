@@ -20,7 +20,7 @@ def default_precision():
 
 
 class InklingRuntime:
-    def __init__(self, device, weights, lmax=32768, chunk=2048, log=print):
+    def __init__(self, device, weights, lmax=32768, chunk=2048, log=print, *, device_sampling=False):
         if lmax % 32 or chunk % 32:
             raise ValueError(f"lmax and chunk must be multiples of 32, got {lmax}, {chunk}")
         self.dev = device
@@ -32,6 +32,11 @@ class InklingRuntime:
         self.buckets = []
         t0 = time.time()
         self.m = InklingTT2(device, weights, default_precision(), lmax=lmax, log=lambda s: None)
+        self.sampler = None
+        if device_sampling and hasattr(self.m, "head_logits"):
+            from inkling_tt.sampling import DecodeSampler
+
+            self.sampler = DecodeSampler(self.m.head_logits)
         log(f"inkling: model loaded in {time.time() - t0:.1f} s")
         self._zeros = {}
         self.pos = None
@@ -45,7 +50,11 @@ class InklingRuntime:
             return
         self._prepare_prefill(log)
         t0 = time.time()
+        if self.sampler is not None:
+            self.sampler.warm()
         self.m.capture()
+        if self.sampler is not None:
+            self.sampler.capture()
         self.pos = None
         log(f"inkling: trace captured in {time.time() - t0:.1f} s")
 
@@ -63,6 +72,8 @@ class InklingRuntime:
         log(f"inkling: chunked prefill tables and programs prepared in {time.time() - t0:.1f} s")
 
     def release(self):
+        if self.sampler is not None:
+            self.sampler.release()
         if self.traced:
             ttnn.release_trace(self.dev, self.m.trace_id)
             self.m.trace_id = None
@@ -124,23 +135,31 @@ class InklingRuntime:
             self._advance(ids[p - start], p)
         return self.m.step(ids[-1], end - 1)
 
-    def step_greedy(self, tok, pos):
-        """Decode one token with the on-device argmax; returns the next token id."""
+    def _begin_step(self, pos):
         if self.pos != pos:
             raise RuntimeError(f"sequence state is at position {self.pos}, asked to decode position {pos}")
         if pos >= self.lmax:
             raise ValueError(f"position {pos} exceeds lmax {self.lmax}")
         self.pos = None
+
+    def step_greedy(self, tok, pos):
+        """Decode one token with the on-device argmax; returns the next token id."""
+        self._begin_step(pos)
         nxt = self.m.step_greedy(tok, pos)
         self.pos = pos + 1
         return nxt
 
     def step(self, tok, pos):
-        if self.pos != pos:
-            raise RuntimeError(f"sequence state is at position {self.pos}, asked to decode position {pos}")
-        if pos >= self.lmax:
-            raise ValueError(f"position {pos} exceeds lmax {self.lmax}")
-        self.pos = None
+        self._begin_step(pos)
         logits = self.m.step(tok, pos)
         self.pos = pos + 1
         return logits
+
+    def step_sampled(self, tok, pos, temperature, top_k, top_p, presence, frequency, draw):
+        self._begin_step(pos)
+        sampler = self.sampler
+        sampler.stage(tok, max(0.0, temperature), top_k, top_p, presence, frequency, draw)
+        self.m.run(tok, pos)
+        next_token = sampler.sample()
+        self.pos = pos + 1
+        return next_token

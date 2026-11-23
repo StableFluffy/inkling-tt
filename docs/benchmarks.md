@@ -47,7 +47,18 @@ Each chunk goes to whichever bucket costs less for the tokens that remain, so a 
 | Long, greedy | 7,820 | 4.239 s | 21.3 ms/token |
 | Short, sampled (T=0.8) | 23 | 0.154 s | 21.5 ms/token |
 
-Sampled requests read the logits back and sample on the host. The container needs 217 s to answer `/health` on its first start, which compiles every kernel, and 66 s when the kernel cache is warm.
+The v0.1.0 server measurements include host sampling. The container needs 217 s to answer `/health` on its first start, which compiles every kernel, and 66 s when the kernel cache is warm.
+
+The current standalone engine alternates host and device sampling in one loaded model. Each case uses 118 timed decode tokens per arm after warm-up, from a 29-token prompt.
+
+| Sampling | Host median / p95 | Device median / p95 |
+|---|---:|---:|
+| Temperature 0.8 | 19.73 / 20.30 ms | 18.99 / 19.21 ms |
+| Temperature 0.8, top-p 0.9 | 20.94 / 21.81 ms | 20.31 / 20.69 ms |
+| Temperature 0.8, top-k 37, top-p 0.9, penalties | 19.66 / 20.39 ms | 18.91 / 19.24 ms |
+| Temperature 0, penalties | 19.23 / 19.44 ms | 18.72 / 18.78 ms |
+
+Each seeded request repeated exactly on its own sampler. The greedy and temperature-zero penalty cases also produced identical sequences across sampling paths.
 
 ## Accuracy
 

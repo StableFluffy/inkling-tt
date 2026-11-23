@@ -64,6 +64,8 @@ Each step kept the precision policy of [precision.md](precision.md); the accurac
 
 **Readout.** The LM head writes width-sharded logits. One program (`rowvm.head_tail`) copies them into a row-major logits row, masks the padded vocabulary and finds the argmax. For greedy decoding a second one-core program (`rowvm.token_feedback`) copies the chosen token's embedding row from an on-device table into the next step's input and advances the position, so the host does not touch the critical path. `m.greedy(tok, pos, n)` enqueues `n` replays and reads all IDs back at the end.
 
+**Sampling.** The sampled server path applies its filters to the entire head row on device and reads one token ID. A bounded heap on each worker finds local candidates for small exact top-k requests. The sampler uses a radix selection to find score and probability-mass cutoffs for larger sets. Penalty counts stay in a reusable device buffer.
+
 **Row-major state.** The decode bank, residual scratch, embedding row and rowvm constants are stored row-major. A TILE layout stores one row as 16-value faces, so reading a row cost one NoC transaction per 16 values; row-major reads it in one transfer per stripe.
 
 ## What did not help

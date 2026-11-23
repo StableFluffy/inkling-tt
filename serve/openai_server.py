@@ -2,6 +2,8 @@ import argparse
 import asyncio
 import json
 import logging
+import math
+import os
 import threading
 import time
 import uuid
@@ -120,7 +122,15 @@ class Engine:
         self.ttnn = ttnn
         self.lmax = args.lmax
         self.dev = open_device(args.device_id)
-        self.rt = InklingRuntime(self.dev, args.weights, lmax=args.lmax, chunk=args.prefill_chunk, log=log.info)
+        self.device_sampling = not args.no_trace and os.getenv("INK_DEVICE_SAMPLING") != "0"
+        self.rt = InklingRuntime(
+            self.dev,
+            args.weights,
+            lmax=args.lmax,
+            chunk=args.prefill_chunk,
+            log=log.info,
+            device_sampling=self.device_sampling,
+        )
         self.rt.fast_prefill = not args.no_fast_prefill
         if not args.no_trace:
             self.rt.capture(log=log.info)
@@ -141,9 +151,22 @@ class Engine:
             gen.seed()
         else:
             gen.manual_seed(s.seed)
+        greedy = s.temperature <= 0.0 and not (s.presence_penalty or s.frequency_penalty)
+        score_bound = 30 + abs(s.presence_penalty) + s.max_tokens * abs(s.frequency_penalty)
+        device_sampling = (
+            self.device_sampling
+            and self.rt.sampler is not None
+            and self.rt.traced
+            and not greedy
+            and math.isfinite(s.temperature)
+            and math.isfinite(s.top_p)
+            and score_bound < 3e38 * min(s.temperature if s.temperature > 0.0 else 1.0, 1.0)
+        )
         counts: dict[int, int] = {}
         t0 = time.perf_counter()
         self.rt.reset()
+        if device_sampling and (s.presence_penalty or s.frequency_penalty):
+            self.rt.sampler.reset()
         t1 = time.perf_counter()
         t.reset_s = t1 - t0
         logits = self.rt.feed(ids, 0, job.cancelled)
@@ -153,7 +176,6 @@ class Engine:
             t.finish_reason = "cancelled"
             return
         pos = len(ids)
-        greedy = s.temperature <= 0.0 and not (s.presence_penalty or s.frequency_penalty)
         next_tok = None
         for k in range(s.max_tokens):
             tok = next_tok if next_tok is not None else sample(logits, s, counts, gen)
@@ -171,6 +193,11 @@ class Engine:
                 break
             if greedy:
                 next_tok = self.rt.step_greedy(tok, pos)
+            elif device_sampling:
+                draw = torch.rand(1, generator=gen).item() if s.temperature > 0.0 else 0.0
+                next_tok = self.rt.step_sampled(
+                    tok, pos, s.temperature, s.top_k, s.top_p, s.presence_penalty, s.frequency_penalty, draw
+                )
             else:
                 logits = self.rt.step(tok, pos)
             pos += 1

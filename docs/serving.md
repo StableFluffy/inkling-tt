@@ -39,7 +39,7 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   "temperature": 0, "max_tokens": 200}'
 ```
 
-The server implements `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`. It supports streaming (SSE), `temperature`, `top_p`, `top_k`, presence and frequency penalties, stop strings and stop token IDs, `seed` and `max_tokens`. `temperature: 0` is greedy decoding. Without `max_tokens`, a request may generate until the context is full, so set it.
+The server implements `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`. It supports streaming (SSE), `temperature`, `top_p`, `top_k`, presence and frequency penalties, stop strings and stop token IDs, `seed` and `max_tokens`. `temperature: 0` selects the highest logit after applying any penalties. Without `max_tokens`, a request may generate until the context is full, so set it.
 
 Chat responses put the model's thinking channel in `reasoning_content` and its answer in `content`. `reasoning_effort` is passed to the chat template: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a number in [0, 0.99]; the default is 0.9.
 
@@ -65,7 +65,9 @@ Environment switches for comparisons: `INK_ATTN_DECODE=0` uses TTNN's SDPA decod
 
 ## How a request runs
 
-The runtime (`serve/runtime.py`) resets the convolution histories, which takes about 5 ms; cache slots past the current position are masked, so the KV caches need no clearing. It splits the prompt into chunks for the two prefill buckets (128 and 2048 rows, see [prefill.md](prefill.md)) and then replays the decode trace once per output token. Greedy requests without penalties take the token from the device argmax and skip the logits readback. Sampled requests read the logits and sample on the host, which costs about 1.5 ms per token.
+The runtime (`serve/runtime.py`) resets the convolution histories, which takes about 5 ms; cache slots past the current position are masked, so the KV caches need no clearing. It splits the prompt into chunks for the two prefill buckets (128 and 2048 rows, see [prefill.md](prefill.md)) and then replays the decode trace once per output token. Greedy requests without penalties take the token from the device argmax and skip the logits readback. The host samples the first token from the prefill logits. The traced decode sampler reads the BF16 head row on the device and applies the FP32 softcap, penalties, temperature and filters across all 200,058 tokens. The host reads a token ID for each subsequent step.
+
+The sampler uses the request's Torch generator for a single uniform draw per token. It walks its cumulative mass in ascending token-ID order and breaks score ties by token ID. Repeating a seeded request reproduces its sequence on the same sampling path. Filtered sequences can differ between the host and device paths because their cumulative order differs. `INK_DEVICE_SAMPLING=0` selects the host path for comparison.
 
 A request may use at most `lmax` tokens in total and must leave room for one output token.
 
