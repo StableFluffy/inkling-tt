@@ -46,28 +46,24 @@ Each chunk goes to whichever bucket costs less for the tokens that remain. A 300
 ## Adaptive greedy MTP
 
 `tools/bench_server.py --compare-mtp --runs 3 --max-tokens 64` alternates B1 and adaptive
-DSpark requests against the same source server. Both prefill buckets and the standard dispatch
-ring are resident with `--mtp 3 --lmax 8192 --prefill-chunk 2048`. All 42 requests match in streamed
-choices and usage. Values are median/p95.
+DSpark requests on a server started with `--mtp 3 --lmax 8192 --prefill-chunk 2048`.
+The same job then starts a standalone B1 server and repeats all seven prompts three times.
+Both servers use the larger dispatch ring. All 63 requests match in streamed choices and usage.
+Decode is in ms/ID and TTFT is in ms. Each cell gives median/p95.
 
-| Prompt | B1 decode, ms/ID | MTP decode, ms/ID | B1 TTFT, ms | MTP TTFT, ms |
-|---|---:|---:|---:|---:|
-| Chat | 19.36/19.39 | 19.46/19.49 | 137.10/137.28 | 137.30/137.48 |
-| Python | 19.40/19.43 | 17.06/17.09 | 148.40/148.67 | 148.20/148.29 |
-| Korean | 19.35/19.41 | 19.49/19.52 | 156.70/156.79 | 156.70/156.70 |
-| 1,580 tokens | 19.93/19.94 | 18.73/18.73 | 1044.60/1046.67 | 1042.50/1045.74 |
-| 7,820 tokens | 20.61/20.71 | 20.61/20.65 | 4692.30/4692.93 | 4695.30/4696.56 |
-| Long Python | 19.41/19.46 | 18.54/18.56 | 305.50/305.68 | 305.30/305.48 |
-| Math | 19.38/19.41 | 16.76/16.77 | 167.20/167.29 | 167.60/167.69 |
+| Prompt | Standalone B1 decode | Resident B1 decode | MTP decode | Standalone B1 TTFT | Resident B1 TTFT | MTP TTFT |
+|---|---:|---:|---:|---:|---:|---:|
+| Chat | 18.46/18.46 | 18.55/18.57 | 18.54/18.65 | 128.90/134.75 | 123.50/123.77 | 123.70/124.15 |
+| Python | 18.44/18.45 | 18.63/18.64 | 16.19/16.21 | 139.10/139.19 | 134.70/134.97 | 134.50/134.77 |
+| Korean | 18.44/18.46 | 18.94/19.04 | 18.75/18.82 | 147.90/148.53 | 144.50/146.12 | 143.60/143.78 |
+| 1,580 tokens | 19.02/19.04 | 19.41/19.52 | 18.21/18.21 | 858.90/860.16 | 968.00/968.90 | 961.00/979.36 |
+| 7,820 tokens | 19.91/20.19 | 20.35/20.37 | 20.28/20.38 | 3711.60/3713.58 | 4372.00/4376.59 | 4367.90/4374.20 |
+| Long Python | 18.99/19.09 | 18.88/18.88 | 17.87/17.89 | 287.60/306.86 | 280.20/280.83 | 280.40/280.94 |
+| Math | 18.78/19.01 | 18.77/18.83 | 15.80/15.81 | 160.70/162.86 | 155.20/155.20 | 154.60/154.78 |
 
-The mean of the seven decode medians is 19.63 ms/ID in B1 mode and 18.66 ms/ID with MTP.
-The largest increase in a decode median is 0.14 ms/ID. At 7,820 tokens, the decode medians
-are both 20.61 ms/ID and first-token latency differs by 3 ms.
-
-The same job starts a standalone B1 server with the larger dispatch ring for two short
-probes. It matches the resident MTP streams and decodes chat at 18.43/18.48 ms per ID and
-Korean at 18.45/18.46 ms per ID. The resident MTP median is 19.45 ms per ID for both.
-B1 is the server default.
+The mean decode median is 18.86 ms/ID for standalone B1, 19.08 for resident B1 and 17.95
+for adaptive MTP. At 7,820 tokens the MTP median is 0.37 ms/ID higher and TTFT is 656 ms higher
+than standalone B1. B1 is the server default.
 
 ## Accuracy
 
