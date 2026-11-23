@@ -124,7 +124,7 @@ In the converted shards `gate_up_proj` is `[128, 2304, 2304]` with gate rows fir
 
 ## Readout
 
-`logits = 30 * tanh(W_head . RN(Mix(C, x, q_out), w_norm) / 30)`. The head is not tied to the embedding. Both store 201,024 rows; rows from 200,058 up are padding, which the port masks before argmax. The embedding row is normalized with `RN(e, w_embed)` and has no extra scale.
+`logits = 30 * tanh(W_head . RN(Mix(C, x, q_out), w_norm) / 30)`. The head is not tied to the embedding. The checkpoint stores 201,024 rows for both; rows from 200,058 up are padding. Transformers drops the padded head rows, so the converted head has 200,058 rows, and the port masks the tile padding of its logits before argmax. The embedding row is normalized with `RN(e, w_embed)` and has no extra scale.
 
 ## Cast points
 
