@@ -28,8 +28,12 @@ void kernel_main() {
     }
 #else
     constexpr auto a1 = TensorAccessorArgs<a0.next_compile_time_args_offset()>();
+#ifdef PREFILL_SEPARATE_BANK
+    const auto weights = TensorAccessor(a0, addr(0), fp_bytes);
+#else
     const auto slabs = TensorAccessor(a0, addr(0), fp_bytes);
     const auto weights = TensorAccessor(a1, addr(1), fp_bytes);
+#endif
     const uint32_t scratch = get_write_ptr(2);
     for (uint32_t tile = first; tile < end; ++tile) {
         const uint32_t row_block = tile / cols;
@@ -55,7 +59,13 @@ void kernel_main() {
         cb_reserve_back(0, depth);
         const uint32_t data = get_write_ptr(0);
         for (uint32_t d = 0; d < depth; ++d) {
-            noc_async_read<fp_bytes>(slabs.get_noc_addr(d * rows * cols + tile), data + d * fp_bytes, fp_bytes);
+#ifdef PREFILL_SEPARATE_BANK
+            const auto entry = TensorAccessor(a1, addr(1 + d), fp_bytes);
+            const uint64_t source = entry.get_noc_addr(tile);
+#else
+            const uint64_t source = slabs.get_noc_addr(d * rows * cols + tile);
+#endif
+            noc_async_read<fp_bytes>(source, data + d * fp_bytes, fp_bytes);
         }
         noc_async_read_barrier();
         cb_push_back(0, depth);

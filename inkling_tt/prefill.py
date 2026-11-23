@@ -289,8 +289,40 @@ def _conv_program(tasks, cols, dynamic, tiles, x_dtype, out_dtype, residual_dtyp
     return _program(kernels, cbs)
 
 
+@lru_cache(maxsize=16)
+def _depth_score_program(tasks, cols, rows, specs):
+    grid, rt = _grid(tasks)
+    reader, writer = specs
+    args = [cols, rows]
+    kernels = [
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "depth_score_io.cpp"),
+            core_ranges=grid,
+            compile_time_args=[*args, *reader[0]],
+            runtime_args=rt,
+            config=ttnn.ReaderConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "depth_score_io.cpp"),
+            core_ranges=grid,
+            compile_time_args=[*args, *writer[0]],
+            runtime_args=rt,
+            defines=[("PREFILL_WRITE", "1")],
+            config=ttnn.WriterConfigDescriptor(),
+        ),
+        ttnn.KernelDescriptor(
+            kernel_source=str(_KERNELS / "depth_score_compute.cpp"),
+            core_ranges=grid,
+            compile_time_args=args,
+            runtime_args=rt,
+            config=_compute((3,)),
+        ),
+    ]
+    return _program(kernels, [_tile_cb(grid, i, FP, n) for i, n in ((0, 16), (1, cols), (3, 1), (16, 2))])
+
+
 @lru_cache(maxsize=32)
-def _mix_program(tasks, cols, rows, depth, queries, specs):
+def _mix_program(tasks, cols, rows, depth, queries, separate, specs):
     grid, rt = _grid(tasks)
     args = [cols, rows, depth, queries]
     reader, writer = tuple(sum(group, ()) for group in specs)
@@ -300,6 +332,7 @@ def _mix_program(tasks, cols, rows, depth, queries, specs):
             core_ranges=grid,
             compile_time_args=[*args, *reader],
             runtime_args=rt,
+            defines=[("PREFILL_SEPARATE_BANK", "1")] if separate else [],
             config=ttnn.ReaderConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
@@ -627,6 +660,8 @@ class Prefill:
             self._norm_rows = tuple(_alloc(self.dev, self.rows.shape) for _ in range(3))
             self._controller_rows = _alloc(self.dev, (1, 1, chunk, 2 * D))
         self._reuse_items = os.environ.get("INK_PREFILL_REUSE_ITEMS", "1") == "1"
+        self._fused_depth_mix = os.environ.get("INK_PREFILL_DEPTH_MIX", "1") == "1"
+        self._depth_logits = {}
         self._project_distance = os.environ.get("INK_PREFILL_PROJECT_DISTANCE", "1") == "1"
         self._bank_items = {}
         self._un16 = None
@@ -757,13 +792,25 @@ class Prefill:
         current = self.ops.rms(partial)
         if not bank:
             return [current] * nq
-        items = self._items(bank, current)
-        scores = self.c.mm(items, qm[0])
-        weights = ttnn.softmax(scores, dim=1)
-        out = [_alloc(self.dev, (1, 1, self.chunk, D), FP) for _ in range(nq)]
         cols, rows = D // 32, self.chunk // 32
+        depth = len(bank) + 1
+        if self._fused_depth_mix:
+            entries = (*bank, current)
+            scores = self._depth_logits.get(depth)
+            if scores is None:
+                scores = self._depth_logits[depth] = _alloc(self.dev, (1, depth, self.chunk, 32), FP)
+            _launch(_depth_score_program, (_tasks(self.dev, depth * rows), cols, rows), (qm[0], *entries), (scores,))
+            inputs = (ttnn.softmax(scores, dim=1), *entries)
+        else:
+            items = self._items(bank, current)
+            scores = self.c.mm(items, qm[0])
+            inputs = (items, ttnn.softmax(scores, dim=1))
+        out = [_alloc(self.dev, (1, 1, self.chunk, D), FP) for _ in range(nq)]
         _launch(
-            _mix_program, (_tasks(self.dev, cols * rows), cols, rows, len(bank) + 1, nq), (items, weights), tuple(out)
+            _mix_program,
+            (_tasks(self.dev, cols * rows), cols, rows, depth, nq, self._fused_depth_mix),
+            inputs,
+            tuple(out),
         )
         return out
 
