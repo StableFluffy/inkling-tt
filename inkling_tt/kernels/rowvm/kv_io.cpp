@@ -27,6 +27,10 @@ void kernel_main() {
     cb_wait_front(16, 1);
     noc_async_write_tile(column % 32, y, get_read_ptr(16));
     noc_async_write_barrier();
+#ifdef KV_SIGNAL
+    const uint32_t peer = get_arg_val<uint32_t>(1);
+    noc_semaphore_inc(get_noc_addr(peer & 0xffff, peer >> 16, get_semaphore(2)), 1);
+#endif
     cb_pop_front(16, 1);
 #else
     const uint32_t bank = column / 8;

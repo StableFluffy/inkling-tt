@@ -86,8 +86,8 @@ visit:
 
 ```
 attention input row (usually written by the previous visit's last program)
-  -> Q/relative/sink/gate matmul, paired K and V matmul
-  -> prepare_attention      Q, R, sink; K/V conv, clip/RMS, cache write
+  -> Q/relative/sink/gate matmul
+  -> prepare_attention      paired K/V projection, Q/R/sink prep, K/V conv and cache write
   -> attention decode       (inkling_tt/attn_decode.py)
   -> O matmul
   -> attnres_mix + conv     post-attention conv, residual, bank append, MLP mix, norm
@@ -102,9 +102,10 @@ four-query mix over the previous pass's bank, one `message_down` launch for the 
 `qkv_message_projections` for their blends, and one more down/blend pair for the MLP gate. The
 readout is the LM head matmul, `head_tail` and, for greedy decoding, `token_feedback`.
 
-Independent programs on disjoint cores can share one launch through `_Group`: `prepare_attention`
-runs the Q, R and sink programs and both K/V cache programs together, and `qkv_message_projections`
-runs three gate blends together.
+Programs on disjoint workers can share one launch through `_Group`. On the full grid,
+`prepare_attention` assigns 64 workers to the paired K/V projection and 65 to head preparation.
+Each K/V cache worker loads its history and taps while its four projection workers produce the
+next row. `qkv_message_projections` runs three gate blends together.
 
 ## Launching and tracing
 

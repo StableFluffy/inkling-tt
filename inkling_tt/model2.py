@@ -64,7 +64,7 @@ class Ctx:
 
     def __init__(self, device, prec: Precision):
         self.dev = device
-        worker_grid(device)
+        grid = worker_grid(device)
         self.prec = prec
         single_stream = device.get_num_devices() == 1 and getattr(prec, "experts", "stock") == "stream"
         self.visit_fusion = (
@@ -87,6 +87,9 @@ class Ctx:
         self.group_gates = self.shard_fusion and os.environ.get("INK_GROUP_GATES", "1") != "0"
         self.join_attention_prep = self.layout_fusion and os.environ.get("INK_JOIN_ATTN_PREP", "1") != "0"
         self.paired_kv = single_stream and self.join_attention_prep and os.environ.get("INK_PAIR_KV", "1") != "0"
+        self.fused_kv_prep = (
+            self.paired_kv and grid.x * grid.y >= 129 and os.environ.get("INK_FUSED_KV_PREP", "1") == "1"
+        )
         # Decode-only rowvm rows (constants, bank, residual scratch) as row-major DRAM pages: one read per stripe.
         self.row_major_state = (
             self.visit_fusion and device.get_num_devices() == 1 and os.environ.get("INK_RM_STATE", "1") != "0"
@@ -638,9 +641,13 @@ class Layer:
             )
             rowvm.sink_tile(qrsg, col_offset=sink_col, out=sinkt)
 
+        kv_projection = None
         if c.paired_kv and xk.memory_config() == xv.memory_config():
             kr, vr = c.kv_rows
-            rowvm.project_kv(xk, xv, self.decode_kv, kr, vr)
+            if c.fused_kv_prep:
+                kv_projection = (xk, xv, self.decode_kv)
+            else:
+                rowvm.project_kv(xk, xv, self.decode_kv, kr, vr)
         else:
             kr, vr = dense.linear(xk, self.wk), dense.linear(xv, self.wv)
         if c.layout_fusion:
@@ -664,6 +671,7 @@ class Layer:
                     k_dyn=k_dyn,
                     v_dyn=v_dyn,
                     wrap=not self.is_global,
+                    kv_projection=kv_projection,
                 )
             else:
                 rowvm.update_kv(

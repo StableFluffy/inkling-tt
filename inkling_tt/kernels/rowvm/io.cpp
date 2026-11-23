@@ -405,7 +405,17 @@ void kernel_main() {
 #ifndef ROWVM_WRITE
     {
     RV_ZONE("RV_READ");
-#ifdef ROWVM_CONV_MIX
+#if defined(ROWVM_WAIT_KV)
+    transfer<1>(task);
+    transfer<2>(task);
+    if constexpr (count == 4) {
+        transfer<3>(task);
+    }
+    auto ready = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(2));
+    noc_semaphore_wait(ready, 4);
+    noc_semaphore_set(ready, 0);
+    transfer<0>(task);
+#elif defined(ROWVM_CONV_MIX)
     read_batch<4>(task, std::make_integer_sequence<uint32_t, count - 4>{});
     read_batch<0>(task, std::make_integer_sequence<uint32_t, 4>{});
 #else

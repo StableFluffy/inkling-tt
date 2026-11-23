@@ -192,7 +192,9 @@ def _linear_base(core_coords, grid_x):
 
 
 @lru_cache(maxsize=256)
-def _program(compute_args, readers, writers, core_coords, task_cols, index_args, position_args, grid_width):
+def _program(
+    compute_args, readers, writers, core_coords, task_cols, index_args, position_args, grid_width, wait_for_kv
+):
     cores = tuple(ttnn.CoreCoord(x, y) for x, y in core_coords)
     base = _linear_base(core_coords, grid_width) if _RECT else None
     grid = _rects(core_coords) if base is not None else ttnn.CoreRangeSet([ttnn.CoreRange(c, c) for c in cores])
@@ -257,6 +259,9 @@ def _program(compute_args, readers, writers, core_coords, task_cols, index_args,
             cbs.extend((_cb(grid, 2, 4), _cb(grid, 3, 4), _cb(grid, 15, 4, 4)))
         if op == _GATE_INPUT_STRIPED:
             defines.append(("ROWVM_GROUP_INPUT", "1"))
+    if wait_for_kv:
+        semaphores.append(ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, grid, 0))
+        defines.append(("ROWVM_WAIT_KV", "1"))
     write_args = _io_args(writers, task_cols)
     write_defines = [*defines, ("ROWVM_WRITE", "1")]
     if compute_args[0] in (_RMS, _L2) and writers[0][5] > compute_args[1]:
@@ -338,7 +343,16 @@ def _bind(kernel, regions, extra_args=()):
 
 
 def _run(
-    compute_args, readers, writers, tasks=1, task_cols=0, query_outputs=(), indices=None, position=None, group=None
+    compute_args,
+    readers,
+    writers,
+    tasks=1,
+    task_cols=0,
+    query_outputs=(),
+    indices=None,
+    position=None,
+    group=None,
+    wait_for_kv=False,
 ):
     inputs = [r.tensor for r in readers]
     if position is not None:
@@ -362,9 +376,14 @@ def _run(
         raise ValueError("rowvm outputs must have independent storage")
     grid = device.compute_with_storage_grid_size()
     offset = group.tasks if group is not None else 0
-    if offset + tasks > grid.x * grid.y:
-        raise ValueError("rowvm requires more logical cores than the device provides")
-    coords = tuple((i % grid.x, i // grid.x) for i in range(offset, offset + tasks))
+    if group is not None and group.cores is not None:
+        coords = group.cores[offset : offset + tasks]
+        if len(coords) != tasks:
+            raise ValueError("rowvm group requires more logical cores than its placement provides")
+    else:
+        if offset + tasks > grid.x * grid.y:
+            raise ValueError("rowvm requires more logical cores than the device provides")
+        coords = tuple((i % grid.x, i // grid.x) for i in range(offset, offset + tasks))
     in_cbs = (0, 1, 4, 12, 13, 14) if compute_args[0] == _MESSAGE_UP else range(len(readers))
     in_specs = tuple(r.spec(cb) for cb, r in zip(in_cbs, readers))
     out_cbs = (16, 17, 21, 22) if compute_args[0] == _CONV_MIX else range(16, 16 + len(writers))
@@ -384,7 +403,7 @@ def _run(
     if position is not None:
         position_args = tuple(ttnn.TensorAccessorArgs(position).get_compile_time_args())
         common_args.append(position.buffer_address())
-    args = (compute_args, in_specs, out_specs, coords, task_cols, index_args, position_args, grid.x)
+    args = (compute_args, in_specs, out_specs, coords, task_cols, index_args, position_args, grid.x, wait_for_kv)
     if group is not None:
         group.tasks += tasks
         group.entries.append((args, readers, writers, common_args, inputs, outputs))
@@ -406,8 +425,10 @@ def _bind_program(op, kernels, readers, writers, common_args):
 
 
 @lru_cache(maxsize=32)
-def _group_program(keys):
+def _group_program(keys, projection=()):
     programs = [_program(*key) for key in keys]
+    if projection:
+        programs.append(_kv_program(*projection))
     desc = ttnn.ProgramDescriptor(
         kernels=[k for _, kernels in programs for k in kernels],
         cbs=[cb for p, _ in programs for cb in p.cbs],
@@ -434,9 +455,9 @@ def _kv_placement(device):
 
 
 @lru_cache(maxsize=8)
-def _kv_program(tasks, specs):
+def _kv_program(tasks, specs, signal=False):
     grid = _rects(tuple((x, y) for x, y, *_ in tasks))
-    rt = [(ttnn.CoreCoord(x, y), [col]) for x, y, col in tasks]
+    rt = [(ttnn.CoreCoord(x, y), [col, *peer]) for x, y, col, *peer in tasks]
     compute = ttnn.ComputeConfigDescriptor(
         math_fidelity=ttnn.MathFidelity.HiFi4, fp32_dest_acc_en=True, math_approx_mode=False
     )
@@ -456,7 +477,7 @@ def _kv_program(tasks, specs):
             core_ranges=grid,
             runtime_args=rt,
             compile_time_args=[8, *specs],
-            defines=[("KV_WRITE", "1")],
+            defines=[("KV_WRITE", "1")] + ([("KV_SIGNAL", "1")] if signal else []),
             config=ttnn.WriterConfigDescriptor(),
         ),
         ttnn.KernelDescriptor(
@@ -467,7 +488,8 @@ def _kv_program(tasks, specs):
         ),
     ]
     cbs = [_cb(grid, 0, 2, 16), _cb(grid, 1, 2, 16), _cb(grid, 2, 4), _cb(grid, 16, 2)]
-    desc = ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs)
+    semaphores = [ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, grid, 0)] if signal else []
+    desc = ttnn.ProgramDescriptor(kernels=kernels, cbs=cbs, semaphores=semaphores)
     desc.custom_program_hash = ttnn.compute_program_descriptor_hash(desc)
     return desc, kernels
 
@@ -485,21 +507,39 @@ def project_kv(xk, xv, packed, k, v):
 
 
 class _Group:
-    """One generic launch for independent kernels on disjoint workers."""
+    """One generic launch for kernels on disjoint workers."""
 
-    def __init__(self):
+    def __init__(self, cores=None):
         self.tasks = 0
         self.entries = []
+        self.cores = cores
 
-    def launch(self):
+    def launch(self, kv=None):
         inputs, outputs, kernels = [], [], []
+        projection = ()
+        if kv is not None:
+            xk, xv, packed, k, v = kv
+            device = xk.device()
+            cache_cores = self.cores[self.tasks - 16 : self.tasks]
+            peers = [device.worker_core_from_logical_core(ttnn.CoreCoord(x, y)) for x, y in cache_cores]
+            tasks = tuple(
+                (x, y, col, peers[col // 4].x | (peers[col // 4].y << 16)) for x, y, col in _kv_placement(device)
+            )
+            specs = tuple(a for t in (xk, k) for a in ttnn.TensorAccessorArgs(t).get_compile_time_args())
+            projection = (tasks, specs, True)
         with _launch_lock:
-            desc, programs = _group_program(tuple(entry[0] for entry in self.entries))
+            desc, programs = _group_program(tuple(entry[0] for entry in self.entries), projection)
             for (args, readers, writers, extra, ins, outs), (_, items) in zip(self.entries, programs):
                 _bind_program(args[0][0], items, readers, writers, extra)
                 kernels.extend(items)
                 inputs.extend(ins)
                 outputs.extend(outs)
+            if kv is not None:
+                _, items = programs[-1]
+                items[0].common_runtime_args = [packed.buffer_address()]
+                items[1].common_runtime_args = [t.buffer_address() for t in (xk, xv, k, v)]
+                kernels.extend(items)
+                inputs.extend(kv)
             desc.kernels = kernels
             ttnn.generic_op(inputs + outputs[::-1], desc)
 
@@ -664,6 +704,7 @@ def update_kv(
     v_dyn=None,
     wrap,
     _group=None,
+    _wait_for_kv=False,
 ):
     """Convolve and normalize each head, then update the corresponding cache row."""
     if (
@@ -699,16 +740,40 @@ def update_kv(
             8,
             position=position,
             group=group,
+            wait_for_kv=_wait_for_kv,
         )
     if _group is None:
         group.launch()
 
 
 def prepare_attention(
-    qrsg, q, r, sink, k, v, caches, histories, taps, position, *, q_threshold, r_threshold, tau, k_dyn, v_dyn, wrap
+    qrsg,
+    q,
+    r,
+    sink,
+    k,
+    v,
+    caches,
+    histories,
+    taps,
+    position,
+    *,
+    q_threshold,
+    r_threshold,
+    tau,
+    k_dyn,
+    v_dyn,
+    wrap,
+    kv_projection=None,
 ):
-    """Dispatch head preparation and the independent K/V cache writes together."""
-    group = _Group()
+    """Dispatch head preparation and K/V cache writes together."""
+    cores = None
+    if kv_projection is not None:
+        device = qrsg.device()
+        grid = device.compute_with_storage_grid_size()
+        occupied = {(x, y) for x, y, _ in _kv_placement(device)}
+        cores = tuple((x, y) for y in range(grid.y) for x in range(grid.x) if (x, y) not in occupied)
+    group = _Group(cores)
     attention_heads(qrsg, q, r, sink, q_threshold=q_threshold, r_threshold=r_threshold, tau=tau, _group=group)
     update_kv(
         k,
@@ -722,8 +787,9 @@ def prepare_attention(
         v_dyn=v_dyn,
         wrap=wrap,
         _group=group,
+        _wait_for_kv=kv_projection is not None,
     )
-    group.launch()
+    group.launch((*kv_projection, k, v) if kv_projection is not None else None)
 
 
 def gate_from_heads(x, logits, *, col_offset=0, dtype=BF, out=None, memory_config=None):

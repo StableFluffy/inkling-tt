@@ -34,10 +34,13 @@ The equations and rounding points are in [model.md](model.md).
 
 One matmul computes Q, R, the sink logits and the gate logits from the attention input
 ([dense.md](dense.md)). The model folds the learned Q and R scales into those weights at load time.
-A second program computes K and V from their respective inputs. Two small matmuls compute the
-dynamic taps on global visits.
+Two small matmuls compute the dynamic taps on global visits. On a 13x10 grid,
+`rowvm.prepare_attention` runs the paired K/V projection and head preparation in one launch.
+The projection workers keep their bank-local placement. A cache worker reads the projected head
+after its four column tiles signal completion. On smaller grids, the paired projection runs in
+its own launch. Set `INK_FUSED_KV_PREP=0` to use the separate program on the full grid.
 
-`rowvm.prepare_attention` then runs in one launch ([rowvm.md](rowvm.md)):
+The preparation kernels perform three operations ([rowvm.md](rowvm.md)).
 
 - Q and R: clip per head, round to BF16, apply `tau` on global visits and round again, as HF does. R
   is zero-extended from 16 to 32 columns.
