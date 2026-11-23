@@ -597,7 +597,18 @@ def _prefill_io_program(combine, tasks, specs, map_bytes, token_tiles, rows, wid
 
 @lru_cache(maxsize=32)
 def _prefill_projection_program(
-    gate, tasks, fidelity, specs, broadcast_down, rows, single_weights, wide_blocks, verify
+    gate,
+    tasks,
+    fidelity,
+    specs,
+    broadcast_down,
+    rows,
+    single_weights,
+    wide_blocks,
+    verify,
+    combine_rows,
+    capacity,
+    short_gate,
 ):
     groups = zip(tasks, (4, 2)) if gate else ((tasks, 1),)
     k = _GU_K if gate else _DOWN_K
@@ -627,7 +638,7 @@ def _prefill_projection_program(
                 ),
                 _cb(grid, 2, ttnn.uint32, _EXPERTS * 4),
                 _cb(grid, 3, ttnn.uint32, _EXPERTS * 4),
-                _cb(grid, 16, _BF, 2048, 2 * (cols // 2 if gate else cols)),
+                _cb(grid, 16, _BF, 2048, capacity if combine_rows else 2 * (cols // 2 if gate else cols)),
             ]
         )
         definitions = [
@@ -640,6 +651,18 @@ def _prefill_projection_program(
             definitions.append(("EXPERTS_VERIFY", "1"))
         if verify == 2:
             definitions.extend((("EXPERTS_VERIFY_STREAM", "1"), ("EXPERTS_VERIFY_RING", str(_VERIFY_RING))))
+        if short_gate:
+            definitions.append(("EXPERTS_VERIFY_SHORT_GATE", "1"))
+        if combine_rows:
+            definitions.append(("EXPERTS_VERIFY_DOWN_ROWS", str(combine_rows)))
+            cbs.extend(
+                (
+                    _cb(grid, 4, _BF, 2048, 2),
+                    _cb(grid, 5, ttnn.uint32, 1024),
+                    _cb(grid, 6, ttnn.uint32, 64),
+                    _cb(grid, 17, _BF, 2048),
+                )
+            )
         for source, accessor, config in (
             ("prefill_weights.cpp", specs[0], ttnn.ReaderConfigDescriptor()),
             ("prefill_rows.cpp", sum(specs, ()), ttnn.WriterConfigDescriptor()),
@@ -712,7 +735,7 @@ def _prefill_io(x, workspace, combine, compact=None):
         ttnn.generic_op([*inputs, *tail, output], desc)
 
 
-def _prefill_project(gate, workspace, handle, *, verify=False):
+def _prefill_project(gate, workspace, handle, *, verify=False, combine=(), short_gate=False):
     x, output = (workspace.wide, workspace.hidden) if gate else (workspace.hidden, workspace.wide)
     weights, tasks = (handle.gate_up, handle.gate_tasks) if gate else (handle.down, handle.down_tasks)
     broadcast_down = not gate and workspace.broadcast_down
@@ -721,6 +744,10 @@ def _prefill_project(gate, workspace, handle, *, verify=False):
     ends = workspace.ends
     tail = (workspace.wide_tail,) if workspace.wide_tail is not None else ()
     wide_blocks = workspace.wide.shape[-2] // _GU_K if tail else 0
+    combine_rows = len(combine) - 2 if combine else 0
+    if combine_rows:
+        output, *extra = combine
+        tail = tuple(extra)
     with _LOCK:
         desc, kernels = _prefill_projection_program(
             gate,
@@ -732,6 +759,9 @@ def _prefill_project(gate, workspace, handle, *, verify=False):
             workspace.tokens > 1024 or workspace.weight_buffers == 1,
             wide_blocks,
             verify,
+            combine_rows,
+            workspace.gather.shape[-1] // _PREFILL_ROWS if combine_rows else 0,
+            short_gate,
         )
         for reader, writer in zip(kernels[::3], kernels[1::3]):
             reader.common_runtime_args = [ends.buffer_address(), weights.buffer_address()]

@@ -18,7 +18,7 @@ def stage(data, dest):
     ttnn.copy_host_to_device_tensor(host, dest)
 
 
-def main(compare_maps):
+def main(compare_maps, compare_epilogue):
     rows = 4
     generators = [torch.Generator().manual_seed(i) for i in (456, 457, 458)]
     device = ttnn.open_device(device_id=0, **DEVICE_PARAMS)
@@ -28,9 +28,18 @@ def main(compare_maps):
         handle = experts_stream.prepare(
             device, weights.get("layers.0.mlp.experts.gate_up_proj"), weights.get("layers.0.mlp.experts.down_proj")
         )
-        variants = ((True, False), (True, True)) if compare_maps else ((False, True), (True, True))
-        names = ("two maps programs", "one maps program") if compare_maps else ("resident", "pipelined")
-        verifiers = [(VerifyExperts(device, rows, streaming=streaming), direct) for streaming, direct in variants]
+        if compare_maps:
+            variants = ((True, False, True), (True, True, True))
+            names = ("two maps programs", "one maps program")
+        elif compare_epilogue:
+            variants = ((True, True, False), (True, True, True))
+            names = ("separate combine", "fused epilogue")
+        else:
+            variants = ((False, True, False), (True, True, True))
+            names = ("resident", "pipelined")
+        verifiers = [
+            (VerifyExperts(device, rows, streaming=streaming), direct, fuse) for streaming, direct, fuse in variants
+        ]
         packed = _alloc(device, (1, 1, 32, D))
         routing = [
             (
@@ -59,8 +68,10 @@ def main(compare_maps):
                 refs.append(ttnn.to_torch(experts_stream.moe_decode(row, dev_ids, dev_gamma, handle))[0, 0, 0])
             expected = torch.stack(refs)
             union = ids.unique().numel()
-            for name, (verifier, direct_maps) in zip(names, verifiers):
-                data = ttnn.to_torch(verifier.run(packed, routing, handle, direct_maps=direct_maps))[0, 0]
+            for name, (verifier, direct_maps, fuse_epilogue) in zip(names, verifiers):
+                data = ttnn.to_torch(
+                    verifier.run(packed, routing, handle, direct_maps=direct_maps, fuse_epilogue=fuse_epilogue)
+                )[0, 0]
                 failures = (data[:rows] != expected).sum().item()
                 print(f"{name} union {union}: {failures}/{rows * D} mismatches against B1", flush=True)
                 assert torch.equal(data[:rows], expected)
@@ -69,9 +80,9 @@ def main(compare_maps):
 
         ttnn.synchronize_device(device)
         traces = []
-        for verifier, direct_maps in verifiers:
+        for verifier, direct_maps, fuse_epilogue in verifiers:
             trace = ttnn.begin_trace_capture(device, cq_id=0)
-            verifier.run(packed, routing, handle, direct_maps=direct_maps)
+            verifier.run(packed, routing, handle, direct_maps=direct_maps, fuse_epilogue=fuse_epilogue)
             ttnn.end_trace_capture(device, trace, cq_id=0)
             traces.append(trace)
         try:
@@ -102,5 +113,8 @@ def main(compare_maps):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--compare-maps", action="store_true")
-    main(parser.parse_args().compare_maps)
+    variants = parser.add_mutually_exclusive_group()
+    variants.add_argument("--compare-maps", action="store_true")
+    variants.add_argument("--compare-epilogue", action="store_true")
+    args = parser.parse_args()
+    main(args.compare_maps, args.compare_epilogue)

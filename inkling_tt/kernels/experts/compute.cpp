@@ -12,7 +12,7 @@ constexpr uint32_t columns = get_compile_time_arg_val(2);
 constexpr uint32_t pairs = columns / 2;
 
 #ifdef TRISC_MATH
-#include "ckernel_sfpu_conversions.h"
+#include "combine.h"
 #include "ckernel_sfpu_tanh.h"
 #include "llk_math_eltwise_binary_sfpu_macros.h"
 #include "ckernel_sfpu_sigmoid.h"
@@ -20,26 +20,7 @@ constexpr uint32_t pairs = columns / 2;
 namespace {
 using namespace sfpi;
 
-// In FP32 DST, each face's first four rows use two vectors (even/odd).
-// The logical B1 row lives in the first two faces, eight vectors apart.
-constexpr uint32_t vectors_in_tile = 32;
-constexpr uint32_t second_face = 8;
-
-template <typename F>
-void face_rows(F fn) {
-#pragma GCC unroll 2
-    for (uint32_t face = 0; face <= second_face; face += second_face) {
-#pragma GCC unroll 2
-        for (uint32_t parity = 0; parity < 2; ++parity) {
-            fn(face + parity);
-        }
-    }
-}
-
-// Match the Blackhole sparse matmul's BF16 projection writeback.
-sfpi_inline vFloat round_projection(vFloat value) {
-    return sfpi::convert<sfpi::vFloat16b>(value, sfpi::RoundMode::Nearest);
-}
+using namespace expert_math;
 
 void gate_sigmoid(uint32_t tile, uint32_t, uint32_t) {
     const uint32_t base = tile * vectors_in_tile;
@@ -74,19 +55,6 @@ void hidden(uint32_t tile, uint32_t, uint32_t) {
     });
 }
 
-void combine(uint32_t gamma_bits, uint32_t slot, uint32_t tile) {
-    vFloat gamma = __builtin_bit_cast(float, gamma_bits);
-    const uint32_t base = tile * vectors_in_tile;
-    face_rows([=](uint32_t row) {
-        const uint32_t d = base + row;
-        const uint32_t sum = d + columns * vectors_in_tile;
-        vFloat value = round_projection(dst_reg[d]);
-        vFloat term = value * gamma;
-        vFloat acc = slot == 0 ? term : vFloat(dst_reg[sum]) + term;
-        dst_reg[sum] = slot == 7 ? ::float32_to_bf16_rne(acc) : acc;
-        dst_reg[d] = 0.0f;
-    });
-}
 }  // namespace
 #endif
 
@@ -111,7 +79,7 @@ void kernel_main() {
             cb_wait_front(cb_x, 1);
             copy_tile(cb_x, 0, 0);
             cb_pop_front(cb_x, 1);
-            MATH((_llk_math_eltwise_binary_sfpu_params_(combine, gamma[slot], slot, 0, VectorMode::None)));
+            MATH((_llk_math_eltwise_binary_sfpu_params_(combine<columns>, gamma[slot], slot, 0, VectorMode::None)));
         }
         tile_regs_commit();
         cb_reserve_back(cb_out, 1);
@@ -166,7 +134,7 @@ void kernel_main() {
         }
         cb_pop_front(cb_x, k);
         for (uint32_t tile = 0; tile < cols; ++tile) {
-            MATH((_llk_math_eltwise_binary_sfpu_params_(combine, gamma[slot], slot, tile, VectorMode::None)));
+            MATH((_llk_math_eltwise_binary_sfpu_params_(combine<columns>, gamma[slot], slot, tile, VectorMode::None)));
         }
     }
     constexpr uint32_t first = cols;

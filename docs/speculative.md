@@ -80,8 +80,9 @@ B1's K-stripe sum and tie-breaking order. One mapping program assigns compact ro
 The grouped expert path reads one gate/up and down slice per distinct routed expert. It keeps
 B1's eight routes and FP32 weights per row, streams the existing BFP8_B weight pack at HiFi4 and
 combines the results in the original routing-slot order. Each weight reader uses a two-block
-buffer with one read in flight. A 20-expert union moves 169 MB in 0.452 ms through the full
-expert path, including route maps and the combine.
+buffer with one read in flight. For two to four rows, the down workers retain the per-expert
+BF16 outputs in local buffers and combine them in the same launch. The full 20-expert path
+moves 169 MB in 0.443 ms, including the route maps and the combine.
 
 A round accepts a prefix by advancing the position. Later rounds or B1 overwrite rejected
 positions before those positions can enter a live window. The continuation ID remains pending
@@ -131,7 +132,7 @@ INK_LMAX=2048 scripts/bench_decode.sh
 | Three proposals, 1,088-slot draft global prefix | 5.85 ms median, 5.89 ms p95 |
 | Draft proposal IDs on two synthetic tap fixtures | 6/6 against CPU |
 | Four router rows with staging, shared | 34.68 µs median, 42.16 µs p95 |
-| Four expert rows, union of 20 | 0.463 ms median, 0.466 ms p95 |
+| Four expert rows, union of 20 | 0.443 ms median, 0.446 ms p95 |
 | Four BF16 target head rows, serial | 7.708 ms median, 7.742 ms p95 |
 | Four BF16 target head rows, shared | 2.030 ms median, 2.058 ms p95 |
 | Indexed attention with future writes | 208/208 bitwise-equal rows |

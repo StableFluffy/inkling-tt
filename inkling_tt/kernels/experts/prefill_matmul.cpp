@@ -2,6 +2,13 @@
 #include "api/compute/compute_kernel_api.h"
 #include "api/compute/matmul.h"
 #include "api/compute/pack.h"
+#ifdef EXPERTS_VERIFY_DOWN_ROWS
+#include "api/compute/tile_move_copy.h"
+#ifdef TRISC_MATH
+#include "combine.h"
+#include "llk_math_eltwise_binary_sfpu_macros.h"
+#endif
+#endif
 
 using namespace ckernel;
 constexpr uint32_t cols = get_compile_time_arg_val(2);
@@ -25,8 +32,13 @@ template <typename F>
 void live_rows(F fn) {
 #pragma GCC unroll 2
     for (uint32_t face = 0; face < 16; face += 8) {
+#ifdef EXPERTS_VERIFY_SHORT_GATE
+        constexpr uint32_t lanes = 2;
+#else
+        constexpr uint32_t lanes = 4;
+#endif
 #pragma GCC unroll 4
-        for (uint32_t v = 0; v < 4; ++v) {
+        for (uint32_t v = 0; v < lanes; ++v) {
             fn(face + v);
         }
     }
@@ -133,5 +145,29 @@ void kernel_main() {
         cb_pop_front(1, k * cols);
 #endif
     }
+#ifdef EXPERTS_VERIFY_DOWN_ROWS
+    reconfig_data_format_srca(4);
+    copy_init(4);
+    pack_reconfig_data_format(17);
+    for (uint32_t row = 0; row < EXPERTS_VERIFY_DOWN_ROWS; ++row) {
+        uint32_t gamma[8];
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+            MATH(gamma[slot] = ckernel::mailbox_read(ckernel::ThreadId::BriscThreadId));
+        }
+        cb_reserve_back(17, 1);
+        tile_regs_acquire();
+        for (uint32_t slot = 0; slot < 8; ++slot) {
+            cb_wait_front(4, 1);
+            copy_tile(4, 0, 0);
+            cb_pop_front(4, 1);
+            MATH((_llk_math_eltwise_binary_sfpu_params_(expert_math::combine<1>, gamma[slot], slot, 0, VectorMode::None)));
+        }
+        tile_regs_commit();
+        tile_regs_wait();
+        pack_tile(1, 17);
+        tile_regs_release();
+        cb_push_back(17, 1);
+    }
+#endif
     cb_pop_front(2, 1);
 }

@@ -89,7 +89,7 @@ class VerifyExperts:
         zeros = ttnn.from_torch(torch.zeros(1, 1, 32, D), dtype=BF, layout=TILE)
         ttnn.copy_host_to_device_tensor(zeros, self.workspace.output)
 
-    def run(self, x, routing, handle, *, direct_maps=True):
+    def run(self, x, routing, handle, *, direct_maps=True, fuse_epilogue=True):
         """Stream the union of B1 routes while preserving each token's combine order."""
         rows = len(routing)
         if not 2 <= rows <= self.rows:
@@ -115,7 +115,17 @@ class VerifyExperts:
                 desc.kernels = [kernel]
                 ttnn.generic_op(list(maps), desc)
         experts._prefill_io(x, work, False)
-        experts._prefill_project(True, work, handle, verify=self.verify_mode)
+        fused = self.verify_mode == 2 and fuse_epilogue and rows <= 4
+        experts._prefill_project(True, work, handle, verify=self.verify_mode, short_gate=fused)
+        if fused:
+            experts._prefill_project(
+                False,
+                work,
+                handle,
+                verify=self.verify_mode,
+                combine=(work.output, work.inverse, *(gamma for _, gamma in routing)),
+            )
+            return work.output
         experts._prefill_project(False, work, handle, verify=self.verify_mode)
         _launch(
             _combine_program,
